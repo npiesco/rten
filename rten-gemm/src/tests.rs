@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::mem::size_of;
 use std::time::Instant;
 
 use rten_base::num::AsUsize;
@@ -162,9 +163,9 @@ where
 // them to small values in tests, so tests can enforce the use of multiple
 // blocks without needing large inputs that are slow when tests are compiled
 // in debug mode.
-const ROW_BLOCK_SIZE: usize = 64;
+const ROW_BLOCK_SIZE: usize = super::ROW_BLOCK_MAX;
 const COL_BLOCK_SIZE: usize = 1024;
-const DEPTH_BLOCK_SIZE: usize = 256;
+const DEPTH_BLOCK_SIZE: usize = super::DEPTH_BLOCK_BYTES / size_of::<f32>();
 
 fn run_gemm<LhsT: GemmInT, RhsT: GemmInT, OutT: GemmOutT>(
     mut output: MatrixMut<OutT>,
@@ -1465,4 +1466,299 @@ fn bench_prepack_a() {
             }
         },
     );
+}
+
+/// Test correctness of GEMM for the exact matrix shapes used by MiniLM-L6-v2
+/// transformer encoder (seq_len=128, hidden=384, intermediate=1536, heads=12).
+///
+/// These are small-to-medium GEMMs where blocking overhead matters.
+/// With KC=256 and MC=64, K=384 splits into 2 depth blocks and M=128 splits
+/// into 2 row blocks — both unnecessary if blocking is tuned for modern caches.
+#[test]
+fn test_gemm_minilm_shapes() {
+    let mut rng = XorShiftRng::new(42);
+
+    // MiniLM-L6-v2 FusedMatMul shapes (from profiling):
+    // QKV projections: [128, 384] × [384, 384] — 24 calls, 46% of GEMM time
+    // FFN down-project: [128, 1536] × [1536, 384] — 6 calls, 41% of GEMM time
+    // FFN up-project:   [128, 384] × [384, 1536] — 6 calls, 13% of GEMM time
+    let cases = [
+        ([128, 384], [384, 384]),
+        ([128, 1536], [1536, 384]),
+        ([128, 384], [384, 1536]),
+        // Attention score: [12*128, 32] × [32, 128] (batched as heads)
+        ([128, 32], [32, 128]),
+        // Attention value: [12*128, 128] × [128, 32]
+        ([128, 128], [128, 32]),
+    ];
+
+    for gemm in all_gemms::<f32, f32, f32>() {
+        for &(a_shape, b_shape) in &cases {
+            let a = NdTensor::<f32, 2>::rand(a_shape, &mut rng);
+            let b = NdTensor::<f32, 2>::rand(b_shape, &mut rng);
+
+            let result = run_matmul(a.view(), b.view(), None, Some(&gemm)).unwrap();
+            let expected = reference_matmul(a.view(), b.view(), None);
+
+            expect_equal(&result, &expected).unwrap_or_else(|e| {
+                panic!(
+                    "GEMM {} mismatch for [{}×{}] × [{}×{}]: {}",
+                    gemm.kernel_name(),
+                    a_shape[0],
+                    a_shape[1],
+                    b_shape[0],
+                    b_shape[1],
+                    e
+                );
+            });
+        }
+    }
+}
+
+/// Benchmark GEMM for MiniLM shapes. Verifies that tuned blocking reduces
+/// depth and row block splits for K=384 and M=128.
+#[test]
+#[ignore]
+fn bench_gemm_minilm_shapes() {
+    struct Case {
+        m: usize,
+        k: usize,
+        n: usize,
+        label: &'static str,
+    }
+
+    let cases = [
+        Case { m: 128, k: 384, n: 384, label: "QKV projection" },
+        Case { m: 128, k: 1536, n: 384, label: "FFN down-project" },
+        Case { m: 128, k: 384, n: 1536, label: "FFN up-project" },
+    ];
+
+    let gemm = GemmExecutor::<f32>::new();
+    let mut rng = XorShiftRng::new(42);
+    let iters = 500;
+
+    println!("\nMiniLM-L6-v2 GEMM benchmark ({iters} iters)");
+    println!("{:<20} {:>10} {:>10}", "Shape", "Total(ms)", "Per-call(µs)");
+    println!("{}", "-".repeat(44));
+
+    for case in &cases {
+        let a = NdTensor::<f32, 2>::rand([case.m, case.k], &mut rng);
+        let b = NdTensor::<f32, 2>::rand([case.k, case.n], &mut rng);
+
+        // Warmup
+        for _ in 0..10 {
+            let mut out = NdTensor::<f32, 2>::zeros([case.m, case.n]);
+            gemm.gemm(
+                out.data_mut().unwrap(),
+                GemmInputA::Unpacked(a.view()),
+                GemmInputB::Unpacked(b.view()),
+                GemmOptions::default(),
+            )
+            .unwrap();
+        }
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            let mut out = NdTensor::<f32, 2>::zeros([case.m, case.n]);
+            gemm.gemm(
+                out.data_mut().unwrap(),
+                GemmInputA::Unpacked(a.view()),
+                GemmInputB::Unpacked(b.view()),
+                GemmOptions::default(),
+            )
+            .unwrap();
+        }
+        let elapsed = start.elapsed();
+        let total_ms = elapsed.as_secs_f64() * 1000.0;
+        let per_call_us = total_ms * 1000.0 / iters as f64;
+
+        println!(
+            "{:<20} {:>10.2} {:>10.1}",
+            format!("{}x{}x{}", case.m, case.k, case.n),
+            total_ms,
+            per_call_us
+        );
+    }
+}
+
+/// Verify that blocking constants are properly exported and have sane values
+/// for the cache hierarchy.
+#[test]
+fn test_blocking_constants_tuned() {
+    let kc_f32 = super::DEPTH_BLOCK_BYTES / size_of::<f32>();
+    let mc = super::ROW_BLOCK_MAX;
+
+    // KC must be at least 64 for reasonable GEMM performance
+    assert!(
+        kc_f32 >= 64,
+        "KC for f32 = {} is too small",
+        kc_f32,
+    );
+
+    // MC must be at least MR (6 for FmaKernel) to process at least one tile
+    assert!(
+        mc >= 6,
+        "MC = {} is smaller than MR=6",
+        mc,
+    );
+
+    // Sanity: KC × NR × sizeof(f32) should fit in L1 (≤48KB for modern CPUs)
+    let nr = 16; // AVX2 FmaKernel NR
+    let l1_usage = kc_f32 * nr * size_of::<f32>();
+    assert!(
+        l1_usage <= 48 * 1024,
+        "KC×NR×4 = {} bytes exceeds 48KB L1d cache",
+        l1_usage
+    );
+
+    // MC × KC × sizeof(f32) should fit in L2 (≤2MB for modern P-cores)
+    let l2_usage = mc * kc_f32 * size_of::<f32>();
+    assert!(
+        l2_usage <= 2 * 1024 * 1024,
+        "MC×KC×4 = {} bytes exceeds 2MB L2 cache",
+        l2_usage
+    );
+}
+
+/// Test BLAS backend produces correct results for MiniLM-sized GEMMs.
+#[cfg(feature = "blas")]
+#[test]
+fn test_blas_sgemm_correctness() {
+    let mut rng = XorShiftRng::new(42);
+    let gemm = GemmExecutor::<f32>::new();
+
+    let cases = [
+        ([128, 384], [384, 384]),
+        ([128, 1536], [1536, 384]),
+        ([128, 384], [384, 1536]),
+        ([64, 64], [64, 64]),
+    ];
+
+    for &(a_shape, b_shape) in &cases {
+        let a = NdTensor::<f32, 2>::rand(a_shape, &mut rng);
+        let b = NdTensor::<f32, 2>::rand(b_shape, &mut rng);
+
+        let mut result = NdTensor::zeros([a_shape[0], b_shape[1]]);
+        gemm.gemm(
+            result.data_mut().unwrap(),
+            GemmInputA::Unpacked(a.view()),
+            GemmInputB::Unpacked(b.view()),
+            GemmOptions::default(),
+        )
+        .unwrap();
+
+        let expected = reference_matmul(a.view(), b.view(), None);
+
+        expect_equal(&result, &expected).unwrap_or_else(|e| {
+            panic!(
+                "BLAS mismatch for [{}×{}] × [{}×{}]: {}",
+                a_shape[0], a_shape[1], b_shape[0], b_shape[1], e
+            );
+        });
+    }
+}
+
+/// Test BLAS with alpha and beta parameters.
+#[cfg(feature = "blas")]
+#[test]
+fn test_blas_sgemm_alpha_beta() {
+    let mut rng = XorShiftRng::new(42);
+    let gemm = GemmExecutor::<f32>::new();
+
+    let a = NdTensor::<f32, 2>::rand([64, 64], &mut rng);
+    let b = NdTensor::<f32, 2>::rand([64, 64], &mut rng);
+    let alpha = 0.5f32;
+    let beta = 0.25f32;
+
+    // Initialize output with known values
+    let mut result = NdTensor::<f32, 2>::rand([64, 64], &mut rng);
+    let initial = result.clone();
+
+    gemm.gemm(
+        result.data_mut().unwrap(),
+        GemmInputA::Unpacked(a.view()),
+        GemmInputB::Unpacked(b.view()),
+        GemmOptions {
+            alpha,
+            beta,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Compute expected: alpha * A @ B + beta * C_initial
+    let ab: NdTensor<f32, 2> = reference_matmul(a.view(), b.view(), None);
+    let mut expected = NdTensor::zeros([64, 64]);
+    for i in 0..64 {
+        for j in 0..64 {
+            expected[[i, j]] = alpha * ab[[i, j]] + beta * initial[[i, j]];
+        }
+    }
+
+    expect_equal(&result, &expected).unwrap_or_else(|e| {
+        panic!("BLAS alpha/beta mismatch: {}", e);
+    });
+}
+
+/// Benchmark BLAS GEMM for MiniLM shapes.
+#[cfg(feature = "blas")]
+#[test]
+#[ignore]
+fn bench_blas_gemm() {
+    let gemm = GemmExecutor::<f32>::new();
+    let mut rng = XorShiftRng::new(42);
+    let iters = 500;
+
+    struct Case {
+        m: usize,
+        k: usize,
+        n: usize,
+    }
+
+    let cases = [
+        Case { m: 128, k: 384, n: 384 },
+        Case { m: 128, k: 1536, n: 384 },
+        Case { m: 128, k: 384, n: 1536 },
+    ];
+
+    println!("\nBLAS GEMM ({iters} iters)");
+    println!("{:<20} {:>12}", "Shape", "Per-call(µs)");
+    println!("{}", "-".repeat(34));
+
+    for case in &cases {
+        let a = NdTensor::<f32, 2>::rand([case.m, case.k], &mut rng);
+        let b = NdTensor::<f32, 2>::rand([case.k, case.n], &mut rng);
+
+        // Warmup
+        for _ in 0..10 {
+            let mut out = NdTensor::<f32, 2>::zeros([case.m, case.n]);
+            gemm.gemm(
+                out.data_mut().unwrap(),
+                GemmInputA::Unpacked(a.view()),
+                GemmInputB::Unpacked(b.view()),
+                GemmOptions::default(),
+            )
+            .unwrap();
+        }
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            let mut out = NdTensor::<f32, 2>::zeros([case.m, case.n]);
+            gemm.gemm(
+                out.data_mut().unwrap(),
+                GemmInputA::Unpacked(a.view()),
+                GemmInputB::Unpacked(b.view()),
+                GemmOptions::default(),
+            )
+            .unwrap();
+        }
+        let elapsed = start.elapsed();
+        let per_call_us = elapsed.as_secs_f64() * 1e6 / iters as f64;
+
+        println!(
+            "{:<20} {:>12.1}",
+            format!("{}x{}x{}", case.m, case.k, case.n),
+            per_call_us
+        );
+    }
 }

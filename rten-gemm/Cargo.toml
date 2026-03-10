@@ -8,6 +8,11 @@ license = "MIT OR Apache-2.0"
 homepage = "https://github.com/robertknight/rten"
 repository = "https://github.com/robertknight/rten"
 
+[features]
+default = []
+# Use system BLAS (e.g., OpenBLAS, MKL) for f32 GEMM on native targets.
+blas = []
+
 [dependencies]
 rayon = { workspace = true }
 rten-base = { path = "../rten-base", version = "0.24.0" }

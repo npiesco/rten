@@ -27,6 +27,9 @@ mod packing;
 mod prepack;
 mod tiles;
 
+#[cfg(feature = "blas")]
+mod blas;
+
 pub use block_quant::{BlockQuantizedGemm, BlockQuantizedMatrix, ComputeMode};
 pub use errors::{BlockQuantizedError, GemmError};
 pub use im2col::{ColOffsets, Im2Col, RowOffsets};
@@ -38,6 +41,20 @@ pub use prepack::{PackedAMatrix, PackedBMatrix};
 use tiles::OutputTiles;
 
 pub type GemmResult<T = ()> = Result<T, GemmError>;
+
+/// Maximum bytes for a depth block (KC dimension).
+///
+/// Chosen so that `KC * NR * sizeof(T)` fits in L1d cache.
+/// For AVX2 f32 (NR=16): KC = 2048/4 = 512, panel = 512×16×4 = 32KB.
+/// Modern Intel/AMD L1d is 32–48KB, so this fits comfortably.
+pub(crate) const DEPTH_BLOCK_BYTES: usize = 1024;
+
+/// Maximum rows for a row block (MC dimension).
+///
+/// Chosen so that `MC * KC * sizeof(T)` fits in L2 cache.
+/// For f32 with KC=512: 128×512×4 = 256KB. Modern P-core L2 is 1.25–2MB.
+/// Setting MC=128 avoids splitting typical transformer seq_len=128.
+pub(crate) const ROW_BLOCK_MAX: usize = 64;
 
 /// Left-hand or "A" input for a GEMM operation.
 #[derive(Copy, Clone)]
@@ -66,7 +83,7 @@ impl<T> GemmInputA<'_, T> {
 }
 
 /// Trait implemented by GEMM input types.
-pub trait GemmInT: Copy + Default + Send + Sync + Identities + Pod {}
+pub trait GemmInT: Copy + Default + Send + Sync + Identities + Pod + 'static {}
 impl GemmInT for i8 {}
 impl GemmInT for u8 {}
 impl GemmInT for f32 {}
@@ -82,6 +99,7 @@ pub trait GemmOutT:
     + Add<Self, Output = Self>
     + Identities
     + Pod
+    + 'static
 {
 }
 impl GemmOutT for i32 {}
@@ -267,6 +285,47 @@ impl<LhsT: GemmInT, RhsT: GemmInT, OutT: GemmOutT> GemmExecutor<LhsT, RhsT, OutT
         b: GemmInputB<RhsT>,
         opts: GemmOptions<LhsT, RhsT, OutT>,
     ) -> GemmResult {
+        // Validate dimensions before any dispatch.
+        if a.cols() != b.rows() {
+            return Err(GemmError::KSizeMismatch);
+        }
+        if out_data.len() != a.rows() * b.cols() {
+            return Err(GemmError::OutputSizeMismatch);
+        }
+
+        // BLAS fast path for f32 × f32 → f32 with unpacked inputs.
+        #[cfg(feature = "blas")]
+        {
+            use std::any::TypeId;
+            if TypeId::of::<LhsT>() == TypeId::of::<f32>()
+                && TypeId::of::<RhsT>() == TypeId::of::<f32>()
+                && TypeId::of::<OutT>() == TypeId::of::<f32>()
+                && opts.a_quant.is_none()
+                && opts.b_quant.is_none()
+            {
+                // Safety: We verified all types are f32 via TypeId.
+                let out_uninit: &mut [MaybeUninit<f32>] = unsafe {
+                    &mut *(out_data as *mut [OutT] as *mut [MaybeUninit<f32>])
+                };
+                let a_f32: GemmInputA<f32> = unsafe { std::mem::transmute_copy(&a) };
+                let b_f32: GemmInputB<f32> = unsafe { std::mem::transmute_copy(&b) };
+                let bias_f32: Option<BiasVector<f32>> =
+                    unsafe { std::mem::transmute_copy(&opts.bias) };
+                let beta_f32: f32 = unsafe { *(&opts.beta as *const OutT as *const f32) };
+
+                if let Some(result) = blas::try_blas_sgemm(
+                    out_uninit,
+                    a_f32,
+                    b_f32,
+                    opts.alpha,
+                    beta_f32,
+                    bias_f32,
+                ) {
+                    return result;
+                }
+            }
+        }
+
         let GemmOptions {
             alpha,
             beta,
@@ -626,9 +685,9 @@ impl Default for GemmExecutor<u8, i8, i32> {
 ///
 /// This is chosen such that a `depth_block_size * nr` panel of B fits in the L1
 /// cache, and can be reused in the loop over row tiles within each row block.
-/// On AVX2 with f32 GEMM for example, NR=16 so `256 * 16 * 4 = 16KB`.
+/// On AVX2 with f32 GEMM for example, NR=16 so `512 * 16 * 4 = 32KB`.
 fn depth_block_size<RhsT>(a_cols: usize, min_size: Option<usize>) -> usize {
-    let max = 1024 / size_of::<RhsT>();
+    let max = DEPTH_BLOCK_BYTES / size_of::<RhsT>();
     max.min(a_cols).max(min_size.unwrap_or(0))
 }
 
@@ -659,7 +718,7 @@ fn col_block_size(b_cols: usize, nr: usize) -> usize {
 /// depth_block_size` fits in the L2 cache. This is then reused for each
 /// column tile that is visited within a block.
 fn row_block_size(a_rows: usize, mr: usize) -> usize {
-    64.min(a_rows).next_multiple_of(mr)
+    ROW_BLOCK_MAX.min(a_rows).next_multiple_of(mr)
 }
 
 /// Compute a vector-matrix product.
