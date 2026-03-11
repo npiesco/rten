@@ -10,8 +10,6 @@ repository = "https://github.com/robertknight/rten"
 
 [features]
 default = []
-# Use system BLAS (e.g., OpenBLAS, MKL) for f32 GEMM on native targets.
-blas = []
 
 [dependencies]
 rayon = { workspace = true }

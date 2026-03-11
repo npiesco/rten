@@ -1528,9 +1528,24 @@ fn bench_gemm_minilm_shapes() {
     }
 
     let cases = [
-        Case { m: 128, k: 384, n: 384, label: "QKV projection" },
-        Case { m: 128, k: 1536, n: 384, label: "FFN down-project" },
-        Case { m: 128, k: 384, n: 1536, label: "FFN up-project" },
+        Case {
+            m: 128,
+            k: 384,
+            n: 384,
+            label: "QKV projection",
+        },
+        Case {
+            m: 128,
+            k: 1536,
+            n: 384,
+            label: "FFN down-project",
+        },
+        Case {
+            m: 128,
+            k: 384,
+            n: 1536,
+            label: "FFN up-project",
+        },
     ];
 
     let gemm = GemmExecutor::<f32>::new();
@@ -1589,18 +1604,10 @@ fn test_blocking_constants_tuned() {
     let mc = super::ROW_BLOCK_MAX;
 
     // KC must be at least 64 for reasonable GEMM performance
-    assert!(
-        kc_f32 >= 64,
-        "KC for f32 = {} is too small",
-        kc_f32,
-    );
+    assert!(kc_f32 >= 64, "KC for f32 = {} is too small", kc_f32,);
 
     // MC must be at least MR (6 for FmaKernel) to process at least one tile
-    assert!(
-        mc >= 6,
-        "MC = {} is smaller than MR=6",
-        mc,
-    );
+    assert!(mc >= 6, "MC = {} is smaller than MR=6", mc,);
 
     // Sanity: KC × NR × sizeof(f32) should fit in L1 (≤48KB for modern CPUs)
     let nr = 16; // AVX2 FmaKernel NR
@@ -1618,147 +1625,4 @@ fn test_blocking_constants_tuned() {
         "MC×KC×4 = {} bytes exceeds 2MB L2 cache",
         l2_usage
     );
-}
-
-/// Test BLAS backend produces correct results for MiniLM-sized GEMMs.
-#[cfg(feature = "blas")]
-#[test]
-fn test_blas_sgemm_correctness() {
-    let mut rng = XorShiftRng::new(42);
-    let gemm = GemmExecutor::<f32>::new();
-
-    let cases = [
-        ([128, 384], [384, 384]),
-        ([128, 1536], [1536, 384]),
-        ([128, 384], [384, 1536]),
-        ([64, 64], [64, 64]),
-    ];
-
-    for &(a_shape, b_shape) in &cases {
-        let a = NdTensor::<f32, 2>::rand(a_shape, &mut rng);
-        let b = NdTensor::<f32, 2>::rand(b_shape, &mut rng);
-
-        let mut result = NdTensor::zeros([a_shape[0], b_shape[1]]);
-        gemm.gemm(
-            result.data_mut().unwrap(),
-            GemmInputA::Unpacked(a.view()),
-            GemmInputB::Unpacked(b.view()),
-            GemmOptions::default(),
-        )
-        .unwrap();
-
-        let expected = reference_matmul(a.view(), b.view(), None);
-
-        expect_equal(&result, &expected).unwrap_or_else(|e| {
-            panic!(
-                "BLAS mismatch for [{}×{}] × [{}×{}]: {}",
-                a_shape[0], a_shape[1], b_shape[0], b_shape[1], e
-            );
-        });
-    }
-}
-
-/// Test BLAS with alpha and beta parameters.
-#[cfg(feature = "blas")]
-#[test]
-fn test_blas_sgemm_alpha_beta() {
-    let mut rng = XorShiftRng::new(42);
-    let gemm = GemmExecutor::<f32>::new();
-
-    let a = NdTensor::<f32, 2>::rand([64, 64], &mut rng);
-    let b = NdTensor::<f32, 2>::rand([64, 64], &mut rng);
-    let alpha = 0.5f32;
-    let beta = 0.25f32;
-
-    // Initialize output with known values
-    let mut result = NdTensor::<f32, 2>::rand([64, 64], &mut rng);
-    let initial = result.clone();
-
-    gemm.gemm(
-        result.data_mut().unwrap(),
-        GemmInputA::Unpacked(a.view()),
-        GemmInputB::Unpacked(b.view()),
-        GemmOptions {
-            alpha,
-            beta,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-
-    // Compute expected: alpha * A @ B + beta * C_initial
-    let ab: NdTensor<f32, 2> = reference_matmul(a.view(), b.view(), None);
-    let mut expected = NdTensor::zeros([64, 64]);
-    for i in 0..64 {
-        for j in 0..64 {
-            expected[[i, j]] = alpha * ab[[i, j]] + beta * initial[[i, j]];
-        }
-    }
-
-    expect_equal(&result, &expected).unwrap_or_else(|e| {
-        panic!("BLAS alpha/beta mismatch: {}", e);
-    });
-}
-
-/// Benchmark BLAS GEMM for MiniLM shapes.
-#[cfg(feature = "blas")]
-#[test]
-#[ignore]
-fn bench_blas_gemm() {
-    let gemm = GemmExecutor::<f32>::new();
-    let mut rng = XorShiftRng::new(42);
-    let iters = 500;
-
-    struct Case {
-        m: usize,
-        k: usize,
-        n: usize,
-    }
-
-    let cases = [
-        Case { m: 128, k: 384, n: 384 },
-        Case { m: 128, k: 1536, n: 384 },
-        Case { m: 128, k: 384, n: 1536 },
-    ];
-
-    println!("\nBLAS GEMM ({iters} iters)");
-    println!("{:<20} {:>12}", "Shape", "Per-call(µs)");
-    println!("{}", "-".repeat(34));
-
-    for case in &cases {
-        let a = NdTensor::<f32, 2>::rand([case.m, case.k], &mut rng);
-        let b = NdTensor::<f32, 2>::rand([case.k, case.n], &mut rng);
-
-        // Warmup
-        for _ in 0..10 {
-            let mut out = NdTensor::<f32, 2>::zeros([case.m, case.n]);
-            gemm.gemm(
-                out.data_mut().unwrap(),
-                GemmInputA::Unpacked(a.view()),
-                GemmInputB::Unpacked(b.view()),
-                GemmOptions::default(),
-            )
-            .unwrap();
-        }
-
-        let start = Instant::now();
-        for _ in 0..iters {
-            let mut out = NdTensor::<f32, 2>::zeros([case.m, case.n]);
-            gemm.gemm(
-                out.data_mut().unwrap(),
-                GemmInputA::Unpacked(a.view()),
-                GemmInputB::Unpacked(b.view()),
-                GemmOptions::default(),
-            )
-            .unwrap();
-        }
-        let elapsed = start.elapsed();
-        let per_call_us = elapsed.as_secs_f64() * 1e6 / iters as f64;
-
-        println!(
-            "{:<20} {:>12.1}",
-            format!("{}x{}x{}", case.m, case.k, case.n),
-            per_call_us
-        );
-    }
 }

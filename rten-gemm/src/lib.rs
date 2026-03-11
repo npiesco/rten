@@ -27,9 +27,6 @@ mod packing;
 mod prepack;
 mod tiles;
 
-#[cfg(feature = "blas")]
-mod blas;
-
 pub use block_quant::{BlockQuantizedGemm, BlockQuantizedMatrix, ComputeMode};
 pub use errors::{BlockQuantizedError, GemmError};
 pub use im2col::{ColOffsets, Im2Col, RowOffsets};
@@ -83,7 +80,7 @@ impl<T> GemmInputA<'_, T> {
 }
 
 /// Trait implemented by GEMM input types.
-pub trait GemmInT: Copy + Default + Send + Sync + Identities + Pod + 'static {}
+pub trait GemmInT: Copy + Default + Send + Sync + Identities + Pod {}
 impl GemmInT for i8 {}
 impl GemmInT for u8 {}
 impl GemmInT for f32 {}
@@ -99,7 +96,6 @@ pub trait GemmOutT:
     + Add<Self, Output = Self>
     + Identities
     + Pod
-    + 'static
 {
 }
 impl GemmOutT for i32 {}
@@ -291,39 +287,6 @@ impl<LhsT: GemmInT, RhsT: GemmInT, OutT: GemmOutT> GemmExecutor<LhsT, RhsT, OutT
         }
         if out_data.len() != a.rows() * b.cols() {
             return Err(GemmError::OutputSizeMismatch);
-        }
-
-        // BLAS fast path for f32 × f32 → f32 with unpacked inputs.
-        #[cfg(feature = "blas")]
-        {
-            use std::any::TypeId;
-            if TypeId::of::<LhsT>() == TypeId::of::<f32>()
-                && TypeId::of::<RhsT>() == TypeId::of::<f32>()
-                && TypeId::of::<OutT>() == TypeId::of::<f32>()
-                && opts.a_quant.is_none()
-                && opts.b_quant.is_none()
-            {
-                // Safety: We verified all types are f32 via TypeId.
-                let out_uninit: &mut [MaybeUninit<f32>] = unsafe {
-                    &mut *(out_data as *mut [OutT] as *mut [MaybeUninit<f32>])
-                };
-                let a_f32: GemmInputA<f32> = unsafe { std::mem::transmute_copy(&a) };
-                let b_f32: GemmInputB<f32> = unsafe { std::mem::transmute_copy(&b) };
-                let bias_f32: Option<BiasVector<f32>> =
-                    unsafe { std::mem::transmute_copy(&opts.bias) };
-                let beta_f32: f32 = unsafe { *(&opts.beta as *const OutT as *const f32) };
-
-                if let Some(result) = blas::try_blas_sgemm(
-                    out_uninit,
-                    a_f32,
-                    b_f32,
-                    opts.alpha,
-                    beta_f32,
-                    bias_f32,
-                ) {
-                    return result;
-                }
-            }
         }
 
         let GemmOptions {
