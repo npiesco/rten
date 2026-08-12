@@ -1,15 +1,29 @@
+use rten_base::bit_set::BitSet;
 use rten_tensor::prelude::*;
 use rten_tensor::{Tensor, TensorView};
 
 use crate::buffer_pool::BufferPool;
+use crate::infer_shapes::InferShapes;
 use crate::operator::{
-    InputList, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
-    OutputTypeList, OutputTypesContext,
+    InPlaceInputs, InputList, IntoOpResult, OpError, OpRunContext, Operator, OutputList,
+    OutputType, OutputTypeList, OutputTypesContext,
 };
 use crate::ops::split::SplitSizes;
 use crate::ops::split::split;
 use crate::ops::{Concat, map_value_view, resolve_axis, resolve_index};
 use crate::value::{DataType, Sequence, Value, ValueType, ValueView};
+
+/// Resolve a sequence position in `[-len, len)` to an index in `[0, len)`.
+fn try_resolve_position(len: usize, pos: i32) -> Result<usize, OpError> {
+    resolve_index(len, pos as isize).ok_or_else(|| {
+        OpError::invalid_value(format!(
+            "Sequence position {} is out of range. Must be in [{}, {})",
+            pos,
+            -(len as isize),
+            len
+        ))
+    })
+}
 
 #[derive(Debug)]
 pub struct SequenceEmpty {
@@ -34,6 +48,11 @@ impl Operator for SequenceEmpty {
         let dtype = self.dtype.unwrap_or(DataType::Float);
         Some([OutputType::Fixed(ValueType::Sequence(dtype))].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        // Shape inference does not support sequence types yet.
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -51,8 +70,7 @@ impl Operator for SequenceAt {
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
         let seq: &Sequence = ctx.inputs().require_as(0)?;
         let pos: i32 = ctx.inputs().require_as(1)?;
-        let pos = resolve_index(seq.len(), pos as isize)
-            .ok_or(OpError::InvalidValue("Sequence position is invalid"))?;
+        let pos = try_resolve_position(seq.len(), pos)?;
         seq.at(pos)
             .unwrap()
             .to_owned_in(ctx.pool())
@@ -61,6 +79,11 @@ impl Operator for SequenceAt {
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::ElementTypeOfInputSequence(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        // Shape inference does not support sequence types yet.
+        None
     }
 }
 
@@ -98,20 +121,22 @@ impl Operator for SequenceConstruct {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::SequenceWithElementTypeOfInput(0)].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        // Shape inference does not support sequence types yet.
+        None
+    }
 }
 
 fn sequence_erase(mut seq: Sequence, pos: Option<i32>) -> Result<Sequence, OpError> {
     let Some(max_index) = seq.len().checked_sub(1) else {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "Cannot remove element from empty sequence",
         ));
     };
 
     let pos = pos
-        .map(|pos| {
-            resolve_index(seq.len(), pos as isize)
-                .ok_or(OpError::InvalidValue("Sequence position is invalid"))
-        })
+        .map(|pos| try_resolve_position(seq.len(), pos))
         .transpose()?
         .unwrap_or(max_index);
 
@@ -132,8 +157,8 @@ impl Operator for SequenceErase {
         Some(2)
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
@@ -144,14 +169,23 @@ impl Operator for SequenceErase {
             .into_op_result()
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
-        let seq: Sequence = input.try_into()?;
-        let pos: Option<i32> = ctx.inputs().get_as(0)?;
-        sequence_erase(seq, pos).map(Value::from)
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let seq: Sequence = in_place.into_single().try_into()?;
+        let pos: Option<i32> = ctx.inputs().get_as(1)?;
+        sequence_erase(seq, pos).map(Value::from).into_op_result()
     }
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        // Shape inference does not support sequence types yet.
+        None
     }
 }
 
@@ -162,19 +196,16 @@ fn sequence_insert(
     val: ValueView,
 ) -> Result<Sequence, OpError> {
     let ValueType::Tensor(val_dtype) = val.dtype() else {
-        return Err(OpError::InvalidValue("expected input to be a tensor"));
+        return Err(OpError::invalid_value("expected input to be a tensor"));
     };
 
     if seq.dtype() != val_dtype {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "Tensor type does not match sequence type",
         ));
     }
     let pos = pos
-        .map(|pos| {
-            resolve_index(seq.len() + 1, pos as isize)
-                .ok_or(OpError::InvalidValue("Sequence position is invalid"))
-        })
+        .map(|pos| try_resolve_position(seq.len() + 1, pos))
         .transpose()?
         .unwrap_or(seq.len());
 
@@ -195,8 +226,8 @@ impl Operator for SequenceInsert {
         Some(3)
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
@@ -208,15 +239,26 @@ impl Operator for SequenceInsert {
             .into_op_result()
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
-        let seq: Sequence = input.try_into()?;
-        let value = ctx.inputs().require(0)?;
-        let pos: Option<i32> = ctx.inputs().get_as(1)?;
-        sequence_insert(ctx.pool(), seq, pos, value).map(Value::from)
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let seq: Sequence = in_place.into_single().try_into()?;
+        let value = ctx.inputs().require(1)?;
+        let pos: Option<i32> = ctx.inputs().get_as(2)?;
+        sequence_insert(ctx.pool(), seq, pos, value)
+            .map(Value::from)
+            .into_op_result()
     }
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        // Shape inference does not support sequence types yet.
+        None
     }
 }
 
@@ -240,6 +282,11 @@ impl Operator for SequenceLength {
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::Fixed(ValueType::Tensor(DataType::Int32))].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        // Shape inference does not support sequence types yet.
+        None
     }
 }
 
@@ -297,6 +344,11 @@ impl Operator for ConcatFromSequence {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::ElementTypeOfInputSequence(0)].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        // Shape inference does not support sequence types yet.
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -327,12 +379,14 @@ impl Operator for SplitToSequence {
                     if size >= 1 {
                         SplitSizes::Size(size)
                     } else {
-                        return Err(OpError::InvalidValue("Split size must be >= 1"));
+                        return Err(OpError::invalid_value("Split size must be >= 1"));
                     }
                 }
                 (1, _) => SplitSizes::Sizes(splits.nd_view()),
                 _ => {
-                    return Err(OpError::InvalidValue("Split size must be scalar or vector"));
+                    return Err(OpError::invalid_value(
+                        "Split size must be scalar or vector",
+                    ));
                 }
             }
         } else {
@@ -363,6 +417,11 @@ impl Operator for SplitToSequence {
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::SequenceWithElementTypeOfInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        // Shape inference does not support sequence types yet.
+        None
     }
 }
 
@@ -432,7 +491,9 @@ mod tests {
             Case {
                 seq: [1., 2.].map(Tensor::from).into(),
                 pos: 2,
-                expected: Err(OpError::InvalidValue("Sequence position is invalid")),
+                expected: Err(OpError::invalid_value(
+                    "Sequence position 2 is out of range. Must be in [-2, 2)",
+                )),
             },
         ];
 
@@ -516,13 +577,15 @@ mod tests {
             Case {
                 seq: test_seq.clone(),
                 pos: Some(5),
-                expected: Err(OpError::InvalidValue("Sequence position is invalid")),
+                expected: Err(OpError::invalid_value(
+                    "Sequence position 5 is out of range. Must be in [-3, 3)",
+                )),
             },
             // Removal from empty sequence
             Case {
                 seq: Sequence::new(DataType::Int32),
                 pos: None,
-                expected: Err(OpError::InvalidValue(
+                expected: Err(OpError::invalid_value(
                     "Cannot remove element from empty sequence",
                 )),
             },
@@ -585,14 +648,16 @@ mod tests {
                 seq: [1., 2.].map(Tensor::from).into(),
                 pos: Some(5),
                 value: Tensor::from(3.).into(),
-                expected: Err(OpError::InvalidValue("Sequence position is invalid")),
+                expected: Err(OpError::invalid_value(
+                    "Sequence position 5 is out of range. Must be in [-3, 3)",
+                )),
             },
             // Data type mismatch
             Case {
                 seq: [1., 2.].map(Tensor::from).into(),
                 pos: Some(2),
                 value: Tensor::from(3i32).into(),
-                expected: Err(OpError::InvalidValue(
+                expected: Err(OpError::invalid_value(
                     "Tensor type does not match sequence type",
                 )),
             },
@@ -650,7 +715,9 @@ mod tests {
                 seq: [[0], [1], [2]].map(Tensor::from).into(),
                 axis: 3,
                 new_axis: true,
-                expected: Err(OpError::InvalidValue("Axis is invalid")),
+                expected: Err(OpError::invalid_value(
+                    "Axis 3 is out of range. Must be in [-1, 1)",
+                )),
             },
         ];
 
@@ -719,7 +786,7 @@ mod tests {
                 splits: Some(Tensor::from(0)),
                 axis: 0,
                 keep_dims: true,
-                expected: Err(OpError::InvalidValue("Split size must be >= 1")),
+                expected: Err(OpError::invalid_value("Split size must be >= 1")),
             },
             // Invalid split rank
             Case {
@@ -727,7 +794,9 @@ mod tests {
                 splits: Some(Tensor::from([[1]])),
                 axis: 0,
                 keep_dims: true,
-                expected: Err(OpError::InvalidValue("Split size must be scalar or vector")),
+                expected: Err(OpError::invalid_value(
+                    "Split size must be scalar or vector",
+                )),
             },
         ];
 

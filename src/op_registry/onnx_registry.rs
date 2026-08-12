@@ -7,18 +7,20 @@ use std::fmt;
 use std::sync::Arc;
 
 use rten_base::bit_set::BitSet;
-use rten_base::num::LeBytes;
+use rten_base::num::AsUsize;
 use rten_onnx::onnx;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use super::ReadOpError;
-use crate::graph::Graph;
+use crate::graph::{Constant, Graph};
 use crate::operator::Operator;
 use crate::ops;
+#[cfg(feature = "contrib")]
+use crate::ops::AccuracyLevel;
 use crate::ops::{
-    AccuracyLevel, BoxOrder, CoordTransformMode, DepthToSpaceMode, Direction, NearestMode, PadMode,
-    Padding, ResizeMode, ScatterReduction,
+    BoxOrder, CoordTransformMode, DepthToSpaceMode, Direction, NearestMode, PadMode, Padding,
+    ResizeMode, ScatterReduction,
 };
 use crate::value::{DataType, Scalar};
 
@@ -94,17 +96,45 @@ impl OnnxOpRegistry {
                     reg.register_op_with_factory(id, &stub);
                 }
             };
+
+            // Variants for ops in a non-default domain. The domain (and op
+            // type, if it differs from the Rust type name) must match the
+            // op's `ReadOp::id`, as it is used to register the stub when the
+            // feature is disabled.
+            ($domain:literal, $op:ident, feature=$feature:literal) => {
+                register_op!($domain, stringify!($op), $op, feature = $feature);
+            };
+
+            ($domain:literal, $op_type:expr, $op:ident, feature=$feature:literal) => {
+                #[cfg(feature = $feature)]
+                reg.register_op::<ops::$op>();
+                #[cfg(not(feature = $feature))]
+                {
+                    fn stub(_op: &onnx::NodeProto, _ctx: &dyn OpLoadContext) -> ReadOpResult {
+                        Err(ReadOpError::FeatureNotEnabled {
+                            name: stringify!($op).to_string(),
+                            feature: $feature.to_string(),
+                        })
+                    }
+                    let id = OpId::with_domain($domain, $op_type);
+                    reg.register_op_with_factory(id, &stub);
+                }
+            };
         }
 
         // ai.onnx ops.
         register_op!(Abs);
         register_op!(Acos);
+        register_op!(Acosh);
         register_op!(Add);
         register_op!(And);
         register_op!(ArgMax);
         register_op!(ArgMin);
         register_op!(Asin);
+        register_op!(Asinh);
         register_op!(Atan);
+        register_op!(Atanh);
+        register_op!(Attention);
         register_op!(AveragePool);
         register_op!(BatchNormalization);
         register_op!(Cast);
@@ -118,7 +148,9 @@ impl OnnxOpRegistry {
         register_op!(ConstantOfShape);
         register_op!(ConvTranspose);
         register_op!(Cos);
+        register_op!(Cosh);
         register_op!(CumSum);
+        register_op!(DFT, feature = "fft");
         register_op!(DequantizeLinear);
         register_op!(DepthToSpace);
         register_op!(Div);
@@ -158,6 +190,7 @@ impl OnnxOpRegistry {
         register_op!(Log);
         register_op!(LogSoftmax);
         register_op!(Loop);
+        register_op!(LpNormalization);
         register_op!(LSTM);
         register_op!(MatMul);
         register_op!(MatMulInteger);
@@ -167,6 +200,7 @@ impl OnnxOpRegistry {
         register_op!(Min);
         register_op!(Mod);
         register_op!(Mul);
+        register_op!(Multinomial, feature = "random");
         register_op!(Neg);
         register_op!(NonMaxSuppression);
         register_op!(NonZero);
@@ -184,7 +218,10 @@ impl OnnxOpRegistry {
         register_op!(RandomUniformLike, feature = "random");
         register_op!(Range);
         register_op!(Reciprocal);
+        register_op!(ReduceL1);
         register_op!(ReduceL2);
+        register_op!(ReduceLogSum);
+        register_op!(ReduceLogSumExp);
         register_op!(ReduceMax);
         register_op!(ReduceMean);
         register_op!(ReduceMin);
@@ -194,7 +231,10 @@ impl OnnxOpRegistry {
         register_op!(Relu);
         register_op!(Reshape);
         register_op!(Resize);
+        register_op!(ReverseSequence);
+        register_op!(RotaryEmbedding);
         register_op!(Round);
+        register_op!(Scatter);
         register_op!(ScatterElements);
         register_op!(ScatterND);
         register_op!(SequenceAt);
@@ -207,6 +247,7 @@ impl OnnxOpRegistry {
         register_op!(Sigmoid);
         register_op!(Sign);
         register_op!(Sin);
+        register_op!(Sinh);
         register_op!(Size);
         register_op!(Slice);
         register_op!(Softmax);
@@ -218,6 +259,7 @@ impl OnnxOpRegistry {
         register_op!(STFT, feature = "fft");
         register_op!(Sub);
         register_op!(Sum);
+        register_op!(Swish);
         register_op!(Tan);
         register_op!(Tanh);
         register_op!(Tile);
@@ -225,11 +267,33 @@ impl OnnxOpRegistry {
         register_op!(Transpose);
         register_op!(Trilu);
         register_op!(Unsqueeze);
+        register_op!(Upsample);
         register_op!(Where);
         register_op!(Xor);
 
+        // ai.onnx experimental
+        register_op!("ai.onnx", SimplifiedLayerNormalization, feature = "contrib");
+
         // com.microsoft ops.
-        register_op!(MatMulNBits);
+        register_op!("com.microsoft", BiasGelu, feature = "contrib");
+        register_op!("com.microsoft", FastGelu, feature = "contrib");
+        register_op!("com.microsoft", "Gelu", GeluMicrosoft, feature = "contrib");
+        register_op!("com.microsoft", GroupQueryAttention, feature = "contrib");
+        register_op!("com.microsoft", MatMulNBits, feature = "contrib");
+        register_op!("com.microsoft", MultiHeadAttention, feature = "contrib");
+        register_op!("com.microsoft", QuickGelu, feature = "contrib");
+        register_op!("com.microsoft", SkipLayerNormalization, feature = "contrib");
+        register_op!(
+            "com.microsoft",
+            SkipSimplifiedLayerNormalization,
+            feature = "contrib"
+        );
+        register_op!(
+            "com.microsoft",
+            "RotaryEmbedding",
+            RotaryEmbeddingMicrosoft,
+            feature = "contrib"
+        );
 
         reg
     }
@@ -280,13 +344,32 @@ impl fmt::Display for OpId<'_> {
 pub trait OpLoadContext {
     /// Deserialize a graph definition.
     fn load_graph(&self, graph: &onnx::GraphProto) -> Result<Graph, ReadOpError>;
+
+    /// Return the opset version that the operator uses, or `None` if
+    /// unspecified or invalid.
+    fn opset_version(&self) -> Option<u16>;
+
+    /// Deserialize a tensor from the operator attribute named `attr_name`.
+    ///
+    /// Tensor data stored in the `raw_data` field is moved out of `tensor`
+    /// rather than copied, so this must be called at most once per tensor.
+    fn load_tensor(
+        &self,
+        attr_name: &str,
+        tensor: &onnx::TensorProto,
+    ) -> Result<Constant, ReadOpError>;
 }
 
 /// Value for an operator input created from an attribute (`onnx::AttributeProto`).
 #[derive(Debug, PartialEq)]
 pub enum ConstInput {
+    // Only constructed by feature-gated deserializers (eg. DFT), so it may be
+    // unused depending on the enabled features.
+    #[allow(dead_code)]
+    Int(i64),
     Ints(Vec<i64>),
     Float(f32),
+    Floats(Vec<f32>),
 }
 
 /// Result of deserializing an ONNX operator and converting it to RTen's
@@ -302,7 +385,7 @@ pub struct ParsedOp<Op: Operator + Send + Sync> {
     const_inputs: Vec<(u32, ConstInput)>,
 
     /// Indices of unused attributes in the [`onnx::NodeProto::attribute`] field.
-    unused_attrs: BitSet,
+    unused_attrs: BitSet<u32>,
 }
 
 impl<Op: Operator + Send + Sync> From<Op> for ParsedOp<Op> {
@@ -325,7 +408,7 @@ impl<Op: Operator + Send + Sync> ParsedOp<Op> {
         self
     }
 
-    fn with_unused_attrs(mut self, attrs: BitSet) -> Self {
+    fn with_unused_attrs(mut self, attrs: BitSet<u32>) -> Self {
         self.unused_attrs = attrs;
         self
     }
@@ -335,7 +418,7 @@ impl<Op: Operator + Send + Sync> ParsedOp<Op> {
 pub struct DynParsedOp {
     pub op: Arc<dyn Operator + Send + Sync>,
     pub const_inputs: Vec<(u32, ConstInput)>,
-    pub unused_attrs: BitSet,
+    pub unused_attrs: BitSet<u32>,
 }
 
 impl<Op: Operator + Send + Sync> From<ParsedOp<Op>> for DynParsedOp {
@@ -380,20 +463,32 @@ pub trait ReadOp: Operator + Sized + Send + Sync {
 /// detecting unsupported attributes.
 struct Attrs<'a> {
     attrs: &'a [onnx::AttributeProto],
-    unused_attrs: Cell<BitSet>,
+    unused_attrs: Cell<BitSet<u32>>,
+
+    /// Opset version the operator uses.
+    #[allow(dead_code)] // May be unused depending on enabled features.
+    opset_version: Option<u16>,
 }
 
 impl<'a> Attrs<'a> {
-    fn new(attrs: &'a [onnx::AttributeProto]) -> Self {
+    fn new(attrs: &'a [onnx::AttributeProto], opset_version: Option<u16>) -> Self {
         // Assume there will be at most 32 attributes. If there are more, we'll
         // just ignore them.
-        let n_attrs: u32 = attrs.len().min(BitSet::BITS).try_into().unwrap();
-        let unused_attrs = Cell::new(BitSet::ones(n_attrs));
+        let n_attrs: u32 = attrs.len().min(u32::BITS.as_usize()).try_into().unwrap();
+        let unused_attrs = Cell::new(BitSet::<u32>::ones(n_attrs));
 
         Self {
             attrs,
             unused_attrs,
+            opset_version,
         }
+    }
+
+    /// Return the opset version the operator was exported against, or `None` if
+    /// it was not specified.
+    #[allow(dead_code)] // Only used by feature-gated deserializers (eg. DFT).
+    fn opset_version(&self) -> Option<u16> {
+        self.opset_version
     }
 
     /// Get an optional attribute.
@@ -405,7 +500,7 @@ impl<'a> Attrs<'a> {
             .find(|(_pos, att)| att.name.as_deref() == Some(name))?;
 
         let mut unused_attrs = self.unused_attrs.take();
-        if pos < BitSet::BITS {
+        if pos < u32::BITS.as_usize() {
             unused_attrs.delete(pos.try_into().unwrap());
             self.unused_attrs.set(unused_attrs);
         }
@@ -436,7 +531,7 @@ impl<'a> Attrs<'a> {
     }
 
     /// Return the indices of unused attributes
-    fn unused_attrs(&self) -> BitSet {
+    fn unused_attrs(&self) -> BitSet<u32> {
         self.unused_attrs.get()
     }
 
@@ -602,9 +697,9 @@ macro_rules! impl_read_op {
 
             fn read(
                 op: &onnx::NodeProto,
-                _ctx: &dyn OpLoadContext,
+                ctx: &dyn OpLoadContext,
             ) -> Result<ParsedOp<Self>, ReadOpError> {
-                let attrs = Attrs::new(&op.attribute);
+                let attrs = Attrs::new(&op.attribute, ctx.opset_version());
                 Ok(ParsedOp::new(ops::$op {}).with_unused_attrs(attrs.unused_attrs()))
             }
         }
@@ -618,9 +713,9 @@ macro_rules! impl_read_op {
 
             fn read(
                 op: &onnx::NodeProto,
-                _ctx: &dyn OpLoadContext,
+                ctx: &dyn OpLoadContext,
             ) -> Result<ParsedOp<Self>, ReadOpError> {
-                let attrs = Attrs::new(&op.attribute);
+                let attrs = Attrs::new(&op.attribute, ctx.opset_version());
                 $read(&attrs).map(|op| ParsedOp::from(op).with_unused_attrs(attrs.unused_attrs()))
             }
         }
@@ -634,9 +729,25 @@ macro_rules! impl_read_op {
 
             fn read(
                 op: &onnx::NodeProto,
-                _ctx: &dyn OpLoadContext,
+                ctx: &dyn OpLoadContext,
             ) -> Result<ParsedOp<Self>, ReadOpError> {
-                let attrs = Attrs::new(&op.attribute);
+                let attrs = Attrs::new(&op.attribute, ctx.opset_version());
+                $read(&attrs).map(|op| ParsedOp::from(op).with_unused_attrs(attrs.unused_attrs()))
+            }
+        }
+    };
+
+    ($domain:literal, $op_type:literal, $op:ident, $read:expr) => {
+        impl ReadOp for ops::$op {
+            fn id() -> OpId<'static> {
+                OpId::with_domain($domain, $op_type)
+            }
+
+            fn read(
+                op: &onnx::NodeProto,
+                ctx: &dyn OpLoadContext,
+            ) -> Result<ParsedOp<Self>, ReadOpError> {
+                let attrs = Attrs::new(&op.attribute, ctx.opset_version());
                 $read(&attrs).map(|op| ParsedOp::from(op).with_unused_attrs(attrs.unused_attrs()))
             }
         }
@@ -645,6 +756,7 @@ macro_rules! impl_read_op {
 
 impl_read_op!(Abs);
 impl_read_op!(Acos);
+impl_read_op!(Acosh);
 impl_read_op!(Add);
 impl_read_op!(And);
 
@@ -672,7 +784,30 @@ impl_read_op!(ArgMin, |attrs: &Attrs| {
 });
 
 impl_read_op!(Asin);
+impl_read_op!(Asinh);
 impl_read_op!(Atan);
+impl_read_op!(Atanh);
+
+impl_read_op!(Attention, |attrs: &Attrs| {
+    let is_causal = attrs.get_as("is_causal").unwrap_or(false);
+    let q_num_heads = attrs.get_as_int("q_num_heads")?;
+    let kv_num_heads = attrs.get_as_int("kv_num_heads")?;
+    let scale = attrs.get_as("scale");
+    let softcap = attrs.get_as("softcap").unwrap_or(0.0);
+
+    // `qk_matmul_output` output is unsupported
+    attrs.check_unused::<i64>("qk_matmul_output_mode")?;
+    // We always use f32 softmax precision
+    attrs.check_unused::<i64>("softmax_precision")?;
+
+    Ok(ops::Attention {
+        is_causal,
+        kv_num_heads,
+        q_num_heads,
+        scale,
+        softcap,
+    })
+});
 
 impl_read_op!(AveragePool, |attrs: &Attrs| {
     let PoolAttrs {
@@ -699,8 +834,32 @@ impl_read_op!(BatchNormalization, |attrs: &Attrs| {
     // unsupported.
     attrs.check_unused::<f32>("momentum")?;
 
+    // "spatial" was removed in opset 9.
+    attrs.check_eq("spatial", 1)?;
+
     let epsilon = attrs.get("epsilon").map(|v| v.as_f32()).unwrap_or(1e-05);
     Ok(ops::BatchNormalization { epsilon })
+});
+
+#[cfg(feature = "contrib")]
+impl_read_op!("com.microsoft", BiasGelu, |_attrs: &Attrs| {
+    Ok(ops::BiasGelu {})
+});
+
+#[cfg(feature = "contrib")]
+impl_read_op!("com.microsoft", FastGelu, |_attrs: &Attrs| {
+    Ok(ops::FastGelu {})
+});
+
+#[cfg(feature = "contrib")]
+impl_read_op!("com.microsoft", "Gelu", GeluMicrosoft, |_attrs: &Attrs| {
+    Ok(ops::GeluMicrosoft {})
+});
+
+#[cfg(feature = "contrib")]
+impl_read_op!("com.microsoft", QuickGelu, |attrs: &Attrs| {
+    let alpha = attrs.get_as("alpha").unwrap_or(1.702);
+    Ok(ops::QuickGelu { alpha })
 });
 
 impl_read_op!(Cast, |attrs: &Attrs| {
@@ -708,11 +867,21 @@ impl_read_op!(Cast, |attrs: &Attrs| {
     // Conversions to other types do not saturate, even if this attribute is 1.
     attrs.check_eq("saturate", 1)?;
 
+    // "round_mode" only applies to conversions to float8e8m0.
+    attrs.check_eq("round_mode", "up")?;
+
     let to = attrs.require("to")?.as_dtype()?;
     Ok(ops::Cast { to })
 });
 
-impl_read_op!(CastLike);
+impl_read_op!(CastLike, |attrs: &Attrs| {
+    // The "saturate" attribute only applies to FP8, which is unsupported.
+    // Conversions to other types do not saturate, even if this attribute is 1.
+    attrs.check_eq("saturate", 1)?;
+
+    attrs.check_eq("round_mode", "up")?;
+    Ok(ops::CastLike {})
+});
 impl_read_op!(Ceil);
 
 impl_read_op!(Clip, |attrs: &Attrs| {
@@ -834,69 +1003,31 @@ impl_read_op!(ConvInteger, |attrs: &Attrs| {
     })
 });
 
-/// Helper for extracting scalar values from a `TensorProto`.
-///
-/// The data may be stored either as little-endian bytes in the `raw_data` field
-/// or in one of the repeated numeric fields (`float_data`, `int32_data` etc.)
-/// The numeric field may have a wider type than the tensor's data type (eg.
-/// int8 values are stored in the int32_data field).
-fn extract_scalar<T: Copy + LeBytes, U: Copy + TryInto<T>>(
-    raw_data: Option<&[u8]>,
-    typed_data: &[U],
-) -> Result<T, ReadOpError> {
-    if let Some(data) = raw_data
-        && let Ok(bytes) = data.try_into()
-    {
-        Ok(T::from_le_bytes(bytes))
-    } else if typed_data.len() == 1
-        && let Ok(value) = typed_data[0].try_into()
-    {
-        Ok(value)
-    } else {
-        Err(ReadOpError::attr_error("value", "invalid scalar value"))
+impl ReadOp for ops::ConstantOfShape {
+    fn id() -> OpId<'static> {
+        OpId::new("ConstantOfShape")
+    }
+
+    fn read(op: &onnx::NodeProto, ctx: &dyn OpLoadContext) -> Result<ParsedOp<Self>, ReadOpError> {
+        let attrs = Attrs::new(&op.attribute, ctx.opset_version());
+
+        let value = attrs
+            .get("value")
+            .map(|attr| {
+                let Some(tensor) = attr.attr.t.as_ref() else {
+                    return Err(ReadOpError::attr_error("value", "missing tensor value"));
+                };
+                let constant = ctx.load_tensor("value", tensor)?;
+                constant
+                    .item()
+                    .ok_or_else(|| ReadOpError::attr_error("value", "expected a single element"))
+            })
+            .transpose()?
+            .unwrap_or(Scalar::Float(0.));
+
+        Ok(ParsedOp::from(ops::ConstantOfShape { value }).with_unused_attrs(attrs.unused_attrs()))
     }
 }
-
-impl_read_op!(ConstantOfShape, |attrs: &Attrs| {
-    let value = attrs
-        .get("value")
-        .map(|attr| {
-            let Some(tensor) = attr.attr.t.as_ref() else {
-                return Err(ReadOpError::attr_error("value", "missing tensor value"));
-            };
-
-            let raw_data = tensor.raw_data.as_ref().map(|data| data.take());
-
-            match tensor.data_type {
-                Some(onnx::DataType::FLOAT) => {
-                    let value = extract_scalar(raw_data.as_deref(), &tensor.float_data)?;
-                    Ok(Scalar::Float(value))
-                }
-                Some(onnx::DataType::INT64) => {
-                    let value: i64 = extract_scalar(raw_data.as_deref(), &tensor.int64_data)?;
-                    #[allow(clippy::as_conversions)]
-                    Ok(Scalar::Int(value as i32))
-                }
-                Some(onnx::DataType::INT32) => {
-                    let value: i32 = extract_scalar(raw_data.as_deref(), &tensor.int32_data)?;
-                    Ok(Scalar::Int(value))
-                }
-                Some(onnx::DataType::BOOL) => {
-                    let value: u8 = extract_scalar(raw_data.as_deref(), &tensor.int32_data)?;
-                    let value = if value != 0 { 1 } else { 0 };
-                    Ok(Scalar::Int(value))
-                }
-                _ => Err(ReadOpError::attr_error(
-                    "value",
-                    "unsupported data type for ConstantOfShape",
-                )),
-            }
-        })
-        .transpose()?
-        .unwrap_or(Scalar::Float(0.));
-
-    Ok(ops::ConstantOfShape { value })
-});
 
 impl_read_op!(ConvTranspose, |attrs: &Attrs| {
     let ConvAttrs {
@@ -906,16 +1037,13 @@ impl_read_op!(ConvTranspose, |attrs: &Attrs| {
         strides,
     } = get_common_conv_attrs(attrs)?;
 
-    if !dilations.iter().all(|d| *d == 1) {
-        return Err(ReadOpError::attr_error("dilations", "unsupported value"));
-    }
-
     let output_padding = attrs
         .get("output_padding")
         .map(|v| v.cast_ints())
         .transpose()?;
 
     Ok(ops::ConvTranspose {
+        dilations,
         padding,
         strides,
         groups,
@@ -924,14 +1052,42 @@ impl_read_op!(ConvTranspose, |attrs: &Attrs| {
 });
 
 impl_read_op!(Cos);
+impl_read_op!(Cosh);
 impl_read_op!(CumSum, |attrs: &Attrs| {
-    attrs.check_eq("exclusive", 0)?;
-    attrs.check_eq("reverse", 0)?;
-    Ok(ops::CumSum {})
+    let exclusive = attrs.get_as("exclusive").unwrap_or(false);
+    let reverse = attrs.get_as("reverse").unwrap_or(false);
+    Ok(ops::CumSum { exclusive, reverse })
+});
+
+#[cfg(feature = "fft")]
+impl_read_op!(DFT, |attrs: &Attrs| {
+    let inverse = attrs.get_as("inverse").unwrap_or(false);
+    let onesided = attrs.get_as("onesided").unwrap_or(false);
+
+    // `axis` was an attribute with default 1 in opset 17 and became an optional
+    // input with default -2 in opset 20.
+    let axis = attrs.get_as_int::<i32>("axis")?.or_else(|| {
+        let pre_opset_20 = attrs.opset_version().is_some_and(|v| v < 20);
+        pre_opset_20.then_some(1)
+    });
+    let mut const_inputs = Vec::new();
+    if let Some(axis) = axis {
+        const_inputs.push((2, ConstInput::Int(i64::from(axis))));
+    }
+
+    Ok(ParsedOp::new(ops::DFT { inverse, onesided }).with_inputs(const_inputs))
 });
 
 impl_read_op!(DequantizeLinear, |attrs: &Attrs| {
     let axis = attrs.get_as_int("axis")?.unwrap_or(1);
+
+    // A non-zero "block_size" selects blocked quantization, which is
+    // unsupported.
+    attrs.check_eq("block_size", 0)?;
+
+    // A zero "output_dtype" means the type is taken from the `scale` input.
+    attrs.check_eq("output_dtype", 0)?;
+
     Ok(ops::DequantizeLinear { axis })
 });
 
@@ -956,7 +1112,14 @@ impl_read_op!(Div);
 #[cfg(feature = "random")]
 impl_read_op!(Dropout, |attrs: &Attrs| {
     let seed = attrs.get_as_int("seed")?;
-    Ok(ops::Dropout { seed })
+
+    // `ratio` was an attribute until opset 12, when it became an input.
+    let mut const_inputs = Vec::new();
+    if let Some(ratio) = attrs.get("ratio") {
+        const_inputs.push((1, ConstInput::Float(ratio.as_f32())));
+    }
+
+    Ok(ParsedOp::new(ops::Dropout { seed }).with_inputs(const_inputs))
 });
 
 impl_read_op!(DynamicQuantizeLinear);
@@ -1039,7 +1202,10 @@ impl_read_op!(GreaterOrEqual);
 
 impl_read_op!(GridSample, |attrs: &Attrs| {
     let align_corners = attrs.get_as("align_corners").unwrap_or(false);
-    attrs.check_eq("mode", "bilinear")?;
+
+    // Opset 16 named the interpolation modes "bilinear", "nearest" and
+    // "bicubic". Opset 20 renamed them to "linear", "nearest" and "cubic".
+    attrs.check("mode", |mode: &str| matches!(mode, "bilinear" | "linear"))?;
     attrs.check_eq("padding_mode", "zeros")?;
 
     Ok(ops::GridSample { align_corners })
@@ -1049,7 +1215,7 @@ impl_read_op!(GRU, |attrs: &Attrs| {
     let RnnAttrs {
         direction,
         hidden_size,
-    } = get_common_rnn_attrs(attrs)?;
+    } = get_common_rnn_attrs(attrs, &["Sigmoid", "Tanh"])?;
 
     let linear_before_reset = attrs.get_as("linear_before_reset").unwrap_or(false);
     Ok(ops::GRU {
@@ -1074,7 +1240,7 @@ impl ReadOp for ops::If {
     }
 
     fn read(op: &onnx::NodeProto, ctx: &dyn OpLoadContext) -> Result<ParsedOp<Self>, ReadOpError> {
-        let attrs = Attrs::new(&op.attribute);
+        let attrs = Attrs::new(&op.attribute, ctx.opset_version());
         let then_branch = ctx.load_graph(attrs.require("then_branch")?.as_graph()?)?;
         let else_branch = ctx.load_graph(attrs.require("else_branch")?.as_graph()?)?;
         Ok(ops::If {
@@ -1115,6 +1281,11 @@ impl_read_op!(Less);
 impl_read_op!(LessOrEqual);
 impl_read_op!(Log);
 
+impl_read_op!(LpNormalization, |attrs: &Attrs| {
+    let axis = attrs.get_as_int("axis")?.unwrap_or(-1);
+    let p = attrs.get_as_int("p")?.unwrap_or(2);
+    Ok(ops::LpNormalization { axis, p })
+});
 impl_read_op!(LogSoftmax, |attrs: &Attrs| {
     let axis = attrs.get_as_int("axis")?.unwrap_or(-1);
     Ok(ops::LogSoftmax { axis })
@@ -1126,7 +1297,7 @@ impl ReadOp for ops::Loop {
     }
 
     fn read(op: &onnx::NodeProto, ctx: &dyn OpLoadContext) -> Result<ParsedOp<Self>, ReadOpError> {
-        let attrs = Attrs::new(&op.attribute);
+        let attrs = Attrs::new(&op.attribute, ctx.opset_version());
         let body = ctx.load_graph(attrs.require("body")?.as_graph()?)?;
         Ok(ops::Loop { body }.into())
     }
@@ -1137,7 +1308,14 @@ struct RnnAttrs {
     direction: Direction,
 }
 
-fn get_common_rnn_attrs(attrs: &Attrs) -> Result<RnnAttrs, ReadOpError> {
+/// Read the attributes which are common to all RNN operators.
+///
+/// `default_activations` are the activation functions the operator uses for
+/// one direction, in the order the ONNX spec lists them.
+fn get_common_rnn_attrs(
+    attrs: &Attrs,
+    default_activations: &[&str],
+) -> Result<RnnAttrs, ReadOpError> {
     // ONNX spec does not state that hidden_size is required, but doesn't
     // provide a default. ONNX Runtime requires it to be present and non-zero.
     let hidden_size = attrs.require("hidden_size")?.cast_int()?;
@@ -1154,6 +1332,23 @@ fn get_common_rnn_attrs(attrs: &Attrs) -> Result<RnnAttrs, ReadOpError> {
         .transpose()?
         .unwrap_or(Direction::Forward);
 
+    attrs.check("activation_alpha", |val: &[f32]| val.is_empty())?;
+    attrs.check("activation_beta", |val: &[f32]| val.is_empty())?;
+
+    // Only the default activations are supported. A bidirectional operator
+    // repeats the list once per direction.
+    attrs.check("activations", |val: &[String]| {
+        val.is_empty()
+            || (val.len() == default_activations.len() * direction.num_directions()
+                && val
+                    .iter()
+                    .zip(default_activations.iter().cycle())
+                    .all(|(act, default)| act == default))
+    })?;
+
+    attrs.check_eq("clip", 0.)?;
+    attrs.check_eq("layout", 0)?;
+
     Ok(RnnAttrs {
         hidden_size,
         direction,
@@ -1164,14 +1359,9 @@ impl_read_op!(LSTM, |attrs: &Attrs| {
     let RnnAttrs {
         direction,
         hidden_size,
-    } = get_common_rnn_attrs(attrs)?;
+    } = get_common_rnn_attrs(attrs, &["Sigmoid", "Tanh", "Tanh"])?;
 
-    attrs.check("activation_alpha", |val: &[f32]| val.is_empty())?;
-    attrs.check("activation_beta", |val: &[f32]| val.is_empty())?;
-    attrs.check("activations", |val: &[String]| val.is_empty())?;
-    attrs.check_eq("clip", 0.)?;
     attrs.check_eq("input_forget", 0)?;
-    attrs.check_eq("layout", 0)?;
 
     Ok(ops::LSTM {
         direction,
@@ -1182,6 +1372,7 @@ impl_read_op!(LSTM, |attrs: &Attrs| {
 impl_read_op!(MatMul);
 impl_read_op!(MatMulInteger);
 
+#[cfg(feature = "contrib")]
 impl_read_op!("com.microsoft", MatMulNBits, |attrs: &Attrs| {
     // Spec allows any value between 2 and 8.
     attrs.check_eq("bits", 4)?;
@@ -1271,6 +1462,50 @@ impl_read_op!(Mod, |attrs: &Attrs| {
 });
 
 impl_read_op!(Mul);
+
+#[cfg(feature = "contrib")]
+impl_read_op!("com.microsoft", GroupQueryAttention, |attrs: &Attrs| {
+    let num_heads = attrs.require("num_heads")?.cast_int()?;
+    let kv_num_heads = attrs.require("kv_num_heads")?.cast_int()?;
+    let scale = attrs.get_as("scale");
+    let do_rotary = attrs.get_as("do_rotary").unwrap_or_default();
+    let rotary_interleaved = attrs.get_as("rotary_interleaved").unwrap_or_default();
+    // A non-positive window size (default is -1) means local attention is
+    // disabled.
+    let local_window_size = attrs
+        .get_as_int::<i32>("local_window_size")?
+        .and_then(|size| u32::try_from(size).ok())
+        .filter(|&size| size > 0);
+    let softcap = attrs.get_as("softcap").unwrap_or(0.0);
+    let smooth_softmax = attrs.get_as("smooth_softmax").unwrap_or_default();
+
+    Ok(ops::GroupQueryAttention {
+        num_heads,
+        kv_num_heads,
+        scale,
+        do_rotary,
+        rotary_interleaved,
+        local_window_size,
+        softcap,
+        smooth_softmax,
+    })
+});
+
+#[cfg(feature = "contrib")]
+impl_read_op!("com.microsoft", MultiHeadAttention, |attrs: &Attrs| {
+    let mask_filter_value: f32 = attrs.get_as("mask_filter_value").unwrap_or(-10000.0);
+    let num_heads = attrs.require("num_heads")?.cast_int()?;
+    let unidirectional = attrs.get_as("unidirectional").unwrap_or_default();
+    let scale = attrs.get_as("scale");
+
+    Ok(ops::MultiHeadAttention {
+        mask_filter_value,
+        num_heads,
+        scale,
+        unidirectional,
+    })
+});
+
 impl_read_op!(Neg);
 
 impl_read_op!(NonMaxSuppression, |attrs: &Attrs| {
@@ -1306,18 +1541,43 @@ impl_read_op!(Pad, |attrs: &Attrs| {
         })
         .transpose()?
         .unwrap_or(PadMode::Constant);
-    Ok(ops::Pad { mode })
+
+    // `pads` and `value` were attributes before opset 11.
+    let mut const_inputs = Vec::new();
+    if let Some(pads) = attrs.get("pads") {
+        const_inputs.push((1, ConstInput::Ints(pads.as_ints().to_vec())));
+    }
+    if let Some(value) = attrs.get("value") {
+        const_inputs.push((2, ConstInput::Float(value.as_f32())));
+    }
+
+    Ok(ParsedOp::new(ops::Pad { mode }).with_inputs(const_inputs))
 });
 
 impl_read_op!(Pow);
 impl_read_op!(PRelu);
 
 impl_read_op!(QuantizeLinear, |attrs: &Attrs| {
+    // A zero "output_dtype" means the type is taken from the `zero_point`
+    // input instead.
     let output_dtype = attrs
         .get("output_dtype")
-        .map(|v| v.as_dtype())
+        .filter(|dt| dt.as_i64() != 0)
+        .map(|dt| dt.as_dtype())
         .transpose()?;
     let axis = attrs.get_as_int("axis")?.unwrap_or(-1);
+
+    // A non-zero "block_size" selects blocked quantization, which is
+    // unsupported.
+    attrs.check_eq("block_size", 0)?;
+
+    // "saturate" only applies to FP8, which is unsupported.
+    attrs.check_eq("saturate", 1)?;
+
+    // A zero "precision" means the division is performed using the type of the
+    // `scale` input.
+    attrs.check_eq("precision", 0)?;
+
     Ok(ops::QuantizeLinear { axis, output_dtype })
 });
 
@@ -1330,8 +1590,40 @@ impl_read_op!(RMSNormalization, |attrs: &Attrs| {
 });
 
 #[cfg(feature = "random")]
+impl_read_op!(Multinomial, |attrs: &Attrs| {
+    let dtype = attrs
+        .get_as_int::<i32>("dtype")?
+        .map(onnx::DataType)
+        .unwrap_or(onnx::DataType::INT32);
+    if !matches!(dtype, onnx::DataType::INT32 | onnx::DataType::INT64) {
+        return Err(ReadOpError::attr_error(
+            "dtype",
+            "only int32 and int64 output types are supported",
+        ));
+    }
+
+    let sample_size = attrs.get_as_int::<usize>("sample_size")?.unwrap_or(1);
+    let seed = attrs.get_as("seed");
+    Ok(ops::Multinomial { sample_size, seed })
+});
+
+/// Check that the "dtype" attribute of a `Random*` operator, if set, specifies
+/// a type which RTen maps to f32, as these operators only generate f32 output.
+#[cfg(feature = "random")]
+fn check_random_dtype(attrs: &Attrs) -> Result<(), ReadOpError> {
+    let dtype = attrs.get("dtype").map(|v| v.as_dtype()).transpose()?;
+    match dtype {
+        None | Some(DataType::Float) => Ok(()),
+        Some(_) => Err(ReadOpError::attr_error(
+            "dtype",
+            "only float output types are supported",
+        )),
+    }
+}
+
+#[cfg(feature = "random")]
 impl_read_op!(RandomNormal, |attrs: &Attrs| {
-    attrs.check_eq("dtype", i64::from(onnx::DataType::FLOAT.0))?;
+    check_random_dtype(attrs)?;
 
     let shape = attrs.require("shape")?.cast_ints()?;
     let mean = attrs.get_as("mean").unwrap_or(0.);
@@ -1347,7 +1639,7 @@ impl_read_op!(RandomNormal, |attrs: &Attrs| {
 
 #[cfg(feature = "random")]
 impl_read_op!(RandomNormalLike, |attrs: &Attrs| {
-    attrs.check_eq("dtype", i64::from(onnx::DataType::FLOAT.0))?;
+    check_random_dtype(attrs)?;
 
     let mean = attrs.get_as("mean").unwrap_or(0.);
     let scale = attrs.get_as("scale").unwrap_or(1.);
@@ -1357,7 +1649,7 @@ impl_read_op!(RandomNormalLike, |attrs: &Attrs| {
 
 #[cfg(feature = "random")]
 impl_read_op!(RandomUniform, |attrs: &Attrs| {
-    attrs.check_eq("dtype", i64::from(onnx::DataType::FLOAT.0))?;
+    check_random_dtype(attrs)?;
 
     let shape = attrs.require("shape")?.cast_ints()?;
     let low = attrs.get_as("low").unwrap_or(0.);
@@ -1373,7 +1665,7 @@ impl_read_op!(RandomUniform, |attrs: &Attrs| {
 
 #[cfg(feature = "random")]
 impl_read_op!(RandomUniformLike, |attrs: &Attrs| {
-    attrs.check_eq("dtype", i64::from(onnx::DataType::FLOAT.0))?;
+    check_random_dtype(attrs)?;
 
     let low = attrs.get_as("low").unwrap_or(0.);
     let high = attrs.get_as("high").unwrap_or(1.);
@@ -1381,7 +1673,10 @@ impl_read_op!(RandomUniformLike, |attrs: &Attrs| {
     Ok(ops::RandomUniformLike { low, high, seed })
 });
 
-impl_read_op!(Range);
+impl_read_op!(Range, |attrs: &Attrs| {
+    attrs.check_eq("stash_type", 1)?;
+    Ok(ops::Range {})
+});
 impl_read_op!(Reciprocal);
 
 macro_rules! impl_read_op_for_reduce_op {
@@ -1399,7 +1694,10 @@ macro_rules! impl_read_op_for_reduce_op {
     };
 }
 
+impl_read_op_for_reduce_op!(ReduceL1);
 impl_read_op_for_reduce_op!(ReduceL2);
+impl_read_op_for_reduce_op!(ReduceLogSum);
+impl_read_op_for_reduce_op!(ReduceLogSumExp);
 impl_read_op_for_reduce_op!(ReduceMax);
 impl_read_op_for_reduce_op!(ReduceMean);
 impl_read_op_for_reduce_op!(ReduceMin);
@@ -1410,7 +1708,14 @@ impl_read_op!(Relu);
 
 impl_read_op!(Reshape, |attrs: &Attrs| {
     let allow_zero = attrs.get_as("allowzero").unwrap_or(false);
-    Ok(ops::Reshape { allow_zero })
+
+    // `shape` was an attribute before opset 5.
+    let mut const_inputs = Vec::new();
+    if let Some(shape) = attrs.get("shape") {
+        const_inputs.push((1, ConstInput::Ints(shape.as_ints().to_vec())));
+    }
+
+    Ok(ParsedOp::new(ops::Reshape { allow_zero }).with_inputs(const_inputs))
 });
 
 impl_read_op!(Resize, |attrs: &Attrs| {
@@ -1472,6 +1777,75 @@ impl_read_op!(Resize, |attrs: &Attrs| {
     })
 });
 
+impl_read_op!(ReverseSequence, |attrs: &Attrs| {
+    let batch_axis = attrs.get_as_int("batch_axis")?.unwrap_or(1);
+    let time_axis = attrs.get_as_int("time_axis")?.unwrap_or(0);
+    Ok(ops::ReverseSequence {
+        batch_axis,
+        time_axis,
+    })
+});
+
+impl_read_op!(Upsample, |attrs: &Attrs| {
+    let mode = attrs
+        .get("mode")
+        .map(|v| {
+            v.as_string_enum(|val| match val {
+                "nearest" => Some(ResizeMode::Nearest),
+                "linear" => Some(ResizeMode::Linear),
+                _ => None,
+            })
+        })
+        .transpose()?
+        .unwrap_or(ResizeMode::Nearest);
+
+    // `scales` is a required attribute in opset 7. In opset 9+ it is passed as
+    // the second input.
+    let mut const_inputs = Vec::new();
+    if let Some(scales) = attrs.get("scales") {
+        const_inputs.push((1, ConstInput::Floats(scales.as_floats().to_vec())));
+    }
+
+    Ok(ParsedOp::new(ops::Upsample { mode }).with_inputs(const_inputs))
+});
+
+#[cfg(feature = "contrib")]
+impl_read_op!(
+    "com.microsoft",
+    "RotaryEmbedding",
+    RotaryEmbeddingMicrosoft,
+    |attrs: &Attrs| {
+        let interleaved = attrs.get_as("interleaved").unwrap_or_default();
+        let num_heads = attrs.get_as_int::<usize>("num_heads")?;
+        let rotary_embedding_dim = attrs
+            .get_as_int::<usize>("rotary_embedding_dim")?
+            .unwrap_or_default();
+
+        Ok(ops::RotaryEmbeddingMicrosoft {
+            interleaved,
+            num_heads,
+            rotary_embedding_dim,
+        })
+    }
+);
+
+impl_read_op!(RotaryEmbedding, |attrs: &Attrs| {
+    let interleaved = attrs.get_as("interleaved").unwrap_or_default();
+
+    // Required for 3D input but optional for 4D, so we validate at runtime.
+    let num_heads = attrs.get_as_int::<usize>("num_heads")?.unwrap_or_default();
+
+    let rotary_embedding_dim = attrs
+        .get_as_int::<usize>("rotary_embedding_dim")?
+        .unwrap_or_default();
+
+    Ok(ops::RotaryEmbedding {
+        interleaved,
+        num_heads,
+        rotary_embedding_dim,
+    })
+});
+
 impl_read_op!(Round);
 
 fn convert_scatter_reduction(
@@ -1487,6 +1861,11 @@ fn convert_scatter_reduction(
         _ => Err(ReadOpError::attr_error(attr, "unknown value")),
     }
 }
+
+impl_read_op!(Scatter, |attrs: &Attrs| {
+    let axis = attrs.get_as_int("axis")?.unwrap_or(0);
+    Ok(ops::Scatter { axis })
+});
 
 impl_read_op!(ScatterElements, |attrs: &Attrs| {
     let reduction = attrs.get_as("reduction");
@@ -1521,9 +1900,54 @@ impl_read_op!(Shape, |attrs: &Attrs| {
 
 impl_read_op!(Sigmoid);
 impl_read_op!(Sign);
+
+#[cfg(feature = "contrib")]
+impl_read_op!("ai.onnx", SimplifiedLayerNormalization, |attrs: &Attrs| {
+    let axis = attrs.get_as_int("axis")?.unwrap_or(-1);
+    let epsilon = attrs.get_as("epsilon");
+    attrs.check_eq("stash_type", 1)?;
+
+    Ok(ops::SimplifiedLayerNormalization { axis, epsilon })
+});
+
 impl_read_op!(Sin);
+impl_read_op!(Sinh);
 impl_read_op!(Size);
-impl_read_op!(Slice);
+
+#[cfg(feature = "contrib")]
+impl_read_op!("com.microsoft", SkipLayerNormalization, |attrs: &Attrs| {
+    let epsilon = attrs.require("epsilon")?.as_f32();
+
+    Ok(ops::SkipLayerNormalization { epsilon })
+});
+
+#[cfg(feature = "contrib")]
+impl_read_op!(
+    "com.microsoft",
+    SkipSimplifiedLayerNormalization,
+    |attrs: &Attrs| {
+        let epsilon = attrs.require("epsilon")?.as_f32();
+
+        Ok(ops::SkipSimplifiedLayerNormalization { epsilon })
+    }
+);
+
+impl_read_op!(Slice, |attrs: &Attrs| {
+    // In opset versions <10, `starts`, `ends` and `axes` were specified as
+    // attributes rather than inputs. Convert them to constant inputs at the
+    // positions where the operator expects them.
+    let mut const_inputs = Vec::new();
+    if let Some(starts) = attrs.get("starts") {
+        const_inputs.push((1, ConstInput::Ints(starts.as_ints().to_vec())));
+    }
+    if let Some(ends) = attrs.get("ends") {
+        const_inputs.push((2, ConstInput::Ints(ends.as_ints().to_vec())));
+    }
+    if let Some(axes) = attrs.get("axes") {
+        const_inputs.push((3, ConstInput::Ints(axes.as_ints().to_vec())));
+    }
+    Ok(ParsedOp::new(ops::Slice {}).with_inputs(const_inputs))
+});
 
 impl_read_op!(Softmax, |attrs: &Attrs| {
     let axis = attrs.get_as_int("axis")?.unwrap_or(-1);
@@ -1571,6 +1995,12 @@ impl_read_op!(STFT, |attrs: &Attrs| {
 
 impl_read_op!(Sub);
 impl_read_op!(Sum);
+
+impl_read_op!(Swish, |attrs: &Attrs| {
+    let alpha = attrs.get_as("alpha").unwrap_or(1.0);
+    Ok(ops::Swish { alpha })
+});
+
 impl_read_op!(Tan);
 impl_read_op!(Tanh);
 impl_read_op!(Tile);
@@ -1579,11 +2009,19 @@ impl_read_op!(TopK, |attrs: &Attrs| {
     let axis = attrs.get_as_int("axis")?;
     let largest = attrs.get_as("largest").unwrap_or(true);
     let sorted = attrs.get_as("sorted").unwrap_or(true);
-    Ok(ops::TopK {
+
+    // `k` was an attribute before opset 10.
+    let mut const_inputs = Vec::new();
+    if let Some(k) = attrs.get("k") {
+        const_inputs.push((1, ConstInput::Int(k.as_i64())));
+    }
+
+    Ok(ParsedOp::new(ops::TopK {
         axis,
         largest,
         sorted,
     })
+    .with_inputs(const_inputs))
 });
 
 impl_read_op!(Transpose, |attrs: &Attrs| {
@@ -1610,19 +2048,43 @@ impl_read_op!(Xor);
 #[cfg(test)]
 mod tests {
     use rten_onnx::onnx;
+    use rten_simd::f16;
     use rten_testing::TestCases;
 
     use super::{ConstInput, OnnxOpRegistry, OpLoadContext, ReadOpError};
-    use crate::graph::Graph;
+    use crate::graph::{Constant, Graph};
     use crate::model::onnx_builder::{NodeProtoExt, TensorData, create_node, create_tensor};
-    use crate::ops::{ArgMax, ConstantOfShape, Conv, Padding};
+    use crate::model::onnx_loader::load_constant;
+    #[cfg(feature = "contrib")]
+    use crate::operator::Operator;
+    use crate::ops::{
+        ArgMax, ConstantOfShape, Conv, GridSample, Padding, ResizeMode, RotaryEmbedding, Upsample,
+    };
+    #[cfg(feature = "contrib")]
+    use crate::ops::{GroupQueryAttention, RotaryEmbeddingMicrosoft};
     use crate::value::Scalar;
 
-    struct FakeOpLoadContext;
+    #[derive(Default)]
+    struct FakeOpLoadContext {
+        opset_version: Option<u16>,
+    }
 
     impl OpLoadContext for FakeOpLoadContext {
         fn load_graph(&self, _graph: &onnx::GraphProto) -> Result<Graph, ReadOpError> {
             Ok(Graph::new())
+        }
+
+        fn opset_version(&self) -> Option<u16> {
+            self.opset_version
+        }
+
+        fn load_tensor(
+            &self,
+            attr_name: &str,
+            tensor: &onnx::TensorProto,
+        ) -> Result<Constant, ReadOpError> {
+            load_constant(tensor, None, None)
+                .map_err(|err| ReadOpError::attr_error(attr_name, err.to_string()))
         }
     }
 
@@ -1632,13 +2094,125 @@ mod tests {
 
         // Supported op with no domain.
         let node = create_node("MatMul");
-        let op = reg.read_op(&node, &FakeOpLoadContext).unwrap().op;
+        let op = reg
+            .read_op(&node, &FakeOpLoadContext::default())
+            .unwrap()
+            .op;
         assert_eq!(op.name(), "MatMul");
 
         // Supported op with empty domain.
         let node = create_node("MatMul").with_domain("");
-        let op = reg.read_op(&node, &FakeOpLoadContext).unwrap().op;
+        let op = reg
+            .read_op(&node, &FakeOpLoadContext::default())
+            .unwrap()
+            .op;
         assert_eq!(op.name(), "MatMul");
+    }
+
+    #[cfg(feature = "contrib")]
+    #[test]
+    fn test_read_domain_op_with_distinct_impl_name() {
+        let reg = OnnxOpRegistry::with_all_ops();
+        let node = create_node("RotaryEmbedding")
+            .with_domain("com.microsoft")
+            .with_attr("num_heads", 2i64);
+
+        let op = reg
+            .read_op(&node, &FakeOpLoadContext::default())
+            .unwrap()
+            .op;
+
+        let rotary = op.downcast_ref::<RotaryEmbeddingMicrosoft>().unwrap();
+        assert_eq!(rotary.num_heads, Some(2));
+        assert_eq!(rotary.name(), "com.microsoft.RotaryEmbedding");
+    }
+
+    #[cfg(feature = "contrib")]
+    #[test]
+    fn test_read_group_query_attention_local_window_size() {
+        let reg = OnnxOpRegistry::with_all_ops();
+
+        let read = |local_window_size: Option<i64>| {
+            let mut node = create_node("GroupQueryAttention")
+                .with_domain("com.microsoft")
+                .with_attr("num_heads", 2i64)
+                .with_attr("kv_num_heads", 1i64);
+            if let Some(size) = local_window_size {
+                node = node.with_attr("local_window_size", size);
+            }
+            let op = reg
+                .read_op(&node, &FakeOpLoadContext::default())
+                .unwrap()
+                .op;
+            op.downcast_ref::<GroupQueryAttention>()
+                .unwrap()
+                .local_window_size
+        };
+
+        // A positive window enables local attention.
+        assert_eq!(read(Some(4)), Some(4));
+        // The default (-1) and any non-positive value disable local attention.
+        assert_eq!(read(Some(-1)), None);
+        assert_eq!(read(Some(0)), None);
+        assert_eq!(read(None), None);
+    }
+
+    #[test]
+    fn test_read_rotary_embedding_allows_missing_num_heads() {
+        // `num_heads` is only required for 3D input, which is validated at run
+        // time. A missing attribute loads with `num_heads` defaulting to 0.
+        let reg = OnnxOpRegistry::with_all_ops();
+        let node = create_node("RotaryEmbedding");
+
+        let op = reg
+            .read_op(&node, &FakeOpLoadContext::default())
+            .unwrap()
+            .op;
+
+        let rotary = op.downcast_ref::<RotaryEmbedding>().unwrap();
+        assert_eq!(rotary.num_heads, 0);
+    }
+
+    #[cfg(feature = "contrib")]
+    #[test]
+    fn test_read_rotary_embedding_microsoft_allows_missing_num_heads() {
+        let reg = OnnxOpRegistry::with_all_ops();
+        let node = create_node("RotaryEmbedding").with_domain("com.microsoft");
+
+        let op = reg
+            .read_op(&node, &FakeOpLoadContext::default())
+            .unwrap()
+            .op;
+
+        let rotary = op.downcast_ref::<RotaryEmbeddingMicrosoft>().unwrap();
+        assert_eq!(rotary.num_heads, None);
+    }
+
+    #[test]
+    fn test_read_rotary_embedding_rejects_negative_num_heads() {
+        let reg = OnnxOpRegistry::with_all_ops();
+        let node = create_node("RotaryEmbedding").with_attr("num_heads", -1i64);
+
+        let result = reg.read_op(&node, &FakeOpLoadContext::default());
+
+        assert!(matches!(
+            result,
+            Err(ReadOpError::AttrError { attr, .. }) if attr == "num_heads"
+        ));
+    }
+
+    #[test]
+    fn test_read_rotary_embedding() {
+        let reg = OnnxOpRegistry::with_all_ops();
+        let node = create_node("RotaryEmbedding").with_attr("num_heads", 2i64);
+
+        let op = reg
+            .read_op(&node, &FakeOpLoadContext::default())
+            .unwrap()
+            .op;
+
+        let rotary = op.downcast_ref::<RotaryEmbedding>().unwrap();
+        assert_eq!(rotary.num_heads, 2);
     }
 
     #[test]
@@ -1648,11 +2222,205 @@ mod tests {
             .with_attr("axis", 1)
             .with_attr("keepdims", true);
 
-        let op = reg.read_op(&node, &FakeOpLoadContext).unwrap().op;
+        let op = reg
+            .read_op(&node, &FakeOpLoadContext::default())
+            .unwrap()
+            .op;
 
         let argmax_op = op.downcast_ref::<ArgMax>().unwrap();
         assert_eq!(argmax_op.axis, 1);
         assert_eq!(argmax_op.keep_dims, true);
+    }
+
+    #[test]
+    fn test_read_grid_sample_mode() {
+        #[derive(Debug)]
+        struct Case {
+            mode: Option<&'static str>,
+            expected: Result<(), &'static str>,
+        }
+
+        let cases = [
+            Case {
+                mode: None,
+                expected: Ok(()),
+            },
+            Case {
+                mode: Some("bilinear"),
+                expected: Ok(()),
+            },
+            Case {
+                mode: Some("linear"),
+                expected: Ok(()),
+            },
+            Case {
+                mode: Some("nearest"),
+                expected: Err("unsupported value"),
+            },
+            Case {
+                mode: Some("cubic"),
+                expected: Err("unsupported value"),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let reg = OnnxOpRegistry::with_all_ops();
+            let mut node = create_node("GridSample");
+            if let Some(mode) = case.mode {
+                node = node.with_attr("mode", mode.to_string());
+            }
+
+            let result = reg.read_op(&node, &FakeOpLoadContext::default());
+
+            match (result, case.expected) {
+                (Ok(op), Ok(())) => {
+                    assert!(op.op.downcast_ref::<GridSample>().is_some());
+                }
+                (Err(err), Err(expected)) => {
+                    assert!(
+                        err.to_string().contains(expected),
+                        "{} does not contain {}",
+                        err,
+                        expected
+                    );
+                }
+                (result, expected) => {
+                    panic!("expected {:?} but got {:?}", expected, result.map(|_| ()))
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn test_read_rnn_activations() {
+        #[derive(Debug)]
+        struct Case<'a> {
+            op_type: &'a str,
+            direction: Option<&'a str>,
+            activations: Option<&'a [&'a str]>,
+            expected: Result<(), &'a str>,
+        }
+
+        let cases = [
+            // Unset.
+            Case {
+                op_type: "LSTM",
+                direction: None,
+                activations: None,
+                expected: Ok(()),
+            },
+            Case {
+                op_type: "GRU",
+                direction: None,
+                activations: None,
+                expected: Ok(()),
+            },
+            // Defaults set explicitly.
+            Case {
+                op_type: "LSTM",
+                direction: None,
+                activations: Some(&["Sigmoid", "Tanh", "Tanh"]),
+                expected: Ok(()),
+            },
+            Case {
+                op_type: "GRU",
+                direction: None,
+                activations: Some(&["Sigmoid", "Tanh"]),
+                expected: Ok(()),
+            },
+            // Defaults repeated once per direction.
+            Case {
+                op_type: "LSTM",
+                direction: Some("bidirectional"),
+                activations: Some(&["Sigmoid", "Tanh", "Tanh", "Sigmoid", "Tanh", "Tanh"]),
+                expected: Ok(()),
+            },
+            Case {
+                op_type: "GRU",
+                direction: Some("bidirectional"),
+                activations: Some(&["Sigmoid", "Tanh", "Sigmoid", "Tanh"]),
+                expected: Ok(()),
+            },
+            // Non-default activations are not implemented.
+            Case {
+                op_type: "LSTM",
+                direction: None,
+                activations: Some(&["Sigmoid", "Tanh", "Relu"]),
+                expected: Err("unsupported value"),
+            },
+            Case {
+                op_type: "GRU",
+                direction: None,
+                activations: Some(&["Relu", "Tanh"]),
+                expected: Err("unsupported value"),
+            },
+            // Defaults with wrong length for operator.
+            Case {
+                op_type: "GRU",
+                direction: None,
+                activations: Some(&["Sigmoid", "Tanh", "Tanh"]),
+                expected: Err("unsupported value"),
+            },
+            // Defaults with wrong length for direction count.
+            Case {
+                op_type: "LSTM",
+                direction: None,
+                activations: Some(&["Sigmoid", "Tanh", "Tanh", "Sigmoid", "Tanh", "Tanh"]),
+                expected: Err("unsupported value"),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let reg = OnnxOpRegistry::with_all_ops();
+            let mut node = create_node(case.op_type).with_attr("hidden_size", 4i64);
+            if let Some(direction) = case.direction {
+                node = node.with_attr("direction", direction.to_string());
+            }
+            if let Some(activations) = case.activations {
+                let activations: Vec<String> =
+                    activations.iter().map(|act| act.to_string()).collect();
+                node = node.with_attr("activations", activations);
+            }
+
+            let result = reg.read_op(&node, &FakeOpLoadContext::default());
+
+            match (result, case.expected) {
+                (Ok(op), Ok(())) => assert_eq!(op.op.name(), case.op_type),
+                (Err(err), Err(expected)) => {
+                    assert!(
+                        err.to_string().contains(expected),
+                        "{} does not contain {}",
+                        err,
+                        expected
+                    );
+                }
+                (result, expected) => {
+                    panic!("expected {:?} but got {:?}", expected, result.map(|_| ()))
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn test_read_upsample() {
+        let reg = OnnxOpRegistry::with_all_ops();
+
+        // `mode` defaults to nearest.
+        let node = create_node("Upsample");
+        let op = reg
+            .read_op(&node, &FakeOpLoadContext::default())
+            .unwrap()
+            .op;
+        let upsample = op.downcast_ref::<Upsample>().unwrap();
+        assert!(matches!(upsample.mode, ResizeMode::Nearest));
+
+        let node = create_node("Upsample").with_attr("mode", "linear".to_string());
+        let op = reg
+            .read_op(&node, &FakeOpLoadContext::default())
+            .unwrap()
+            .op;
+        let upsample = op.downcast_ref::<Upsample>().unwrap();
+        assert!(matches!(upsample.mode, ResizeMode::Linear));
     }
 
     #[test]
@@ -1664,12 +2432,17 @@ mod tests {
             .with_attr("keepdims", true)
             .with_attr("unused_b", false);
 
-        let op = reg.read_op(&node, &FakeOpLoadContext).unwrap();
-        assert_eq!(op.unused_attrs.len(), 2);
+        let op = reg.read_op(&node, &FakeOpLoadContext::default()).unwrap();
+        assert_eq!(op.unused_attrs.count_true(), 2);
         let unused_attrs: Vec<_> = op
             .unused_attrs
             .iter()
-            .map(|i| node.attribute[i].name.as_deref().unwrap_or_default())
+            .map(|i| {
+                node.attribute[i as usize]
+                    .name
+                    .as_deref()
+                    .unwrap_or_default()
+            })
             .collect();
         assert_eq!(unused_attrs, &["unused_a", "unused_b"]);
     }
@@ -1679,17 +2452,39 @@ mod tests {
         // Default domain, unknown op type.
         let reg = OnnxOpRegistry::with_all_ops();
         let node = create_node("UnsupportedOp");
-        let op = reg.read_op(&node, &FakeOpLoadContext);
+        let op = reg.read_op(&node, &FakeOpLoadContext::default());
         assert!(
             matches!(op, Err(ReadOpError::OperatorUnavailable { name }) if name == Some("UnsupportedOp".to_string()))
         );
 
         // Known op type, but custom domain.
         let node = create_node("MatMul").with_domain("com.foobar");
-        let op = reg.read_op(&node, &FakeOpLoadContext);
+        let op = reg.read_op(&node, &FakeOpLoadContext::default());
         assert!(
             matches!(op, Err(ReadOpError::OperatorUnavailable { name }) if name == Some("com.foobar/MatMul".to_string()))
         );
+    }
+
+    // Contrib ops load when the `contrib` feature is enabled and report which
+    // feature is missing when it is not.
+    #[test]
+    fn test_read_contrib_op() {
+        let reg = OnnxOpRegistry::with_all_ops();
+        let node = create_node("MatMulNBits")
+            .with_domain("com.microsoft")
+            .with_attr("bits", 4i64)
+            .with_attr("block_size", 32i64);
+        let result = reg.read_op(&node, &FakeOpLoadContext::default());
+
+        #[cfg(feature = "contrib")]
+        assert!(result.is_ok());
+
+        #[cfg(not(feature = "contrib"))]
+        assert!(matches!(
+            result,
+            Err(ReadOpError::FeatureNotEnabled { name, feature })
+                if name == "MatMulNBits" && feature == "contrib"
+        ));
     }
 
     #[test]
@@ -1697,7 +2492,10 @@ mod tests {
         let reg = OnnxOpRegistry::with_all_ops();
         let node = create_node("Conv").with_attr("kernel_shape", vec![3, 3]);
 
-        let op = reg.read_op(&node, &FakeOpLoadContext).unwrap().op;
+        let op = reg
+            .read_op(&node, &FakeOpLoadContext::default())
+            .unwrap()
+            .op;
         let conv_op = op.downcast_ref::<Conv>().unwrap();
 
         assert_eq!(conv_op.padding, Padding::Fixed([0, 0, 0, 0].into()));
@@ -1746,7 +2544,10 @@ mod tests {
                 node = node.with_attr("pads", pads.clone());
             }
 
-            let op = reg.read_op(&node, &FakeOpLoadContext).unwrap().op;
+            let op = reg
+                .read_op(&node, &FakeOpLoadContext::default())
+                .unwrap()
+                .op;
             let conv_op = op.downcast_ref::<Conv>().unwrap();
 
             assert_eq!(conv_op.padding, case.expected);
@@ -1756,59 +2557,138 @@ mod tests {
     #[test]
     fn test_constant_of_shape_dtypes() {
         #[derive(Debug)]
-        struct Case {
+        struct Case<'a> {
             dtype: onnx::DataType,
+            shape: &'a [usize],
             data: TensorData,
-            expected: ConstantOfShape,
+            expected: Result<ConstantOfShape, &'a str>,
         }
 
         let cases = [
             // Conversions that don't alter the dtype.
             Case {
                 dtype: onnx::DataType::FLOAT,
+                shape: &[],
                 data: TensorData::Raw(1.0f32.to_le_bytes().into()),
-                expected: ConstantOfShape {
+                expected: Ok(ConstantOfShape {
                     value: Scalar::Float(1.0),
-                },
+                }),
             },
             Case {
                 dtype: onnx::DataType::INT32,
+                shape: &[],
                 data: TensorData::Raw(2i32.to_le_bytes().into()),
-                expected: ConstantOfShape {
-                    value: Scalar::Int(2),
-                },
+                expected: Ok(ConstantOfShape {
+                    value: Scalar::Int32(2),
+                }),
+            },
+            Case {
+                dtype: onnx::DataType::INT8,
+                shape: &[],
+                data: TensorData::Raw((-3i8).to_le_bytes().into()),
+                expected: Ok(ConstantOfShape {
+                    value: Scalar::Int8(-3),
+                }),
+            },
+            Case {
+                dtype: onnx::DataType::UINT8,
+                shape: &[],
+                data: TensorData::Raw(200u8.to_le_bytes().into()),
+                expected: Ok(ConstantOfShape {
+                    value: Scalar::UInt8(200),
+                }),
             },
             // Test conversions that alter the dtype.
             Case {
                 dtype: onnx::DataType::BOOL,
+                shape: &[],
                 data: TensorData::Int([1].into()),
-                expected: ConstantOfShape {
-                    value: Scalar::Int(1),
-                },
+                expected: Ok(ConstantOfShape {
+                    value: Scalar::Int32(1),
+                }),
             },
             Case {
                 dtype: onnx::DataType::BOOL,
+                shape: &[],
                 data: TensorData::Raw([0].into()),
-                expected: ConstantOfShape {
-                    value: Scalar::Int(0),
-                },
+                expected: Ok(ConstantOfShape {
+                    value: Scalar::Int32(0),
+                }),
             },
             Case {
                 dtype: onnx::DataType::INT64,
+                shape: &[],
                 data: TensorData::Raw(42i64.to_le_bytes().into()),
-                expected: ConstantOfShape {
-                    value: Scalar::Int(42),
-                },
+                expected: Ok(ConstantOfShape {
+                    value: Scalar::Int32(42),
+                }),
+            },
+            Case {
+                dtype: onnx::DataType::DOUBLE,
+                shape: &[],
+                data: TensorData::Double([2.5].into()),
+                expected: Ok(ConstantOfShape {
+                    value: Scalar::Float(2.5),
+                }),
+            },
+            // f16 values are converted to f32.
+            Case {
+                dtype: onnx::DataType::FLOAT16,
+                shape: &[],
+                data: TensorData::Raw(f16::from_f32(2.5).to_bits().to_le_bytes().into()),
+                expected: Ok(ConstantOfShape {
+                    value: Scalar::Float(2.5),
+                }),
+            },
+            // The ONNX spec describes `value` as a 1-element 1D tensor, but any
+            // shape with a single element is accepted.
+            Case {
+                dtype: onnx::DataType::FLOAT,
+                shape: &[1],
+                data: TensorData::Raw(3.0f32.to_le_bytes().into()),
+                expected: Ok(ConstantOfShape {
+                    value: Scalar::Float(3.0),
+                }),
+            },
+            Case {
+                dtype: onnx::DataType::FLOAT,
+                shape: &[1, 1],
+                data: TensorData::Raw(3.0f32.to_le_bytes().into()),
+                expected: Ok(ConstantOfShape {
+                    value: Scalar::Float(3.0),
+                }),
+            },
+            // Tensors with more than one element are rejected.
+            Case {
+                dtype: onnx::DataType::INT32,
+                shape: &[2],
+                data: TensorData::Int([1, 2].into()),
+                expected: Err("expected a single element"),
             },
         ];
 
         cases.test_each(|case| {
             let reg = OnnxOpRegistry::with_all_ops();
-            let tensor = create_tensor("test", &[], case.dtype, case.data.clone());
+            let tensor = create_tensor("test", case.shape, case.dtype, case.data.clone());
             let node = create_node("ConstantOfShape").with_attr("value", tensor);
-            let op = reg.read_op(&node, &FakeOpLoadContext).unwrap();
-            let cos_op = op.op.downcast_ref::<ConstantOfShape>().unwrap();
-            assert_eq!(cos_op, &case.expected);
+
+            match (
+                reg.read_op(&node, &FakeOpLoadContext::default()),
+                &case.expected,
+            ) {
+                (Ok(op), Ok(expected)) => {
+                    let cos_op = op.op.downcast_ref::<ConstantOfShape>().unwrap();
+                    assert_eq!(cos_op, expected);
+                }
+                (Err(err), Err(expected)) => {
+                    assert!(
+                        err.to_string().contains(expected),
+                        "expected error containing {expected:?}, got {err}"
+                    );
+                }
+                (Ok(_), Err(expected)) => panic!("expected error containing {expected:?}"),
+                (Err(err), Ok(_)) => panic!("unexpected error {err}"),
+            }
         });
     }
 
@@ -1827,23 +2707,131 @@ mod tests {
                     .with_attr("max", 0.5),
                 expected_inputs: [(1, ConstInput::Float(-0.5)), (2, ConstInput::Float(0.5))].into(),
             },
+            #[cfg(feature = "random")]
+            Case {
+                op: create_node("Dropout").with_attr("ratio", 0.25),
+                expected_inputs: [(1, ConstInput::Float(0.25))].into(),
+            },
+            // Dropout op with no `ratio` attribute.
+            #[cfg(feature = "random")]
+            Case {
+                op: create_node("Dropout"),
+                expected_inputs: [].into(),
+            },
+            // Pad op with `pads` and `value` attributes.
+            Case {
+                op: create_node("Pad")
+                    .with_attr("pads", vec![0, 1, 0, 1])
+                    .with_attr("value", 1.5),
+                expected_inputs: [
+                    (1, ConstInput::Ints([0, 1, 0, 1].into())),
+                    (2, ConstInput::Float(1.5)),
+                ]
+                .into(),
+            },
+            // Pad op with `pads` attribute only.
+            Case {
+                op: create_node("Pad").with_attr("pads", vec![1, 1, 1, 1]),
+                expected_inputs: [(1, ConstInput::Ints([1, 1, 1, 1].into()))].into(),
+            },
+            Case {
+                op: create_node("Reshape").with_attr("shape", vec![2, -1]),
+                expected_inputs: [(1, ConstInput::Ints([2, -1].into()))].into(),
+            },
             Case {
                 op: create_node("Squeeze").with_attr("axes", vec![-1]),
                 expected_inputs: [(1, ConstInput::Ints([-1].into()))].into(),
+            },
+            Case {
+                op: create_node("Slice")
+                    .with_attr("starts", vec![0, 1])
+                    .with_attr("ends", vec![2, 3])
+                    .with_attr("axes", vec![0, 1]),
+                expected_inputs: [
+                    (1, ConstInput::Ints([0, 1].into())),
+                    (2, ConstInput::Ints([2, 3].into())),
+                    (3, ConstInput::Ints([0, 1].into())),
+                ]
+                .into(),
             },
             Case {
                 op: create_node("Split").with_attr("split", vec![10]),
                 expected_inputs: [(1, ConstInput::Ints([10].into()))].into(),
             },
             Case {
+                op: create_node("TopK").with_attr("k", 3),
+                expected_inputs: [(1, ConstInput::Int(3))].into(),
+            },
+            Case {
                 op: create_node("Unsqueeze").with_attr("axes", vec![-1]),
                 expected_inputs: [(1, ConstInput::Ints([-1].into()))].into(),
+            },
+            Case {
+                op: create_node("Upsample").with_attr("scales", vec![1.0f32, 1.0, 2.0, 2.0]),
+                expected_inputs: [(1, ConstInput::Floats([1.0, 1.0, 2.0, 2.0].into()))].into(),
             },
         ];
 
         cases.test_each_value(|case| {
             let reg = OnnxOpRegistry::with_all_ops();
-            let op = reg.read_op(&case.op, &FakeOpLoadContext).unwrap();
+            let op = reg
+                .read_op(&case.op, &FakeOpLoadContext::default())
+                .unwrap();
+            assert_eq!(op.const_inputs, case.expected_inputs);
+        });
+    }
+
+    #[cfg(feature = "fft")]
+    #[test]
+    fn test_dft_axis() {
+        #[derive(Debug)]
+        struct Case {
+            opset_version: Option<u16>,
+            axis: Option<i64>,
+            expected_inputs: Vec<(u32, ConstInput)>,
+        }
+
+        let cases = [
+            // Explicit `axis` attribute is promoted regardless of opset.
+            Case {
+                opset_version: Some(18),
+                axis: Some(-2),
+                expected_inputs: [(2, ConstInput::Int(-2))].into(),
+            },
+            // Absent `axis` in a pre-opset-20 model uses the default of 1.
+            Case {
+                opset_version: Some(17),
+                axis: None,
+                expected_inputs: [(2, ConstInput::Int(1))].into(),
+            },
+            // Absent `axis` in opset 20+ is left to the operator (default -2).
+            Case {
+                opset_version: Some(20),
+                axis: None,
+                expected_inputs: [].into(),
+            },
+            // Absent `axis` with an unknown opset is left to the operator.
+            Case {
+                opset_version: None,
+                axis: None,
+                expected_inputs: [].into(),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let mut node = create_node("DFT");
+            if let Some(axis) = case.axis {
+                node = node.with_attr("axis", axis);
+            }
+            let reg = OnnxOpRegistry::with_all_ops();
+            let op = reg
+                .read_op(
+                    &node,
+                    &FakeOpLoadContext {
+                        opset_version: case.opset_version,
+                    },
+                )
+                .unwrap();
             assert_eq!(op.const_inputs, case.expected_inputs);
         });
     }

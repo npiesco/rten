@@ -7,7 +7,7 @@ use rten_tensor::prelude::*;
 use rten_tensor::{NdTensor, NdTensorView, Tensor, TensorView};
 
 use crate::buffer_pool::BufferPool;
-use crate::infer_shapes::{InferShapes, impl_infer_shapes};
+use crate::infer_shapes::{InferShapes, UnaryOp, impl_infer_shapes};
 use crate::operator::{
     IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
     OutputTypesContext, static_dims,
@@ -24,7 +24,7 @@ pub fn constant_of_shape<T: Copy>(
         .iter()
         .map(|el| (*el).try_into())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| OpError::InvalidValue("Invalid shape"))?;
+        .map_err(|_| OpError::invalid_value("Invalid shape"))?;
     Ok(Tensor::full_in(pool, &shape, value))
 }
 
@@ -47,8 +47,10 @@ impl Operator for ConstantOfShape {
         let shape = ctx.inputs().require_as(0)?;
 
         match self.value {
-            Scalar::Int(value) => constant_of_shape(pool, value, &shape).into_op_result(),
             Scalar::Float(value) => constant_of_shape(pool, value, &shape).into_op_result(),
+            Scalar::Int32(value) => constant_of_shape(pool, value, &shape).into_op_result(),
+            Scalar::Int8(value) => constant_of_shape(pool, value, &shape).into_op_result(),
+            Scalar::UInt8(value) => constant_of_shape(pool, value, &shape).into_op_result(),
         }
     }
 
@@ -66,7 +68,9 @@ impl_infer_shapes!(
     op,
     shape_ops::ConstantOfShape {
         value: match op.value {
-            Scalar::Int(val) => Some(val),
+            Scalar::Int32(val) => Some(val),
+            Scalar::Int8(val) => Some(val.into()),
+            Scalar::UInt8(val) => Some(val.into()),
             Scalar::Float(_) => None,
         },
     }
@@ -111,7 +115,7 @@ fn extract_off_on_values<T: Copy>(values: NdTensorView<T, 1>) -> Result<(T, T), 
     if values.len() == 2 {
         Ok((values[0], values[1]))
     } else {
-        Err(OpError::InvalidValue("Expected size-2 vector"))
+        Err(OpError::invalid_value("Expected size-2 vector"))
     }
 }
 
@@ -136,7 +140,7 @@ impl Operator for OneHot {
         let depth = depth
             .item()
             .and_then(|&val| if val > 0 { Some(val as usize) } else { None })
-            .ok_or(OpError::InvalidValue("`depth` must be a positive scalar"))?;
+            .ok_or(OpError::invalid_value("`depth` must be a positive scalar"))?;
         let values = inputs.require(2)?;
 
         map_value_view!(values, values, [Int32Tensor, FloatTensor], {
@@ -149,7 +153,19 @@ impl Operator for OneHot {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(2)].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(
+    OneHot,
+    op,
+    shape_ops::OneHot {
+        axis: op.axis as i32,
+    }
+);
 
 pub fn range<T: Copy + Default + ops::Add<Output = T> + PartialOrd>(
     start: T,
@@ -157,7 +173,7 @@ pub fn range<T: Copy + Default + ops::Add<Output = T> + PartialOrd>(
     delta: T,
 ) -> Result<Tensor<T>, OpError> {
     if delta == T::default() {
-        return Err(OpError::InvalidValue("delta must be non-zero"));
+        return Err(OpError::invalid_value("delta must be non-zero"));
     }
 
     // This is not very efficient as it grows the output gradually instead of
@@ -194,7 +210,7 @@ impl Operator for Range {
             let start = start
                 .item()
                 .copied()
-                .ok_or(OpError::InvalidValue("`start` must be a scalar"))?;
+                .ok_or(OpError::invalid_value("`start` must be a scalar"))?;
             let limit = limit.try_into()?;
             let delta = delta.try_into()?;
             range(start, limit, delta).into_op_result()
@@ -250,7 +266,7 @@ impl Operator for EyeLike {
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
         let input = ctx.inputs().require(0)?;
         let ValueType::Tensor(input_dtype) = input.dtype() else {
-            return Err(OpError::InvalidValue("expected input to be a tensor"));
+            return Err(OpError::invalid_value("expected input to be a tensor"));
         };
         let dtype = self.dtype.unwrap_or(input_dtype);
 
@@ -276,6 +292,10 @@ impl Operator for EyeLike {
             .into(),
         )
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(&UnaryOp)
+    }
 }
 
 #[cfg(test)]
@@ -291,7 +311,7 @@ mod tests {
     #[test]
     fn test_constant_of_shape() {
         let op = ConstantOfShape {
-            value: Scalar::Int(42),
+            value: Scalar::Int32(42),
         };
         let shape = Tensor::from([1, 5, 10]);
         let result: Tensor<i32> = op.run_simple(&shape).unwrap();
@@ -303,7 +323,7 @@ mod tests {
         let result: Result<Tensor<i32>, OpError> = op.run_simple(&shape);
         assert_eq!(
             result.err().unwrap(),
-            OpError::InvalidValue("Invalid shape")
+            OpError::invalid_value("Invalid shape")
         );
     }
 
@@ -448,7 +468,9 @@ mod tests {
                 depth: 2,
                 on_value: 1.,
                 off_value: 0.,
-                expected: Err(OpError::InvalidValue("Axis is invalid")),
+                expected: Err(OpError::invalid_value(
+                    "Axis 2 is out of range. Must be in [-2, 2)",
+                )),
             },
         ];
 
@@ -490,7 +512,7 @@ mod tests {
         let r = range(0, 5, 0);
         assert_eq!(
             r.err(),
-            Some(OpError::InvalidValue("delta must be non-zero"))
+            Some(OpError::invalid_value("delta must be non-zero"))
         );
     }
 }

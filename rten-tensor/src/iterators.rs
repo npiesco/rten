@@ -5,9 +5,10 @@ use std::mem::transmute;
 use std::ops::Range;
 
 use rten_base::iter::SplitIterator;
+use smallvec::SmallVec;
 
 use super::{AsView, DynLayout, NdTensorView, NdTensorViewMut, TensorBase, TensorViewMut};
-use crate::layout::{Layout, MutLayout, NdLayout, OverlapPolicy, RemoveDim, merge_axes};
+use crate::layout::{Layout, MutLayout, NdLayout, OverlapPolicy, RemoveDim, SizeArray, merge_axes};
 use crate::storage::{StorageMut, ViewData, ViewMutData};
 
 mod parallel;
@@ -105,7 +106,7 @@ impl OffsetsBase {
     fn new<L: Layout>(layout: &L) -> OffsetsBase {
         // Merge axes to maximize the number of iterations that use the fast
         // path for stepping over the inner dimensions.
-        let merged = merge_axes(layout.shape().as_ref(), layout.strides().as_ref());
+        let merged = merge_axes(&layout.shape(), &layout.strides());
 
         let inner_pos_pad = INNER_NDIM.saturating_sub(merged.len());
         let n_outer = merged.len().saturating_sub(INNER_NDIM);
@@ -652,13 +653,18 @@ pub struct Lanes<'a, T> {
 #[derive(Clone, Debug)]
 pub struct Lane<'a, T> {
     view: NdTensorView<'a, T, 1>,
+
+    /// Index of the next item yielded from the front of the lane.
     index: usize,
+
+    /// Index one past the next item yielded from the back of the lane.
+    end: usize,
 }
 
 impl<'a, T> Lane<'a, T> {
     /// Return the remaining part of the lane as a slice, if it is contiguous.
     pub fn as_slice(&self) -> Option<&'a [T]> {
-        self.view.data().map(|data| &data[self.index..])
+        self.view.data().map(|data| &data[self.index..self.end])
     }
 
     /// Return the item at a given index in this lane.
@@ -675,8 +681,9 @@ impl<'a, T> Lane<'a, T> {
 impl<'a, T> From<NdTensorView<'a, T, 1>> for Lane<'a, T> {
     fn from(val: NdTensorView<'a, T, 1>) -> Self {
         Lane {
-            view: val,
             index: 0,
+            end: val.size(0),
+            view: val,
         }
     }
 }
@@ -686,7 +693,7 @@ impl<'a, T> Iterator for Lane<'a, T> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.view.len() {
+        if self.index < self.end {
             let index = self.index;
             self.index += 1;
 
@@ -698,8 +705,22 @@ impl<'a, T> Iterator for Lane<'a, T> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = self.view.size(0);
-        (size, Some(size))
+        let len = self.end - self.index;
+        (len, Some(len))
+    }
+}
+
+impl<T> DoubleEndedIterator for Lane<'_, T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.index < self.end {
+            self.end -= 1;
+
+            // Safety: Index is in bounds for axis 0.
+            Some(unsafe { self.view.get_unchecked([self.end]) })
+        } else {
+            None
+        }
     }
 }
 
@@ -709,13 +730,13 @@ impl<T> FusedIterator for Lane<'_, T> {}
 
 impl<T: PartialEq> PartialEq<Lane<'_, T>> for Lane<'_, T> {
     fn eq(&self, other: &Lane<'_, T>) -> bool {
-        self.view.slice(self.index..) == other.view.slice(other.index..)
+        self.view.slice(self.index..self.end) == other.view.slice(other.index..other.end)
     }
 }
 
 impl<T: PartialEq> PartialEq<Lane<'_, T>> for LaneMut<'_, T> {
     fn eq(&self, other: &Lane<'_, T>) -> bool {
-        self.view.slice(self.index..) == other.view.slice(other.index..)
+        self.view.slice(self.index..self.end) == other.view.slice(other.index..other.end)
     }
 }
 
@@ -745,7 +766,11 @@ fn lane_for_offset_range<T>(
     offsets: Range<usize>,
 ) -> Lane<T> {
     let view = NdTensorView::from_storage_and_layout(data.slice(offsets), layout);
-    Lane { view, index: 0 }
+    Lane {
+        index: 0,
+        end: view.size(0),
+        view,
+    }
 }
 
 impl<'a, T> Iterator for Lanes<'a, T> {
@@ -881,7 +906,12 @@ impl<'a, T> DoubleEndedIterator for LanesMut<'a, T> {
 #[derive(Debug)]
 pub struct LaneMut<'a, T> {
     view: NdTensorViewMut<'a, T, 1>,
+
+    /// Index of the next item yielded from the front of the lane.
     index: usize,
+
+    /// Index one past the next item yielded from the back of the lane.
+    end: usize,
 }
 
 impl<'a, T> LaneMut<'a, T> {
@@ -898,16 +928,31 @@ impl<'a, T> LaneMut<'a, T> {
             // lane's size and stride.
             NdTensorViewMut::from_storage_and_layout_unchecked(data, layout)
         };
-        LaneMut { view, index: 0 }
+        LaneMut {
+            index: 0,
+            end: view.size(0),
+            view,
+        }
     }
 
     /// Return the remaining part of the lane as a slice, if it is contiguous.
     pub fn as_slice_mut(&mut self) -> Option<&mut [T]> {
-        self.view.data_mut().map(|data| &mut data[self.index..])
+        let (index, end) = (self.index, self.end);
+        self.view.data_mut().map(|data| &mut data[index..end])
     }
 
     /// Return the entire lane as a mutable 1D tensor view.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lane has been stepped, as the view would then alias
+    /// references which the iterator has already yielded.
+    #[track_caller]
     pub fn into_view(self) -> NdTensorViewMut<'a, T, 1> {
+        assert!(
+            self.index == 0 && self.end == self.view.size(0),
+            "lane has been stepped"
+        );
         self.view
     }
 }
@@ -917,7 +962,7 @@ impl<'a, T> Iterator for LaneMut<'a, T> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.view.size(0) {
+        if self.index < self.end {
             let index = self.index;
             self.index += 1;
             let item = unsafe { self.view.get_unchecked_mut([index]) };
@@ -932,13 +977,29 @@ impl<'a, T> Iterator for LaneMut<'a, T> {
 
     #[inline]
     fn nth(&mut self, nth: usize) -> Option<Self::Item> {
-        self.index = (self.index + nth).min(self.view.size(0));
+        self.index = self.index.saturating_add(nth).min(self.end);
         self.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = self.view.size(0);
-        (size, Some(size))
+        let len = self.end - self.index;
+        (len, Some(len))
+    }
+}
+
+impl<T> DoubleEndedIterator for LaneMut<'_, T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.index < self.end {
+            self.end -= 1;
+            let item = unsafe { self.view.get_unchecked_mut([self.end]) };
+
+            // Transmute to preserve lifetime of data. This is safe as we
+            // yield each element only once.
+            Some(unsafe { transmute::<&mut T, Self::Item>(item) })
+        } else {
+            None
+        }
     }
 }
 
@@ -946,7 +1007,7 @@ impl<T> ExactSizeIterator for LaneMut<'_, T> {}
 
 impl<T: PartialEq> PartialEq<LaneMut<'_, T>> for LaneMut<'_, T> {
     fn eq(&self, other: &LaneMut<'_, T>) -> bool {
-        self.view.slice(self.index..) == other.view.slice(other.index..)
+        self.view.slice(self.index..self.end) == other.view.slice(other.index..other.end)
     }
 }
 
@@ -970,8 +1031,26 @@ impl<L: Layout + Clone> InnerIterBase<L> {
         let outer_dims = parent_layout.ndim() - inner_dims;
         let parent_shape = parent_layout.shape();
         let parent_strides = parent_layout.strides();
-        let (outer_shape, inner_shape) = parent_shape.as_ref().split_at(outer_dims);
+
+        let parent_dims: SmallVec<[usize; 5]> = parent_shape.iter().collect();
+        let (outer_shape, inner_shape) = parent_dims.as_ref().split_at(outer_dims);
+
+        let parent_strides: SmallVec<[usize; 5]> = parent_strides.iter().collect();
         let (outer_strides, inner_strides) = parent_strides.as_ref().split_at(outer_dims);
+
+        let inner_layout = make_inner_layout(inner_shape, inner_strides);
+        let inner_data_len = inner_layout.min_data_len();
+
+        // If the inner views are empty, the tensor must have zero-length
+        // storage. Zero the outer strides so that `outer_offsets` always yields
+        // zero - the only valid storage offset.
+        let zero_strides: SmallVec<[usize; 5]>;
+        let outer_strides = if inner_data_len == 0 {
+            zero_strides = SmallVec::from_elem(0, outer_dims);
+            zero_strides.as_ref()
+        } else {
+            outer_strides
+        };
 
         let outer_layout = DynLayout::from_shape_and_strides(
             outer_shape,
@@ -980,11 +1059,9 @@ impl<L: Layout + Clone> InnerIterBase<L> {
         )
         .unwrap();
 
-        let inner_layout = make_inner_layout(inner_shape, inner_strides);
-
         InnerIterBase {
             outer_offsets: Offsets::new(&outer_layout),
-            inner_data_len: inner_layout.min_data_len(),
+            inner_data_len,
             inner_layout,
         }
     }
@@ -1730,6 +1807,23 @@ mod tests {
     }
 
     #[test]
+    fn test_inner_iter_empty() {
+        // Create a tensor view where the inner dimension has zero size and the
+        // outer dimension has non-zero size and non-zero strides.
+        let tensor = NdTensor::<i32, 2>::zeros([0, 3]);
+        assert_eq!(tensor.strides(), [3, 1]);
+        let view = tensor.permuted([1, 0]);
+        assert_eq!(view.strides(), [1, 3]);
+
+        let mut count = 0;
+        for lane in view.inner_iter::<1>() {
+            assert_eq!(lane.shape(), [0]);
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
     fn test_inner_iter_mut() {
         struct InnerIterMutTest(NdTensor<i32, 3>);
 
@@ -1787,6 +1881,69 @@ mod tests {
                 Lane::from(tensor.slice((.., 1))),
             ],
         );
+    }
+
+    #[test]
+    fn test_lane() {
+        let x = NdTensor::from([[1, 2], [3, 4]]);
+        test_iterator(|| x.lanes(0).next().unwrap(), &[&1, &3]);
+        test_iterator(|| x.lanes(1).next().unwrap(), &[&1, &2]);
+    }
+
+    #[test]
+    fn test_lane_mut() {
+        struct LaneMutTest(NdTensor<i32, 2>);
+
+        impl MutIterable for LaneMutTest {
+            type Iter<'a> = super::LaneMut<'a, i32>;
+
+            fn iter_mut(&mut self) -> Self::Iter<'_> {
+                self.0.lanes_mut(0).next().unwrap()
+            }
+        }
+
+        let tensor = NdTensor::from([[1, 2], [3, 4]]);
+        test_mut_iterator(LaneMutTest(tensor), &[&1, &3]);
+    }
+
+    #[test]
+    fn test_lane_mut_nth() {
+        let mut x = NdTensor::from([1, 2, 3]);
+
+        let mut lane = x.lanes_mut(0).next().unwrap();
+        assert_eq!(lane.nth(1), Some(&mut 2));
+        assert_eq!(lane.next(), Some(&mut 3));
+
+        // Skipping past the end must not wrap the cursor around.
+        let mut lane = x.lanes_mut(0).next().unwrap();
+        assert_eq!(lane.next(), Some(&mut 1));
+        assert_eq!(lane.nth(usize::MAX), None);
+        assert_eq!(lane.next(), None);
+    }
+
+    #[test]
+    fn test_lane_mut_into_view() {
+        let mut x = NdTensor::from([1, 2, 3, 4]);
+        let lane = x.lanes_mut(0).next().unwrap();
+        assert_eq!(lane.into_view(), NdTensor::from([1, 2, 3, 4]));
+    }
+
+    #[test]
+    #[should_panic(expected = "lane has been stepped")]
+    fn test_lane_mut_into_view_after_next() {
+        let mut x = NdTensor::from([1, 2, 3, 4]);
+        let mut lane = x.lanes_mut(0).next().unwrap();
+        lane.next();
+        lane.into_view();
+    }
+
+    #[test]
+    #[should_panic(expected = "lane has been stepped")]
+    fn test_lane_mut_into_view_after_next_back() {
+        let mut x = NdTensor::from([1, 2, 3, 4]);
+        let mut lane = x.lanes_mut(0).next().unwrap();
+        lane.next_back();
+        lane.into_view();
     }
 
     #[test]

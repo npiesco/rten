@@ -1,11 +1,13 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use rten_base::byte_cast::{Pod, cast_pod_slice};
-use rten_base::half::f16_to_f32;
+use rten_base::byte_cast::{FromByteArray, cast_slice};
 use rten_onnx::onnx;
+use rten_simd::{SimdOp, f16};
 use rten_tensor::{ArcTensor, Storage, Tensor};
+use rten_vecmath::{ExtendInit, F16ToF32};
 
 use super::external_data::{DataLoader, DataLocation, DataSlice};
 use super::load_error::{LoadError, LoadErrorImpl, load_error};
@@ -49,6 +51,8 @@ pub fn load(
     }
     .map_err(|err| LoadErrorImpl::ParseFailed(Box::new(err)))?;
 
+    let opset_versions = OpsetVersions::from_model(&model);
+
     let graph = if let Some(onnx_graph) = &model.graph {
         load_graph(
             onnx_graph,
@@ -56,6 +60,7 @@ pub fn load(
             options.optimize_mode(),
             None,
             loader,
+            opset_versions,
         )?
     } else {
         Graph::new()
@@ -73,6 +78,37 @@ pub fn load(
         graph,
         weight_cache,
     })
+}
+
+#[derive(Clone, Copy)]
+struct OpsetVersions<'a> {
+    imports: &'a [onnx::OperatorSetIdProto],
+}
+
+impl<'a> OpsetVersions<'a> {
+    /// Create from a model's opset imports.
+    fn from_model(model: &'a onnx::ModelProto) -> Self {
+        OpsetVersions {
+            imports: &model.opset_import,
+        }
+    }
+
+    /// Return the opset version for a domain.
+    ///
+    /// Returns `None` if the domain was not imported or its version was not
+    /// specified or out of range.
+    fn version(&self, domain: &str) -> Option<u16> {
+        fn normalize_domain(domain: &str) -> &str {
+            if domain.is_empty() { "ai.onnx" } else { domain }
+        }
+
+        let domain = normalize_domain(domain);
+        self.imports
+            .iter()
+            .find(|os| normalize_domain(os.domain.as_deref().unwrap_or_default()) == domain)
+            .and_then(|os| os.version)
+            .and_then(|version| u16::try_from(version).ok())
+    }
 }
 
 fn load_metadata(model: &onnx::ModelProto) -> ModelMetadata {
@@ -99,6 +135,7 @@ fn load_graph(
     optimize: OptimizeMode,
     capture_env: Option<&CaptureEnv>,
     loader: Option<&dyn DataLoader>,
+    opset_versions: OpsetVersions,
 ) -> Result<Graph, LoadError> {
     let approx_node_count = onnx_graph.node.len() + onnx_graph.value_info.len();
     let mut graph = Graph::with_capacity(approx_node_count);
@@ -248,6 +285,7 @@ fn load_graph(
                 optimize: optimize.clone(),
                 capture_env,
                 loader,
+                opset_versions,
             },
         )?;
     }
@@ -334,7 +372,7 @@ fn load_value_info(
 /// Create a constant graph node from an ONNX tensor.
 ///
 /// If `name` is provided, it overrides the name from `initializer.name`.
-fn load_constant(
+pub(crate) fn load_constant(
     initializer: &onnx::TensorProto,
     loader: Option<&dyn DataLoader>,
     name: Option<&str>,
@@ -423,75 +461,56 @@ fn load_constant(
             |x| x as i8,
         )?,
 
-        // RTen internally does not support i64 or bool tensors. Instead both
-        // are converted to i32 at load time.
+        // RTen does not natively support i64 or bool tensors. Instead convert
+        // to i32 at load time.
         Some(onnx::DataType::INT64) => {
-            let i64_to_i32 = |bytes: [u8; 8]| saturating_cast_i64_to_i32(i64::from_le_bytes(bytes));
-            let data = if let Some(data) = raw_data {
-                elements_from_le_bytes(&data, i64_to_i32)
-            } else if let Some(external_data) = external_data {
-                elements_from_le_bytes(external_data.data(), i64_to_i32)
-            } else {
-                initializer
-                    .int64_data
-                    .iter()
-                    .copied()
-                    .map(saturating_cast_i64_to_i32)
-                    .collect()
-            };
-            let tensor = tensor_from_elements(&shape, data, name)?;
-            Constant::new(name, tensor)
+            let i64_bytes_to_i32 =
+                |bytes: [u8; 8]| saturating_cast_i64_to_i32(i64::from_le_bytes(bytes));
+            convert_constant(
+                name,
+                &shape,
+                raw_data.as_deref(),
+                external_data,
+                &initializer.int64_data,
+                saturating_cast_i64_to_i32,
+                i64_bytes_to_i32,
+            )?
         }
         Some(onnx::DataType::BOOL) => {
             let u8_to_i32 = |bytes: [u8; 1]| if bytes[0] != 0 { 1 } else { 0 };
-            let data = if let Some(data) = raw_data {
-                elements_from_le_bytes(&data, u8_to_i32)
-            } else if let Some(external_data) = external_data {
-                elements_from_le_bytes(external_data.data(), u8_to_i32)
-            } else {
-                initializer
-                    .int32_data
-                    .iter()
-                    .map(|x| if *x != 0 { 1 } else { 0 })
-                    .collect()
-            };
-            let tensor = tensor_from_elements(&shape, data, name)?;
-            Constant::new(name, tensor)
+            convert_constant(
+                name,
+                &shape,
+                raw_data.as_deref(),
+                external_data,
+                &initializer.int32_data,
+                |x| if x != 0 { 1 } else { 0 },
+                u8_to_i32,
+            )?
         }
 
-        // RTen does not natively support f64 tensors. Instead convert to f32
-        // at load time.
+        // RTen does not natively support f16 or f64 tensors. Instead convert to
+        // f32 at load time.
         Some(onnx::DataType::DOUBLE) => {
-            let data = if let Some(data) = raw_data {
-                let f64_to_f32 = |bytes: [u8; 8]| f64::from_le_bytes(bytes) as f32;
-                elements_from_le_bytes(&data, f64_to_f32)
-            } else {
-                initializer
-                    .double_data
-                    .iter()
-                    .copied()
-                    .map(|x| x as f32)
-                    .collect()
-            };
-            let tensor = tensor_from_elements(&shape, data, name)?;
-            Constant::new(name, tensor)
+            let f64_bytes_to_f32 = |bytes: [u8; 8]| f64::from_le_bytes(bytes) as f32;
+            convert_constant(
+                name,
+                &shape,
+                raw_data.as_deref(),
+                external_data,
+                &initializer.double_data,
+                |x| x as f32,
+                f64_bytes_to_f32,
+            )?
         }
 
-        Some(onnx::DataType::FLOAT16) => {
-            let data = if let Some(data) = raw_data {
-                let f16_to_f32_bytes = |bytes: [u8; 2]| f16_to_f32(u16::from_le_bytes(bytes));
-                elements_from_le_bytes(&data, f16_to_f32_bytes)
-            } else {
-                initializer
-                    .int32_data
-                    .iter()
-                    .copied()
-                    .map(|x| f16_to_f32(x as u16))
-                    .collect()
-            };
-            let tensor = tensor_from_elements(&shape, data, name)?;
-            Constant::new(name, tensor)
-        }
+        Some(onnx::DataType::FLOAT16) => convert_f16_constant(
+            name,
+            &shape,
+            raw_data.as_deref(),
+            external_data,
+            &initializer.int32_data,
+        )?,
 
         Some(dtype) => {
             return Err(load_error!(
@@ -572,9 +591,9 @@ fn external_data_location(
 
 /// Create a constant with elements of type `T`.
 ///
-/// The tensor will use `raw_data` without copying if provided, otherwise the
-/// data in `typed_data` will be copied and converted.
-fn make_constant<T: Pod, U: Pod>(
+/// The tensor will use `raw_data` or `external_data` without copying if
+/// possible, otherwise the data in `typed_data` will be copied and converted.
+fn make_constant<T: FromByteArray, U: FromByteArray>(
     name: Option<&str>,
     shape: &[usize],
     raw_data: Option<Vec<u8>>,
@@ -593,6 +612,86 @@ where
         let data = typed_data.iter().copied().map(convert).collect();
         tensor_from_elements(shape, data, name)?.into()
     };
+    Ok(Constant::new(name, tensor))
+}
+
+/// Create a constant with elements of type `T` by converting elements from
+/// a different type.
+///
+/// Unlike [`make_constant`] this is a potentially lossy conversion to map
+/// elements from an unsupported type to one which is supported. For example,
+/// from f16/f64 to f32. Also unlike `make_constant`, this always copies the
+/// data.
+fn convert_constant<U: Copy, T, const N: usize>(
+    name: Option<&str>,
+    shape: &[usize],
+    raw_data: Option<&[u8]>,
+    external_data: Option<DataSlice>,
+    typed_data: &[U],
+    convert: impl Fn(U) -> T,
+    convert_bytes: impl Fn([u8; N]) -> T,
+) -> Result<Constant, LoadError>
+where
+    Constant: From<ConstantNode<T>>,
+{
+    let data = if let Some(data) = raw_data {
+        elements_from_le_bytes(data, convert_bytes)
+    } else if let Some(external_data) = external_data {
+        elements_from_le_bytes(external_data.data(), convert_bytes)
+    } else {
+        typed_data.iter().copied().map(convert).collect()
+    };
+    let tensor = tensor_from_elements(shape, data, name)?;
+    Ok(Constant::new(name, tensor))
+}
+
+/// View a little-endian byte buffer as a slice of `f16` values without copying.
+///
+/// Returns `None` if the bytes are not `u16`-aligned, have a length that is not
+/// a multiple of 2, or the host is big-endian.
+fn f16_slice_from_le_bytes(bytes: &[u8]) -> Option<&[f16]> {
+    if cfg!(target_endian = "big") {
+        // The reinterpret assumes the bytes are little-endian `f16` bit patterns.
+        return None;
+    }
+    // `cast_slice` checks alignment and length. `f16` is not `FromByteArray`
+    // (it lives in another crate), so cast to `u16` first.
+    let u16s: &[u16] = cast_slice(bytes)?;
+    // Safety: `f16` is `repr(transparent)` over `u16`, so `&[u16]` and `&[f16]`
+    // have identical layout and alignment.
+    Some(unsafe { std::slice::from_raw_parts(u16s.as_ptr() as *const f16, u16s.len()) })
+}
+
+/// Load an f16 constant, converting the elements to f32.
+fn convert_f16_constant(
+    name: Option<&str>,
+    shape: &[usize],
+    raw_data: Option<&[u8]>,
+    external_data: Option<DataSlice>,
+    int32_data: &[i32],
+) -> Result<Constant, LoadError> {
+    let ext_bytes = external_data.as_ref().map(|data| data.data());
+
+    // Obtain the f16 values. Byte buffers are reinterpreted in place, which
+    // requires them to be 2-byte aligned.
+    let f16s: Cow<[f16]> = if let Some(bytes) = raw_data.or(ext_bytes) {
+        let halfs = f16_slice_from_le_bytes(bytes).ok_or_else(|| {
+            load_error!(GraphError, name, "f16 tensor data is not 2-byte aligned")
+        })?;
+        Cow::Borrowed(halfs)
+    } else {
+        int32_data
+            .iter()
+            .map(|&x| f16::from_bits(x as u16))
+            .collect()
+    };
+
+    // Convert f16 -> f32 using SIMD.
+    let n = f16s.len();
+    let mut data: Vec<f32> = Vec::with_capacity(n);
+    data.extend_init(|spare_capacity| F16ToF32::new(&f16s, &mut spare_capacity[..n]).dispatch());
+
+    let tensor = tensor_from_elements(shape, data, name)?;
     Ok(Constant::new(name, tensor))
 }
 
@@ -700,11 +799,16 @@ fn load_constant_from_constant_op(
 
 fn constant_from_attr_value(val: ConstInput) -> Constant {
     match val {
+        ConstInput::Int(val) => Constant::new(
+            None,
+            Tensor::from(saturating_cast_i64_to_i32(val)).into_arc(),
+        ),
         ConstInput::Ints(vals) => {
             let vals: Vec<i32> = vals.into_iter().map(saturating_cast_i64_to_i32).collect();
             Constant::new(None, Tensor::from(vals).into_arc())
         }
         ConstInput::Float(float) => Constant::new(None, Tensor::from(float).into_arc()),
+        ConstInput::Floats(floats) => Constant::new(None, Tensor::from(floats).into_arc()),
     }
 }
 
@@ -729,7 +833,7 @@ fn tensor_from_elements<T>(
 }
 
 /// Create a tensor by reinterpreting the little-endian bytes in `data` as type T.
-fn tensor_from_bytes<T: Pod>(
+fn tensor_from_bytes<T: FromByteArray>(
     shape: &[usize],
     data: Vec<u8>,
     name: Option<&str>,
@@ -765,12 +869,12 @@ fn tensor_from_bytes<T: Pod>(
 
 /// Create a tensor by reinterpreting bytes that have been loaded or
 /// memory-mapped from an external file.
-fn tensor_from_external_data<T: Pod>(
+fn tensor_from_external_data<T: FromByteArray>(
     shape: &[usize],
     data: &DataSlice,
     name: Option<&str>,
 ) -> Result<ArcTensorView<T>, LoadError> {
-    let data: ArcSlice<T> = if let Some(elements) = cast_pod_slice(data.data()) {
+    let data: ArcSlice<T> = if let Some(elements) = cast_slice(data.data()) {
         ArcSlice::new(data.storage.clone(), elements).unwrap()
     } else if data.data().is_empty() {
         // If `data.storage`'s backing storage is a zero-length `Vec<u8>` it
@@ -824,6 +928,9 @@ struct SubgraphOptions<'a> {
 
     /// Data source for tensors with data stored outside model.
     loader: Option<&'a dyn DataLoader>,
+
+    /// Opset versions the model uses.
+    opset_versions: OpsetVersions<'a>,
 }
 
 /// Load an ONNX operator and its subgraphs.
@@ -841,23 +948,55 @@ fn add_operator(
             optimize,
             capture_env,
             loader,
+            opset_versions,
         } = &subgraph_opts;
         let capture_env = CaptureEnv::new(*capture_env, graph, None, None, None);
-        load_graph(g, registry, optimize.clone(), Some(&capture_env), *loader)
+        load_graph(
+            g,
+            registry,
+            optimize.clone(),
+            Some(&capture_env),
+            *loader,
+            *opset_versions,
+        )
     };
 
     struct LoadContext<'a> {
         load_graph: &'a dyn Fn(&onnx::GraphProto) -> Result<Graph, LoadError>,
+        opset_versions: OpsetVersions<'a>,
+
+        /// Source for tensor data stored outside the model file.
+        loader: Option<&'a dyn DataLoader>,
+
+        /// Domain of the operator being loaded.
+        domain: &'a str,
     }
 
     impl OpLoadContext for LoadContext<'_> {
         fn load_graph(&self, graph: &onnx::GraphProto) -> Result<Graph, ReadOpError> {
             (self.load_graph)(graph).map_err(|err| ReadOpError::SubgraphError(err.into()))
         }
+
+        fn opset_version(&self) -> Option<u16> {
+            // Resolved on demand since most deserializers don't need it.
+            self.opset_versions.version(self.domain)
+        }
+
+        fn load_tensor(
+            &self,
+            attr_name: &str,
+            tensor: &onnx::TensorProto,
+        ) -> Result<Constant, ReadOpError> {
+            load_constant(tensor, self.loader, None)
+                .map_err(|err| ReadOpError::attr_error(attr_name, err.to_string()))
+        }
     }
 
     let ctx = LoadContext {
         load_graph: &load_subgraph,
+        opset_versions: subgraph_opts.opset_versions,
+        loader: subgraph_opts.loader,
+        domain: onnx_op.domain.as_deref().unwrap_or_default(),
     };
 
     let node_ids_from_names = |names: &[String]| -> Vec<Option<NodeId>> {
@@ -888,7 +1027,12 @@ fn add_operator(
     if !unused_attrs.is_empty() {
         let names: Vec<_> = unused_attrs
             .iter()
-            .map(|i| onnx_op.attribute[i].name.as_deref().unwrap_or_default())
+            .map(|i| {
+                onnx_op.attribute[i as usize]
+                    .name
+                    .as_deref()
+                    .unwrap_or_default()
+            })
             .collect();
 
         return Err(load_error!(
@@ -936,24 +1080,49 @@ fn add_operator(
         ));
     }
 
-    graph.add_op(onnx_op.name.as_deref(), op, &inputs, &outputs);
+    if let Some(max_outputs) = op.max_outputs()
+        && outputs.len() > max_outputs
+    {
+        return Err(load_error!(
+            OperatorInvalid,
+            onnx_op.name.as_deref(),
+            "operator has {} outputs but maximum is {}",
+            outputs.len(),
+            max_outputs
+        ));
+    }
+
+    let mut name = onnx_op.name.as_deref();
+
+    // It is possible for ONNX operators to have a name that conflicts with a
+    // value. We assume here that values have already been added to the graph,
+    // and if there is a conflict, we make the graph operator anonymous.
+    //
+    // See https://github.com/robertknight/rten/issues/1220.
+    if name.and_then(|n| graph.get_node_id(n)).is_some() {
+        name = None;
+    }
+
+    graph.add_op(name, op, &inputs, &outputs);
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use rten_base::half::{f16_to_f32, f32_to_f16};
     use rten_onnx::onnx;
+    use rten_simd::float16::{f16_to_f32, f32_to_f16};
+    use rten_tensor::prelude::*;
     use rten_tensor::{Tensor, TensorView};
+    use rten_testing::TestCases;
 
-    use super::{Source, load};
+    use super::{OpsetVersions, Source, load};
     use crate::graph::{Constant, Dimension, Graph, TypedConstant};
     use crate::model::external_data::{DataLoader, DataLocation, MemLoader};
     use crate::model::onnx_builder::{
         GraphProtoExt, NodeProtoExt, TensorData, create_node, create_tensor, create_value_info,
     };
-    use crate::model::{LoadError, Model, ModelOptions};
+    use crate::model::{LoadError, Model, ModelOptions, Node};
 
     /// Load a model from a parsed `ModelProto` message.
     fn load_model(
@@ -1206,19 +1375,27 @@ mod tests {
 
         let i64_tensor = external_tensor("i64_tensor", onnx::DataType::INT64, 8, 8);
         let f32_tensor = external_tensor("f32_tensor", onnx::DataType::FLOAT, 16, 4);
-        let bool_tensor = external_tensor("bool_tensor", onnx::DataType::BOOL, 20, 1);
+        // The f16 data must be 2-byte aligned, so place it at an even offset
+        // ahead of the single-byte bool.
+        let f16_tensor = external_tensor("f16_tensor", onnx::DataType::FLOAT16, 20, 2);
+        let bool_tensor = external_tensor("bool_tensor", onnx::DataType::BOOL, 22, 1);
+        let f64_tensor = external_tensor("f64_tensor", onnx::DataType::DOUBLE, 23, 8);
 
         let model_proto = onnx::GraphProto::default()
-            .with_initializer(i64_tensor)
-            .with_initializer(f32_tensor)
             .with_initializer(bool_tensor)
+            .with_initializer(i64_tensor)
+            .with_initializer(f16_tensor)
+            .with_initializer(f32_tensor)
+            .with_initializer(f64_tensor)
             .into_model();
 
         let mut buf = Vec::new();
-        buf.extend(0i64.to_le_bytes());
-        buf.extend(1i64.to_le_bytes());
-        buf.extend((3.14f32).to_le_bytes());
-        buf.push(1u8);
+        buf.extend(0i64.to_le_bytes()); // offset 0
+        buf.extend(1i64.to_le_bytes()); // offset 8
+        buf.extend((3.14f32).to_le_bytes()); // offset 16
+        buf.extend([0x00, 0x3C]); // offset 20: 1.0 in f16
+        buf.push(1u8); // offset 22: bool
+        buf.extend((1.23f64).to_le_bytes()); // offset 23
         let loader = MemLoader::from_entries([("test.onnx.data".to_string(), buf)]);
 
         let model = load_model(model_proto, Some(&loader)).unwrap();
@@ -1231,6 +1408,88 @@ mod tests {
 
         let tensor = model.get_tensor_by_name::<i32>("bool_tensor").unwrap();
         assert_eq!(tensor, Tensor::from(1i32));
+
+        let tensor = model.get_tensor_by_name::<f32>("f16_tensor").unwrap();
+        assert_eq!(tensor, Tensor::from(1.0));
+
+        let tensor = model.get_tensor_by_name::<f32>("f64_tensor").unwrap();
+        assert_eq!(tensor, Tensor::from(1.23));
+    }
+
+    #[test]
+    fn test_initializer_with_empty_external_data() {
+        #[derive(Debug)]
+        struct Case {
+            shape: Vec<usize>,
+            dtype: onnx::DataType,
+            expected: Result<Vec<usize>, String>,
+        }
+
+        let cases = [
+            // Data types for which external data can be used without copying.
+            Case {
+                shape: [0].into(),
+                dtype: onnx::DataType::FLOAT,
+                expected: Ok([0].into()),
+            },
+            Case {
+                shape: [2, 3].into(),
+                dtype: onnx::DataType::FLOAT,
+                expected: Err(
+                    "in node \"init\": graph error: length 0 does not match shape [2, 3]".into(),
+                ),
+            },
+            // Data types which require copying and converting external data.
+            Case {
+                shape: [0].into(),
+                dtype: onnx::DataType::INT64,
+                expected: Ok([0].into()),
+            },
+            Case {
+                shape: [2].into(),
+                dtype: onnx::DataType::INT64,
+                expected: Err(
+                    "in node \"init\": graph error: length 0 does not match shape [2]".into(),
+                ),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let tensor = create_tensor(
+                "init",
+                &case.shape,
+                case.dtype,
+                TensorData::External(DataLocation {
+                    path: "test.onnx.data".to_string(),
+                    offset: 0,
+                    length: 0,
+                }),
+            );
+            let model_proto = onnx::GraphProto::default()
+                .with_initializer(tensor)
+                .into_model();
+            let loader = MemLoader::from_entries([("test.onnx.data".to_string(), Vec::new())]);
+
+            let result = load_model(model_proto, Some(&loader));
+
+            match (result, &case.expected) {
+                (Ok(model), Ok(expected_shape)) => {
+                    let shape = match case.dtype {
+                        onnx::DataType::FLOAT => model
+                            .get_tensor_by_name::<f32>("init")
+                            .map(|t| t.shape().to_vec()),
+                        _ => model
+                            .get_tensor_by_name::<i32>("init")
+                            .map(|t| t.shape().to_vec()),
+                    };
+                    assert_eq!(shape.as_ref(), Some(expected_shape));
+                }
+                (Err(err), Err(expected)) => assert_eq!(&err.to_string(), expected),
+                (result, expected) => {
+                    panic!("expected {:?} but got {:?}", expected, result.map(|_| ()))
+                }
+            }
+        })
     }
 
     #[test]
@@ -1278,6 +1537,74 @@ mod tests {
     }
 
     #[test]
+    fn test_opset_versions() {
+        #[derive(Debug)]
+        struct Case {
+            // (domain, version) pairs for the model's `opset_import` field.
+            opset_imports: Vec<(Option<&'static str>, Option<i64>)>,
+            // (queried domain, expected version) pairs.
+            expected: Vec<(&'static str, Option<u16>)>,
+        }
+
+        let cases = [
+            // Default domain identified by an empty string. It can be queried
+            // by either the empty or "ai.onnx" name.
+            Case {
+                opset_imports: [(Some(""), Some(17))].into(),
+                expected: [("", Some(17)), ("ai.onnx", Some(17))].into(),
+            },
+            // Default domain identified by an unset domain field.
+            Case {
+                opset_imports: [(None, Some(18))].into(),
+                expected: [("", Some(18)), ("ai.onnx", Some(18))].into(),
+            },
+            // Default domain identified by its explicit "ai.onnx" name.
+            Case {
+                opset_imports: [(Some("ai.onnx"), Some(20))].into(),
+                expected: [("", Some(20)), ("ai.onnx", Some(20))].into(),
+            },
+            // Each imported domain reports its own version.
+            Case {
+                opset_imports: [(Some("ai.onnx.ml"), Some(3)), (Some(""), Some(19))].into(),
+                expected: [("ai.onnx.ml", Some(3)), ("", Some(19))].into(),
+            },
+            // Domains that were not imported report no version.
+            Case {
+                opset_imports: [(Some("com.example"), Some(5))].into(),
+                expected: [("com.example", Some(5)), ("", None)].into(),
+            },
+            // No opset imports.
+            Case {
+                opset_imports: [].into(),
+                expected: [("", None), ("ai.onnx", None)].into(),
+            },
+            // Versions outside the `u16` range are treated as unspecified.
+            Case {
+                opset_imports: [(Some(""), Some(-1))].into(),
+                expected: [("", None)].into(),
+            },
+            Case {
+                opset_imports: [(Some(""), Some(1 << 32))].into(),
+                expected: [("", None)].into(),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let mut model = onnx::GraphProto::default().into_model();
+            for (domain, version) in &case.opset_imports {
+                let mut opset = onnx::OperatorSetIdProto::default();
+                opset.domain = domain.map(|d| d.to_string());
+                opset.version = *version;
+                model.opset_import.push(opset);
+            }
+            let opset_versions = OpsetVersions::from_model(&model);
+            for (domain, expected) in &case.expected {
+                assert_eq!(opset_versions.version(domain), *expected);
+            }
+        });
+    }
+
+    #[test]
     fn test_too_many_inputs_for_operator() {
         let node = create_node("Relu")
             .with_input("x")
@@ -1296,6 +1623,60 @@ mod tests {
             err.to_string(),
             "in node \"relu_op\": operator error: operator has 2 inputs but maximum is 1"
         );
+    }
+
+    #[cfg(feature = "random")]
+    #[test]
+    fn test_load_dropout_with_training_mode_input() {
+        let node = create_node("Dropout")
+            .with_input("x")
+            .with_input("ratio")
+            .with_input("training_mode")
+            .with_output("y")
+            .with_name("dropout_op");
+
+        let model_proto = onnx::GraphProto::default()
+            .with_input(create_value_info("x"))
+            .with_input(create_value_info("ratio"))
+            .with_input(create_value_info("training_mode"))
+            .with_node(node)
+            .into_model();
+
+        load_model(model_proto, None).unwrap();
+    }
+
+    #[test]
+    fn test_too_many_outputs_for_operator() {
+        // Test operator-specific limit.
+        let node = create_node("Relu")
+            .with_input("x")
+            .with_output("y0")
+            .with_output("y1")
+            .with_name("relu_op");
+
+        let model_proto = onnx::GraphProto::default()
+            .with_input(create_value_info("x"))
+            .with_node(node)
+            .into_model();
+
+        let err = load_model(model_proto, None).err().unwrap();
+
+        assert_eq!(
+            err.to_string(),
+            "in node \"relu_op\": operator error: operator has 2 outputs but maximum is 1"
+        );
+
+        // Operators without a limit can have many outputs.
+        let mut node = create_node("Split").with_input("x").with_name("split_op");
+
+        for i in 0..65 {
+            let name = format!("y_{}", i);
+            node = node.with_output(&name);
+        }
+        let graph = onnx::GraphProto::default()
+            .with_input(create_value_info("x"))
+            .with_node(node);
+        load_model(graph.into_model(), None).unwrap();
     }
 
     #[test]
@@ -1341,5 +1722,27 @@ mod tests {
                 Dimension::Symbolic("unnamed_1".to_string()),
             ]
         );
+    }
+
+    // See https://github.com/robertknight/rten/issues/1220.
+    #[test]
+    fn test_op_value_name_conflict() {
+        // Create graph where an operator has the same name as a value.
+        let node = create_node("Clip")
+            .with_name("clip_op")
+            .with_input("clip_op");
+        let model_proto = onnx::GraphProto::default().with_node(node).into_model();
+
+        let model = load_model(model_proto, None).unwrap();
+
+        // In the loaded model, the name should refer to the value. The operator
+        // name is currently discarded if there is a conflict.
+        let node = model
+            .graph()
+            .get_node_id("clip_op")
+            .and_then(|id| model.graph().get_node(id))
+            .unwrap();
+
+        assert!(matches!(node, Node::Value(_)));
     }
 }

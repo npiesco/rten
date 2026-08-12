@@ -50,7 +50,7 @@ class AttributeReader:
 
         self._handled_attrs = set()
 
-    def get_attr(self, name: str, expected_type: str, default):
+    def get_attr(self, name: str, expected_type: str, default) -> Any:
         """
         Get the value of an optional operator attribute.
 
@@ -84,6 +84,8 @@ class AttributeReader:
         # them.
         if expected_type == "string":
             val = val.decode()
+        elif expected_type == "strings":
+            val = [s.decode() for s in val]
 
         return val
 
@@ -188,6 +190,10 @@ class AttributeReader:
             case "ints":
                 shape = [len(attr_val)]
                 data = np.array([attr_val]).astype(np.int32)
+
+            case "floats":
+                shape = [len(attr_val)]
+                data = np.array(attr_val).astype(np.float32)
             case _:
                 raise ConversionError(
                     f'Unable to generate input from "{attr_name}" attribute of type "{attr_type}"'

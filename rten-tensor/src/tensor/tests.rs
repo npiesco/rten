@@ -1,10 +1,13 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use super::{AsView, NdTensor, NdTensorView, NdTensorViewMut, Tensor};
-use crate::errors::{ExpandError, FromDataError};
-use crate::layout::{DynLayout, MatrixLayout, MutLayout};
+use super::{AsView, InitEmpty, NdTensor, NdTensorView, NdTensorViewMut, Tensor, TensorView};
+use crate::errors::{DimensionError, ExpandError, FromDataError};
+use crate::layout::{DynLayout, FromShape, MatrixLayout};
 use crate::prelude::*;
 use crate::rng::XorShiftRng;
 use crate::storage::{Alloc, IntoStorage};
@@ -35,6 +38,8 @@ impl Alloc for FakeAlloc {
 
 #[test]
 fn test_append() {
+    // Append along an inner axis. This uses the default path which must
+    // initialize new capacity before copying elements.
     let mut tensor = NdTensor::<i32, 2>::with_capacity([3, 3], 1);
     assert_eq!(tensor.shape(), [3, 0]);
 
@@ -58,10 +63,56 @@ fn test_append() {
         Err(ExpandError::InsufficientCapacity)
     );
 
+    // Append along the outermost axis, where the tensor stays contiguous as it
+    // grows. This uses the fast path that avoids initializing new storage
+    // before copying into it.
+    let mut tensor = NdTensor::<i32, 2>::with_capacity([3, 2], 0);
+    assert_eq!(tensor.shape(), [0, 2]);
+
+    tensor.append(0, &NdTensor::from([[1, 2], [3, 4]])).unwrap();
+    assert_eq!(tensor.shape(), [2, 2]);
+
+    tensor.append(0, &NdTensor::from([[5, 6]])).unwrap();
+    assert_eq!(tensor, NdTensor::from([[1, 2], [3, 4], [5, 6]]));
+
+    // Append along an inner axis where the preceding dims all have size one, so
+    // the tensor is still contiguous as it grows. This also uses the fast path.
+    let mut tensor = NdTensor::<i32, 3>::with_capacity([1, 3, 2], 1);
+    tensor
+        .append(1, &NdTensor::from([[[1, 2], [3, 4]]]))
+        .unwrap();
+    tensor.append(1, &NdTensor::from([[[5, 6]]])).unwrap();
+    assert_eq!(tensor, NdTensor::from([[[1, 2], [3, 4], [5, 6]]]));
+
     // Append to an empty tensor
     let mut empty = NdTensor::<i32, 2>::zeros([0, 3]);
     empty.append(1, &NdTensor::<i32, 2>::zeros([0, 2])).unwrap();
     assert_eq!(empty.shape(), [0, 5]);
+}
+
+// This reproduces an issue where a `may_have_internal_overlap` check could
+// incorrectly fail.
+#[test]
+fn test_append_then_inner_iter_mut() {
+    // Create a tensor which has a 1-sized leading dim with a stride that is
+    // smaller than the product of interior dims.
+    let mut data = Vec::with_capacity(16);
+    data.extend(0..8);
+    let mut tensor = Tensor::from_data(&[1, 2, 4], data);
+    tensor
+        .append(1, &Tensor::from([[[8, 9, 10, 11], [12, 13, 14, 15]]]))
+        .unwrap();
+    assert_eq!(tensor.shape(), &[1, 4, 4]);
+    assert_eq!(tensor.strides(), &[8, 4, 1]);
+
+    // Make tensor non-contiguous
+    let mut sliced = tensor.slice_mut((.., .., ..2));
+
+    // Trigger call to `may_have_internal_overlap`
+    for mut inner in sliced.inner_iter_mut::<3>() {
+        inner.apply(|x| x * 10);
+    }
+    assert_eq!(sliced.to_vec(), &[0, 10, 40, 50, 80, 90, 120, 130]);
 }
 
 #[test]
@@ -378,6 +429,27 @@ fn test_data_truncates_slice() {
 }
 
 #[test]
+fn test_eq() {
+    // Equal shape and elements.
+    let a = NdTensor::from([[1, 2], [3, 4]]);
+    let b = NdTensor::from([[1, 2], [3, 4]]);
+    assert_eq!(a, b);
+
+    // Same elements, different shape.
+    let c = NdTensor::from([1, 2, 3, 4]);
+    assert_ne!(a, c);
+
+    // Same shape, different elements.
+    let d = NdTensor::from([[1, 2], [3, 5]]);
+    assert_ne!(a, d);
+
+    // Same shape and elements, different storage order.
+    let row_major = NdTensor::from([[1, 2], [3, 4]]);
+    let col_major = NdTensor::from([[1, 3], [2, 4]]);
+    assert_eq!(row_major, col_major.transposed());
+}
+
+#[test]
 fn test_fill() {
     let data = vec![1., 2., 3., 4.];
     let mut tensor = NdTensor::from_data([2, 2], data);
@@ -403,6 +475,19 @@ fn test_from_fn() {
 
     let x = Tensor::from_fn(&[2, 2], |index| index[0] * 10 + index[1]);
     assert_eq!(x.data(), Some([0, 1, 10, 11].as_slice()));
+}
+
+#[test]
+fn test_from_fn_in() {
+    let pool = FakeAlloc::new();
+
+    let x = NdTensor::from_fn_in(&pool, [2, 2], |[y, x]| y * 10 + x);
+    assert_eq!(x.data(), Some([0, 1, 10, 11].as_slice()));
+
+    let x = Tensor::from_fn_in(&pool, &[2, 2], |index| index[0] * 10 + index[1]);
+    assert_eq!(x.data(), Some([0, 1, 10, 11].as_slice()));
+
+    assert_eq!(pool.count(), 2);
 }
 
 #[test]
@@ -684,6 +769,36 @@ fn test_has_capacity() {
 }
 
 #[test]
+fn test_hash() {
+    fn hash(tensor: TensorView<i32>) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        tensor.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    // Same shape and elements
+    let a = Tensor::from([[1, 2], [3, 4]]);
+    let b = Tensor::from([[1, 2], [3, 4]]);
+    assert_eq!(hash(a.view()), hash(b.view()));
+
+    // Same shape and elements, different storage order.
+    let col_major = Tensor::from([[1, 3], [2, 4]]);
+    let transposed = col_major.transposed();
+    assert_eq!(a, transposed);
+    assert_eq!(hash(a.view()), hash(transposed));
+
+    // Same elements but a different shape.
+    let flat = Tensor::from([1, 2, 3, 4]);
+    assert_ne!(hash(a.view()), hash(flat.view()));
+
+    // Test use in a HashSet
+    let mut set = HashSet::new();
+    set.insert(NdTensor::from([[1, 2], [3, 4]]));
+    assert!(set.contains(&NdTensor::from([[1, 2], [3, 4]])));
+    assert!(!set.contains(&NdTensor::from([[1, 2], [3, 5]])));
+}
+
+#[test]
 fn test_index_and_index_mut() {
     // NdLayout
     let data = vec![1., 2., 3., 4.];
@@ -710,6 +825,15 @@ fn test_index_axis() {
     let mut slice = tensor.index_axis_mut(0, 3);
     assert_eq!(slice.shape(), [2]);
     assert_eq!(slice.data_mut().unwrap(), [6, 7]);
+}
+
+#[test]
+fn test_init_if_empty() {
+    let empty = NdTensor::<f32, 2>::uninit([2, 0]);
+    assert!(matches!(empty.init_if_empty(), InitEmpty::Empty(_)));
+
+    let not_empty = NdTensor::<f32, 2>::uninit([2, 2]);
+    assert!(matches!(not_empty.init_if_empty(), InitEmpty::NotEmpty(_)));
 }
 
 #[test]
@@ -807,6 +931,56 @@ fn test_into_dyn() {
 }
 
 #[test]
+fn test_into_owned() {
+    // Borrowed data is copied into an owned tensor.
+    let tensor = NdTensor::from_data([2, 2], vec![1, 2, 3, 4]);
+    let owned = tensor.as_cow().into_owned();
+    assert_eq!(owned.shape(), [2, 2]);
+    assert_eq!(owned.data(), Some([1, 2, 3, 4].as_slice()));
+
+    // Borrowed non-contiguous data is copied in logical order.
+    let mut tensor = NdTensor::from_data([2, 2], vec![1, 2, 3, 4]);
+    tensor.transpose();
+    let owned = tensor.as_cow().into_owned();
+    assert_eq!(owned.shape(), [2, 2]);
+    assert_eq!(owned.data(), Some([1, 3, 2, 4].as_slice()));
+
+    // Owned data is preserved without copying.
+    let tensor = NdTensor::from_data([2, 2], vec![1, 2, 3, 4]);
+    let ptr = tensor.data().unwrap().as_ptr();
+    let owned = tensor.into_cow().into_owned();
+    assert_eq!(owned.shape(), [2, 2]);
+    assert_eq!(owned.data().unwrap().as_ptr(), ptr);
+}
+
+#[test]
+fn test_into_permuted() {
+    let tensor = NdTensor::from_data([2, 3], vec![1, 2, 3, 4, 5, 6]);
+    let permuted = tensor.into_permuted([1, 0]);
+    assert_eq!(permuted.shape(), [3, 2]);
+    assert_eq!(permuted.to_vec(), &[1, 4, 2, 5, 3, 6]);
+}
+
+#[test]
+fn test_into_rank() {
+    let tensor = Tensor::from_data(&[2, 2], vec![1, 2, 3, 4]);
+
+    // Converting to the matching rank succeeds and preserves the data.
+    let nd = tensor.clone().into_rank::<2>().unwrap();
+    assert_eq!(nd.shape(), [2, 2]);
+    assert_eq!(nd.data(), Some([1, 2, 3, 4].as_slice()));
+
+    // Converting to a different rank returns `None`.
+    assert_eq!(
+        tensor.into_rank::<3>(),
+        Err(DimensionError {
+            actual: 2,
+            expected: 3
+        })
+    );
+}
+
+#[test]
 fn test_into_shape() {
     // Contiguous tensor.
     let tensor = NdTensor::from_data([2, 2], vec![1., 2., 3., 4.]);
@@ -820,6 +994,48 @@ fn test_into_shape() {
     let reshaped = tensor.into_shape([4]);
     assert_eq!(reshaped.shape(), [4]);
     assert_eq!(reshaped.data(), Some([1., 3., 2., 4.].as_slice()));
+}
+
+#[test]
+fn test_into_shape_cow() {
+    // Contiguous tensor is reshaped without copying.
+    let tensor = NdTensor::from_data([2, 2], vec![1, 2, 3, 4]);
+    let ptr = tensor.data().unwrap().as_ptr();
+    let reshaped = tensor.into_cow().into_shape([4]);
+    assert_eq!(reshaped.shape(), [4]);
+    assert_eq!(reshaped.data().unwrap().as_ptr(), ptr);
+
+    // Non-contiguous tensor is copied into logical order.
+    let mut tensor = NdTensor::from_data([2, 2], vec![1, 2, 3, 4]);
+    tensor.transpose();
+    let reshaped = tensor.into_cow().into_shape([4]);
+    assert_eq!(reshaped.shape(), [4]);
+    assert_eq!(reshaped.data(), Some([1, 3, 2, 4].as_slice()));
+}
+
+#[test]
+#[should_panic(expected = "element count mismatch reshaping [16] to [2, 2]")]
+fn test_into_shape_cow_invalid() {
+    NdTensor::arange(0, 16, None).into_cow().into_shape([2, 2]);
+}
+
+#[test]
+fn test_into_shape_in() {
+    let alloc = FakeAlloc::new();
+
+    // A contiguous reshape can re-use the existing storage.
+    let tensor = NdTensor::arange(0, 4, None);
+    let reshaped = tensor.into_cow().into_shape_in(&alloc, [2, 2]);
+    assert_eq!(reshaped.shape(), [2, 2]);
+    assert_eq!(alloc.count(), 0);
+
+    // A non-contiguous reshape allocates once via the supplied allocator.
+    let mut tensor = NdTensor::arange(0, 4, None).into_shape([2, 2]);
+    tensor.transpose();
+    let reshaped = tensor.into_cow().into_shape_in(&alloc, [4]);
+    assert_eq!(reshaped.shape(), [4]);
+    assert_eq!(reshaped.data(), Some([0, 2, 1, 3].as_slice()));
+    assert_eq!(alloc.count(), 1);
 }
 
 #[test]
@@ -1091,6 +1307,22 @@ fn test_make_contiguous() {
     tensor.make_contiguous();
     assert!(tensor.is_contiguous());
     assert_eq!(tensor.data(), Some([1., 3., 2., 4.].as_slice()));
+}
+
+#[test]
+fn test_into_contiguous() {
+    let tensor = NdTensor::from_data([2, 2], vec![1., 2., 3., 4.]);
+
+    // Cheap, since tensor is already contiguous.
+    let tensor = tensor.into_contiguous();
+
+    let mut transposed = tensor.into_inner();
+    transposed.transpose();
+    assert!(!transposed.is_contiguous());
+
+    // Forces a copy, since tensor is not contiguous.
+    let transposed = transposed.into_contiguous();
+    assert_eq!(transposed.data(), [1., 3., 2., 4.].as_slice());
 }
 
 #[test]

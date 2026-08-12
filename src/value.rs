@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 use crate::buffer_pool::{Buffer, BufferPool, ExtractBuffer};
 
 /// Element type of a tensor.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum DataType {
     Int32,
@@ -196,6 +196,14 @@ impl<'a> From<&'a DynLayout> for ValueLayout<'a> {
 /// underlying layout.
 macro_rules! impl_proxy_layout {
     () => {
+        type Shape<'b>
+            = SmallVec<[usize; 4]>
+        where
+            Self: 'b;
+        type Strides<'b>
+            = SmallVec<[usize; 4]>
+        where
+            Self: 'b;
         type Index<'b> = SmallVec<[usize; 4]>;
         type Indices = DynIndices;
 
@@ -229,7 +237,7 @@ macro_rules! impl_proxy_layout {
             }
         }
 
-        fn shape(&self) -> Self::Index<'_> {
+        fn shape(&self) -> Self::Shape<'_> {
             match self.layout() {
                 ValueLayout::Tensor(layout) => SmallVec::from_slice(layout.shape()),
                 ValueLayout::Vector(len) => SmallVec::from_slice(&[len]),
@@ -243,7 +251,7 @@ macro_rules! impl_proxy_layout {
             }
         }
 
-        fn strides(&self) -> Self::Index<'_> {
+        fn strides(&self) -> Self::Strides<'_> {
             match self.layout() {
                 ValueLayout::Tensor(layout) => SmallVec::from_slice(layout.strides()),
                 ValueLayout::Vector(_) => SmallVec::from_slice(&[1]),
@@ -839,15 +847,19 @@ impl ExtractBuffer for ValueOrView<'_> {
 /// A scalar value with runtime-determined type.
 #[derive(Debug, PartialEq)]
 pub enum Scalar {
-    Int(i32),
     Float(f32),
+    Int32(i32),
+    Int8(i8),
+    UInt8(u8),
 }
 
 impl Scalar {
     pub fn dtype(&self) -> DataType {
         match self {
-            Self::Int(_) => DataType::Int32,
             Self::Float(_) => DataType::Float,
+            Self::Int32(_) => DataType::Int32,
+            Self::Int8(_) => DataType::Int8,
+            Self::UInt8(_) => DataType::UInt8,
         }
     }
 }

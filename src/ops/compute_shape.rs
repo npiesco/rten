@@ -5,6 +5,7 @@ use rten_shape_inference::{SymExpr, SymbolMap};
 use rten_tensor::Tensor;
 use rten_tensor::prelude::*;
 
+use crate::infer_shapes::InferShapes;
 use crate::operator::{
     IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
     OutputTypesContext,
@@ -55,7 +56,7 @@ impl Operator for ComputeShape {
             .map(|sym| {
                 let input = inputs.require(sym.input.as_usize())?;
                 if input.ndim() <= sym.axis.as_usize() {
-                    return Err(OpError::InvalidValue("Axis invalid for input shape"));
+                    return Err(OpError::invalid_value("Axis invalid for input shape"));
                 }
                 let size = input.size(sym.axis.as_usize()) as i32;
                 Ok((sym.name.as_str(), size))
@@ -68,7 +69,7 @@ impl Operator for ComputeShape {
             .iter()
             .map(|expr| {
                 expr.eval(&symbols)
-                    .map_err(|_| OpError::InvalidValue("Failed to evaluate symbolic shape"))
+                    .map_err(|_| OpError::invalid_value("Failed to evaluate symbolic shape"))
             })
             .collect::<Result<Vec<i32>, _>>()?;
 
@@ -77,6 +78,10 @@ impl Operator for ComputeShape {
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::Fixed(ValueType::Tensor(DataType::Int32))].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        None
     }
 }
 
@@ -115,6 +120,7 @@ mod tests {
                     Symbol {
                         name: "x".to_string(),
                         positive: true,
+                        synthetic: false,
                     }
                     .into(),
                 ),
@@ -123,6 +129,7 @@ mod tests {
                     Symbol {
                         name: "y".to_string(),
                         positive: true,
+                        synthetic: false,
                     }
                     .into(),
                 ),
@@ -159,7 +166,7 @@ mod tests {
         let result: Result<NdTensor<i32, 1>, _> = op.run_simple(input_a.view());
         assert_eq!(
             result.err().unwrap(),
-            OpError::InvalidValue("Axis invalid for input shape")
+            OpError::invalid_value("Axis invalid for input shape")
         );
     }
 }

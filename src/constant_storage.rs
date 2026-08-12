@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 
-use rten_base::byte_cast::Pod;
+use rten_base::byte_cast::FromByteArray;
 use rten_tensor::{DynLayout, Storage, TensorBase};
 
 #[cfg(feature = "mmap")]
@@ -52,7 +52,10 @@ impl ConstantStorage {
     }
 
     /// Return the byte offsets of a sub-slice of this storage as a range, or
-    /// `None` if any part of `data` lies outside storage.
+    /// `None` if any element of `data` lies outside storage.
+    ///
+    /// If the slice is empty, this returns an empty range with a start that
+    /// corresponds to `data.as_ptr()` if inside the storage, or zero otherwise.
     ///
     /// Note this always returns `None` if `T` is a zero-sized type.
     fn byte_range_of<T>(&self, data: &[T]) -> Option<Range<usize>> {
@@ -65,7 +68,7 @@ impl ConstantStorage {
         let data_range = slice_address_range(data);
 
         if !self_range.contains(&data_range.start) || self_range.end < data_range.end {
-            return None;
+            return data.is_empty().then_some(0..0);
         }
 
         let start = data_range.start - self_range.start;
@@ -126,7 +129,7 @@ impl<T> ArcSlice<T> {
     /// `T` respectively.
     pub fn from_bytes(buf: Vec<u8>) -> Option<ArcSlice<T>>
     where
-        T: Pod,
+        T: FromByteArray,
     {
         // Vecs with zero capacity have a non-null dangling pointer which can
         // have a smaller alignment that the minimum used by the global
@@ -186,7 +189,7 @@ pub type ArcTensorView<T> = TensorBase<ArcSlice<T>, DynLayout>;
 mod tests {
     use std::sync::Arc;
 
-    use rten_base::byte_cast::cast_pod_slice;
+    use rten_base::byte_cast::cast_slice;
     use rten_tensor::prelude::*;
 
     use super::{ArcSlice, ArcTensorView, ConstantStorage};
@@ -205,10 +208,10 @@ mod tests {
         let storage = Arc::new(ConstantStorage::Buffer(bytes));
 
         // Create two slices referencing memory from the storage.
-        let slice_one = cast_pod_slice::<u8, i32>(&storage.data()[0..32]).unwrap();
+        let slice_one = cast_slice::<u8, i32>(&storage.data()[0..32]).unwrap();
         assert_eq!(slice_one, [0, 1, 2, 3, 4, 5, 6, 7]);
 
-        let slice_two = cast_pod_slice::<u8, i32>(&storage.data()[32..64]).unwrap();
+        let slice_two = cast_slice::<u8, i32>(&storage.data()[32..64]).unwrap();
         assert_eq!(slice_two, [8, 9, 10, 11, 12, 13, 14, 15]);
 
         let arc_slice_one = ArcSlice::new(storage.clone(), slice_one).unwrap();
@@ -226,6 +229,10 @@ mod tests {
         // Create a slice referencing data outside the storage.
         let slice_outside = &[1, 2, 3];
         assert!(ArcSlice::new(storage.clone(), slice_outside).is_none());
+
+        // Like above, but the storage is empty.
+        let empty: &[i32] = &[];
+        assert!(ArcSlice::new(storage.clone(), empty).is_some());
 
         // Try with a zero-sized type.
         let zst_slice = &[(), ()];

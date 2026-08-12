@@ -10,6 +10,7 @@ members = [
   "rten-model-file",
   "rten-onnx",
   "rten-parallel",
+  "rten-serialize",
   "rten-shape-inference",
   "rten-simd",
   "rten-tensor",
@@ -35,10 +36,10 @@ argh = "0.1"
 fastrand = "2.0.2"
 fastrand-contrib = "0.1.0"
 flatbuffers = "24.3.25"
-image = { version = "0.25.1", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 libm = "0.2.6"
 rayon = "1.7.0"
-rustc-hash = "2.0.0"
+rustc-hash = "2.1.2"
 rustfft = { version = "6.4.0" }
 serde = { version = "1" }
 serde_derive = { version = "1" }
@@ -48,7 +49,7 @@ typeid = "1.0.3"
 
 [package]
 name = "rten"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 authors = ["Robert Knight"]
 description = "Machine learning runtime"
@@ -56,8 +57,8 @@ license = "MIT OR Apache-2.0"
 homepage = "https://github.com/robertknight/rten"
 repository = "https://github.com/robertknight/rten"
 resolver = "2"
-include = ["/src", "/CHANGELOG.md", "/README.md"]
-rust-version = "1.89.0"
+include = ["/src", "/CHANGELOG.md", "/README.md", "/docs"]
+rust-version = "1.94.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -68,15 +69,15 @@ flatbuffers = { workspace = true, optional = true }
 memmap2 = { version = "0.9.4", optional = true }
 num_cpus = "1.16.0"
 rayon = { workspace = true }
-rten-base = { path = "./rten-base", version = "0.24.0" }
-rten-gemm = { path = "./rten-gemm", version = "0.24.0" }
-rten-model-file = { path = "./rten-model-file", version = "0.24.0", optional = true }
-rten-onnx = { path = "./rten-onnx", version = "0.24.0", optional = true }
-rten-parallel = { path = "./rten-parallel", version = "0.24.0" }
-rten-shape-inference = { path = "./rten-shape-inference", version = "0.24.0" }
-rten-simd = { path = "./rten-simd", version = "0.24.0" }
-rten-tensor = { path = "./rten-tensor", version = "0.24.0" }
-rten-vecmath = { path = "./rten-vecmath", version = "0.24.0" }
+rten-base = { path = "./rten-base", version = "0.25.0" }
+rten-gemm = { path = "./rten-gemm", version = "0.25.0" }
+rten-model-file = { path = "./rten-model-file", version = "0.25.0", optional = true }
+rten-onnx = { path = "./rten-onnx", version = "0.25.0", optional = true }
+rten-parallel = { path = "./rten-parallel", version = "0.25.0" }
+rten-shape-inference = { path = "./rten-shape-inference", version = "0.25.0" }
+rten-simd = { path = "./rten-simd", version = "0.25.0" }
+rten-tensor = { path = "./rten-tensor", version = "0.25.0" }
+rten-vecmath = { path = "./rten-vecmath", version = "0.25.0" }
 rustc-hash = { workspace = true }
 rustfft = { workspace = true, optional = true }
 smallvec = { workspace = true }
@@ -92,10 +93,12 @@ serde_json = { workspace = true }
 crate-type = ["lib", "cdylib"]
 
 [features]
-default = ["onnx_format", "rten_format"]
+default = ["contrib", "onnx_format", "rten_format"]
 
 # Enable all features that affect supported operators
 all-ops = ["fft", "random"]
+# Enable non-standard "contrib" operators from ONNX Runtime.
+contrib = ["onnx_format"]
 # Enables FFT operators (DFT, STFT etc.)
 fft = ["dep:rustfft"]
 # Enable loading models using memory mapping
@@ -121,7 +124,6 @@ assertions_on_constants = "allow"
 # potentially less efficient.
 needless_range_loop = "allow"
 too_many_arguments = "allow"
-manual_repeat_n = "allow"  # TODO - Address existing failures
 uninlined_format_args = "allow"
 
 [package.metadata.docs.rs]

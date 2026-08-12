@@ -1,133 +1,22 @@
 use std::collections::HashMap;
 
 use rten_base::num::AsUsize;
+use rten_shape_inference::einsum_parser::{EinsumExpr, ValidateError, expand_ellipsis};
+use rten_shape_inference::ops as shape_ops;
 use rten_tensor::layout::{MutLayout, OverlapPolicy};
 use rten_tensor::prelude::*;
-use rten_tensor::{Contiguous, DynLayout, Tensor, TensorView};
+use rten_tensor::{Contiguous, CowTensor, DynLayout, Tensor, TensorView};
 
 use smallvec::SmallVec;
 
 use crate::buffer_pool::{AutoReturn, BufferPool, PoolRef};
+use crate::infer_shapes::{InferShapes, impl_infer_shapes};
 use crate::operator::{
     IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
     OutputTypesContext,
 };
 use crate::ops::layout::expand_to;
 use crate::ops::{matmul, mul, reduce_sum};
-
-/// A parsed equation for an Einsum operator.
-///
-/// Einsum expressions have the form `abc,def,...->xyz` where the `->xyz` part
-/// is optional. If ommitted, it is inferred as the alphabetically ordered
-/// set of letters from the left hand side that do not repeat.
-struct EinsumExpr {
-    inputs: Vec<String>,
-    output: String,
-}
-
-impl EinsumExpr {
-    /// Parse an [Einsum expression][einsum].
-    ///
-    /// The expression must contain at least one input term.
-    ///
-    /// [einsum]: https://onnx.ai/onnx/operators/onnx__Einsum.html
-    fn parse(expr: &str) -> Result<EinsumExpr, OpError> {
-        let mut parts = expr.trim().splitn(2, "->").map(|part| part.trim());
-
-        let lhs = match parts.next() {
-            Some(lhs) if !lhs.is_empty() => lhs,
-            _ => {
-                return Err(OpError::InvalidValue(
-                    "Einsum equation must have at least one term",
-                ));
-            }
-        };
-
-        let inputs: Vec<String> = lhs
-            .split(',')
-            .map(|term| non_whitespace_chars(term).collect())
-            .collect();
-        if inputs.iter().any(|term| !is_valid_einsum_term(term)) {
-            return Err(OpError::InvalidValue("Input term is invalid"));
-        }
-
-        let output: String = match parts.next() {
-            Some(rhs) => non_whitespace_chars(rhs).collect(),
-            None => {
-                const N_LETTERS: usize = 26;
-
-                // Count occurences of each lowercase ASCII letter.
-                let mut char_count = [0; N_LETTERS];
-                for ch in inputs
-                    .iter()
-                    .flat_map(|term| term.chars().filter(|c| c.is_ascii_lowercase()))
-                {
-                    let ascii_idx = ch as u8 - b'a';
-                    char_count[ascii_idx.as_usize()] += 1;
-                }
-
-                // Generate output as sequence of alphabetically ordered
-                // letters which appear only once in the input.
-                let mut output = String::with_capacity(N_LETTERS);
-
-                if inputs.iter().any(|term| term.contains("...")) {
-                    output.push_str("...");
-                }
-
-                for i in 0..N_LETTERS as u8 {
-                    if char_count[i.as_usize()] == 1 {
-                        let ascii_ch = b'a' + i;
-                        output.push(ascii_ch as char);
-                    }
-                }
-
-                output
-            }
-        };
-
-        if !is_valid_einsum_term(&output) {
-            return Err(OpError::InvalidValue("Output term is invalid"));
-        }
-        if contains_repeated_chars(&output) {
-            return Err(OpError::InvalidValue(
-                "Einsum output term contains repeated labels",
-            ));
-        }
-
-        Ok(EinsumExpr { inputs, output })
-    }
-
-    /// Return the dimensions in the expression which are summed over.
-    fn reduced_dims(&self) -> Vec<char> {
-        let mut terms = Vec::new();
-        for in_term in &self.inputs {
-            for in_ch in in_term.chars() {
-                if !terms.contains(&in_ch) && !self.output.contains(in_ch) {
-                    terms.push(in_ch);
-                }
-            }
-        }
-        terms
-    }
-}
-
-fn is_valid_einsum_term(term: &str) -> bool {
-    if let Some((lhs, rhs)) = term.split_once("...") {
-        is_valid_einsum_term(lhs) && !rhs.contains("...") && is_valid_einsum_term(rhs)
-    } else {
-        term.chars().all(|c| c.is_ascii_lowercase())
-    }
-}
-
-fn non_whitespace_chars(s: &str) -> impl Iterator<Item = char> + '_ {
-    s.chars().filter(|c| !c.is_ascii_whitespace())
-}
-
-fn contains_repeated_chars(term: &str) -> bool {
-    term.chars()
-        .filter(|c| *c != '.')
-        .any(|c1| term.chars().filter(|c2| c1 == *c2).count() > 1)
-}
 
 #[derive(Debug)]
 pub struct Einsum {
@@ -155,61 +44,48 @@ impl Operator for Einsum {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(0)].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(
+    Einsum,
+    op,
+    shape_ops::Einsum {
+        equation: &op.equation,
+    }
+);
 
 pub fn einsum(
     pool: &BufferPool,
     inputs: &[TensorView],
     equation_str: &str,
 ) -> Result<Tensor, OpError> {
-    let equation = EinsumExpr::parse(equation_str)?;
-    if equation.inputs.len() != inputs.len() {
-        return Err(OpError::InvalidValue(
-            "Number of terms in Einsum equation does not match input tensor count",
-        ));
-    }
+    let equation =
+        EinsumExpr::parse(equation_str).map_err(|err| OpError::invalid_value(err.as_str()))?;
 
-    // Maximum number of dimensions allowed. This value is chosen to make it
-    // easy to use single digits to represent broadcasting dimensions in terms.
-    const MAX_DIMS: usize = 10;
-
-    // Number of dimensions represented by "..." in equation. This must be the
-    // same for every term.
-    let mut broadcast_ndim = None;
-    for (term, view) in equation.inputs.iter().zip(inputs) {
-        let non_broadcast_ndim = term.split("...").fold(0, |len, term| len + term.len());
-        if view.ndim() < non_broadcast_ndim {
-            return Err(OpError::InvalidValue(
-                "Einsum term dimension count does not match input tensor",
-            ));
-        }
-        if non_broadcast_ndim > MAX_DIMS || view.ndim() > MAX_DIMS {
-            return Err(OpError::UnsupportedValue(
-                "Einsum input or term has too many dimensions",
-            ));
-        }
-
-        if term.contains("...") {
-            let new_broadcast_ndim = (view.ndim() - non_broadcast_ndim) as u8;
-            match broadcast_ndim {
-                None => {
-                    broadcast_ndim = Some(new_broadcast_ndim);
-                }
-                Some(b) if b == new_broadcast_ndim => {}
-                _ => {
-                    return Err(OpError::InvalidValue(
-                        "Number of broadcast dims does not match across inputs",
-                    ));
-                }
+    let broadcast_ndim = equation
+        .validate_inputs(inputs.iter().map(|view| Some(view.ndim())))
+        .map_err(|err| match err {
+            ValidateError::IncorrectInputCount => OpError::invalid_value(
+                "Number of terms in Einsum equation does not match input tensor count",
+            ),
+            ValidateError::TooManyDims => {
+                OpError::unsupported_value("Einsum input or term has too many dimensions")
             }
-        } else if term.len() != view.ndim() {
-            return Err(OpError::InvalidValue(
-                "Einsum term dimension count does not match input tensor",
-            ));
-        }
-    }
+            ValidateError::BroadcastMismatch => {
+                OpError::invalid_value("Number of broadcast dims does not match across inputs")
+            }
+            ValidateError::RankMismatch => {
+                OpError::invalid_value("Einsum term dimension count does not match input tensor")
+            }
+            // Should not happen as the rank of every input is known.
+            ValidateError::UnknownRank => unreachable!(),
+        })? as u8;
 
-    let path = einsum_path(&equation, broadcast_ndim.unwrap_or(0));
+    let path = einsum_path(&equation, broadcast_ndim);
 
     let mut output: Option<PoolRef<Tensor>> = None;
     for step in &path {
@@ -268,7 +144,7 @@ fn take_diagonals<'a>(term: &str, x: &TensorView<'a>) -> Result<(String, TensorV
                 continue;
             }
             if x.size(k) != dim_size {
-                return Err(OpError::InvalidValue(
+                return Err(OpError::invalid_value(
                     "Dimension sizes for repeated labels in term do not match",
                 ));
             }
@@ -285,6 +161,79 @@ fn take_diagonals<'a>(term: &str, x: &TensorView<'a>) -> Result<(String, TensorV
     Ok((unique_dims, out_view))
 }
 
+/// Sum out the dimensions of `term` which appear in neither `other_term` nor
+/// `output`.
+///
+/// Returns `term` with the summed-over dimensions removed and the tensor.
+fn sum_lone_dims<'a>(
+    pool: &BufferPool,
+    view: TensorView<'a>,
+    term: String,
+    other_term: &str,
+    output: &str,
+) -> Result<(String, CowTensor<'a, f32>), OpError> {
+    let mut lone_axes = Vec::new();
+    let mut new_term = String::with_capacity(term.len());
+    for (i, c) in term.chars().enumerate() {
+        if other_term.contains(c) || output.contains(c) {
+            new_term.push(c);
+        } else {
+            lone_axes.push(i as i32);
+        }
+    }
+    if lone_axes.is_empty() {
+        Ok((new_term, view.as_cow()))
+    } else {
+        let summed = reduce_sum(pool, view, Some(&lone_axes), false /* keep_dims */)?;
+        Ok((new_term, summed.into_cow()))
+    }
+}
+
+/// Return the size of a dimension whose label has size `a` in one term and
+/// size `b` in another.
+///
+/// A 1-sized dimension is broadcast to match the other input. Note that the
+/// result may be zero, as a 1-sized dimension broadcasts to a zero-sized one.
+fn broadcast_size(a: usize, b: usize) -> Result<usize, OpError> {
+    match (a, b) {
+        (a, b) if a == b => Ok(a),
+        (1, size) | (size, 1) => Ok(size),
+        _ => Err(OpError::incompatible_input_shapes(
+            "Einsum label has different sizes in different terms",
+        )),
+    }
+}
+
+/// Expand the dimension `from_end` positions from the end of `view` to `size`.
+///
+/// The input is returned unchanged if the dimension already has this size.
+fn expand_dim<'a>(
+    pool: &BufferPool,
+    view: TensorView<'a>,
+    size: usize,
+    from_end: usize,
+) -> CowTensor<'a, f32> {
+    let dim = view.ndim() - from_end;
+    if view.size(dim) == size {
+        return view.as_cow();
+    }
+    let mut shape = view.shape().to_vec();
+    shape[dim] = size;
+    expand_to(pool, view, &shape).into_cow()
+}
+
+/// Return the unique labels in `lhs_term` and `rhs_term` which do not appear
+/// in `output`. These are the dimensions summed over when evaluating a step.
+fn reduced_dims(lhs_term: &str, rhs_term: &str, output: &str) -> Vec<char> {
+    let mut dims = Vec::new();
+    for c in lhs_term.chars().chain(rhs_term.chars()) {
+        if !output.contains(c) && !dims.contains(&c) {
+            dims.push(c);
+        }
+    }
+    dims
+}
+
 /// Evaluate a single step in an einsum path.
 fn einsum_step(
     pool: &BufferPool,
@@ -296,7 +245,7 @@ fn einsum_step(
 
     let (Some(y), Some(rhs)) = (y, &step.rhs) else {
         // Re-arrange input views as `[output_dims][reduced_dims]`.
-        let reduced_dims = step.reduced_dims();
+        let reduced_dims = reduced_dims(&lhs_term, "", &step.output);
         let common_order: String = step
             .output
             .chars()
@@ -308,7 +257,9 @@ fn einsum_step(
             return Ok(xp.to_tensor_in(pool));
         }
 
-        let reduced_dim_indices: Vec<i32> = (0..reduced_dims.len()).map(|i| i as i32 - 1).collect();
+        let reduced_dim_indices: Vec<i32> = (xp.ndim() - reduced_dims.len()..xp.ndim())
+            .map(|i| i as i32)
+            .collect();
         return reduce_sum(
             pool,
             xp,
@@ -318,17 +269,25 @@ fn einsum_step(
     };
 
     let (rhs_term, y) = take_diagonals(&rhs.term, y)?;
-    let reduced_dims = step.reduced_dims();
 
-    if reduced_dims.len() == 1 {
+    // Sum out reduced dimensions which appear in only one term, so that all
+    // remaining reduced dimensions appear in both terms.
+    let (lhs_term, x) = sum_lone_dims(pool, x, lhs_term, &rhs_term, &step.output)?;
+    let (rhs_term, y) = sum_lone_dims(pool, y, rhs_term, &lhs_term, &step.output)?;
+
+    let reduced_dims = reduced_dims(&lhs_term, &rhs_term, &step.output);
+
+    // A single reduced dimension maps directly onto the `K` dimension of a
+    // matmul.
+    if let [matmul_k] = reduced_dims[..] {
         einsum_matmul(
             pool,
-            &x,
-            &y,
+            &x.view(),
+            &y.view(),
             &lhs_term,
             &rhs_term,
             &step.output,
-            reduced_dims[0],
+            matmul_k,
         )
     } else {
         // Re-arrange input views as `[output_dims][reduced_dims]`. This makes
@@ -338,8 +297,8 @@ fn einsum_step(
             .chars()
             .chain(reduced_dims.iter().copied())
             .collect();
-        let xp = permute_and_insert_axes(&x, &lhs_term, &common_order);
-        let yp = permute_and_insert_axes(&y, &rhs_term, &common_order);
+        let xp = permute_and_insert_axes(&x.view(), &lhs_term, &common_order);
+        let yp = permute_and_insert_axes(&y.view(), &rhs_term, &common_order);
 
         // If there are no reduced dimensions, fall back to a simple multiply
         // with broadcasting.
@@ -354,23 +313,27 @@ fn einsum_step(
         let mut tmp_x_shape = xp.shape().to_vec();
         let mut tmp_y_shape = yp.shape().to_vec();
         for i in xp.ndim() - reduced_dims.len()..xp.ndim() {
-            tmp_x_shape[i] = tmp_x_shape[i].max(tmp_y_shape[i]);
-            tmp_y_shape[i] = tmp_y_shape[i].max(tmp_x_shape[i]);
+            let size = broadcast_size(tmp_x_shape[i], tmp_y_shape[i])?;
+            tmp_x_shape[i] = size;
+            tmp_y_shape[i] = size;
         }
         let x = if tmp_x_shape == xp.shape() {
-            x.to_contiguous_in(pool)
+            xp.to_contiguous_in(pool)
         } else {
-            Contiguous::new(expand_to(pool, x.view(), &tmp_x_shape).into_cow()).unwrap()
+            Contiguous::new(expand_to(pool, xp.view(), &tmp_x_shape).into_cow()).unwrap()
         };
         let y = if tmp_y_shape == yp.shape() {
-            y.to_contiguous_in(pool)
+            yp.to_contiguous_in(pool)
         } else {
-            Contiguous::new(expand_to(pool, y.view(), &tmp_y_shape).into_cow()).unwrap()
+            Contiguous::new(expand_to(pool, yp.view(), &tmp_y_shape).into_cow()).unwrap()
         };
 
         // Reshape the adjacent reduced dimensions into a single dimension.
+        // The expanded shapes must be used here since a 1-sized reduced
+        // dimension in either input may have been expanded to match the other
+        // input.
         let reduced_dims_start_index = xp.ndim() - reduced_dims.len();
-        let reduced_size: usize = xp.shape()[reduced_dims_start_index..].iter().product();
+        let reduced_size: usize = tmp_x_shape[reduced_dims_start_index..].iter().product();
 
         tmp_x_shape.truncate(reduced_dims_start_index);
         tmp_x_shape.push(reduced_size);
@@ -382,8 +345,7 @@ fn einsum_step(
 
         // Evaluate the equation with the simplified input shapes using a
         // matmul.
-        let reduced_dim = 'K'; // Upper-case to avoid conflict with equation
-        // terms.
+        let reduced_dim = MERGED_K;
         let term_simplified: String = step
             .output
             .chars()
@@ -399,6 +361,29 @@ fn einsum_step(
             reduced_dim,
         )
     }
+}
+
+/// Label for a 1-sized dimension inserted into a term to serve as the `M`
+/// dimension of a matmul.
+///
+/// Labels from the equation are ASCII letters or digits (standing in for
+/// ellipsis dimensions), so non-alphanumeric characters are used for labels
+/// generated internally.
+const INSERTED_M: char = '<';
+
+/// Label for a 1-sized dimension inserted into a term to serve as the `N`
+/// dimension of a matmul. See [`INSERTED_M`].
+const INSERTED_N: char = '>';
+
+/// Label for the single dimension formed by merging several reduced dimensions
+/// into one. See [`INSERTED_M`].
+const MERGED_K: char = '*';
+
+/// Return true if `c` denotes a 1-sized dimension which was inserted into a
+/// term to give an input the shape required by a matmul, rather than a
+/// dimension from the equation.
+fn is_inserted_dim(c: char) -> bool {
+    matches!(c, INSERTED_M | INSERTED_N)
 }
 
 fn is_valid_permute_insert_spec(src: &str, dest: &str) -> bool {
@@ -459,7 +444,8 @@ fn permute_and_insert_axes<'a, T>(
 /// Reduce inputs of an Einsum equation with two terms using matrix
 /// multiplication.
 ///
-/// The equation must have a single reduced dimension.
+/// The equation must have a single reduced dimension, which must appear in
+/// both terms.
 fn einsum_matmul(
     pool: &BufferPool,
     x: &TensorView,
@@ -472,49 +458,73 @@ fn einsum_matmul(
     let matmul_k = reduced_dim;
 
     // Find terms that can be used as the `N` and `M` dimensions of a matmul.
+    // These must be dimensions which appear in only one of the two inputs.
     //
-    // If there aren't suitable dimensions, we'll insert them. Upper-case
-    // letters are used to denote inserted dimensions since these cannot
-    // conflict with dimensions in the einsum equation.
-    let matmul_n = term2.chars().find(|c| !term1.contains(*c)).unwrap_or('N');
+    // If there aren't suitable dimensions, we'll insert them. Non-alphanumeric
+    // labels are used to denote inserted dimensions since these cannot conflict
+    // with dimensions in the equation.
+    //
+    // The last candidate is chosen in each case because it requires the least
+    // re-ordering of the input: `M` and `N` need to be the second-to-last and
+    // last dimensions of the LHS and RHS respectively.
+    //
+    // Since the reduced dimension appears in both terms, it is excluded as a
+    // candidate by the `contains` tests.
+    let matmul_n = term2
+        .chars()
+        .rev()
+        .find(|c| !term1.contains(*c))
+        .unwrap_or(INSERTED_N);
     let matmul_m = term1
         .chars()
         .rev()
         .find(|c| !term2.contains(*c))
-        .unwrap_or('M');
+        .unwrap_or(INSERTED_M);
 
-    // Find the terms that will be used as the batch dimensions of a matmul.
-    let batch_dims = term1
-        .chars()
-        .filter(|c| *c != matmul_k && *c != matmul_n && *c != matmul_m);
+    // Every remaining dimension becomes a matmul batch dimension. A dimension
+    // which appears in only one input is handled by inserting a 1-sized
+    // dimension into the other input, so it is broadcast by the matmul.
+    let mut batch_dims = String::new();
+    for c in term1.chars().chain(term2.chars()) {
+        if c != matmul_k && c != matmul_m && c != matmul_n && !batch_dims.contains(c) {
+            batch_dims.push(c);
+        }
+    }
 
-    let mut x_order: String = batch_dims.clone().collect();
+    let mut x_order: String = batch_dims.clone();
     x_order.push(matmul_m);
     x_order.push(matmul_k);
 
-    let mut y_order: String = batch_dims
-        .clone()
-        .filter(|bc| term2.contains(*bc))
-        .collect();
+    let mut y_order: String = batch_dims.clone();
     y_order.push(matmul_k);
     y_order.push(matmul_n);
 
-    let mut out_order: String = batch_dims.collect();
-    if matmul_m.is_ascii_lowercase() {
+    // Inserted 1-sized dimensions are excluded from the output.
+    let mut out_order: String = batch_dims;
+    if !is_inserted_dim(matmul_m) {
         out_order.push(matmul_m);
     }
-    if matmul_n.is_ascii_lowercase() {
+    if !is_inserted_dim(matmul_n) {
         out_order.push(matmul_n);
     }
 
     let xp = permute_and_insert_axes(x, term1, &x_order);
     let yp = permute_and_insert_axes(y, term2, &y_order);
-    let mut out = matmul(pool, xp, yp, None)?;
 
-    if !matmul_m.is_ascii_lowercase() {
+    // Matmul broadcasts batch dimensions, but requires the `K` dimension of
+    // both inputs to match, so expand it here if the reduced label has size 1
+    // in one term. The `M` and `N` dimensions cannot need broadcasting, as
+    // they are labels which appear in only one of the two terms.
+    let k_size = broadcast_size(xp.size(xp.ndim() - 1), yp.size(yp.ndim() - 2))?;
+    let xp = expand_dim(pool, xp, k_size, 1);
+    let yp = expand_dim(pool, yp, k_size, 2);
+
+    let mut out = matmul(pool, xp.view(), yp.view(), None)?;
+
+    if is_inserted_dim(matmul_m) {
         out.remove_axis(out.ndim() - 2);
     }
-    if !matmul_n.is_ascii_lowercase() {
+    if is_inserted_dim(matmul_n) {
         out.remove_axis(out.ndim() - 1);
     }
 
@@ -553,46 +563,43 @@ struct EinsumStep {
     output: String,
 }
 
-impl EinsumStep {
-    /// Return a list of chars which appear in the input terms but not in the
-    /// output of this step.
-    fn reduced_dims(&self) -> Vec<char> {
-        let in_terms = [
-            self.lhs.term.as_str(),
-            self.rhs.as_ref().map(|rhs| rhs.term.as_str()).unwrap_or(""),
-        ];
+/// Iterate over the unique labels of a term, in order of first occurrence.
+fn unique_dims(term: &str) -> impl Iterator<Item = char> + '_ {
+    term.chars()
+        .enumerate()
+        .filter_map(|(i, dim)| (!term.chars().take(i).any(|c| c == dim)).then_some(dim))
+}
 
-        let mut terms = Vec::new();
-        for in_term in in_terms {
-            for in_ch in in_term.chars() {
-                if !terms.contains(&in_ch) && !self.output.contains(in_ch) {
-                    terms.push(in_ch);
-                }
-            }
+/// Decrement the count of terms which have yet to use each label in `term`.
+fn subtract_term_dims(reduced_dims: &mut HashMap<char, usize>, term: &str) {
+    for dim in unique_dims(term) {
+        if let Some(count) = reduced_dims.get_mut(&dim) {
+            *count -= 1;
         }
-        terms
     }
 }
 
-/// Replace an ellipsis representing a fixed number of dimensions with a
-/// sequence of numbers.
+/// Return the output term for an intermediate step in a multi-step einsum
+/// path.
 ///
-/// Numbers are used because they are not allowed as dimension labels in
-/// input Einsum equations.
-///
-/// eg. `replace_ellipsis("i...j", 3)` returns `"i012j"`.
-fn replace_ellipsis(term: &str, broadcast_ndim: u8) -> String {
-    assert!(broadcast_ndim <= 10);
-
-    let zero = b'0';
-    if let Some((lhs, rhs)) = term.split_once("...") {
-        lhs.chars()
-            .chain((0..broadcast_ndim).map(|i| (zero + i) as char))
-            .chain(rhs.chars())
-            .collect()
-    } else {
-        term.to_string()
+/// This contains the unique labels of the step's input terms which either
+/// appear in the final output or are reduced dimensions used by subsequent
+/// steps.
+fn step_output(
+    term_a: &str,
+    term_b: &str,
+    final_output: &str,
+    reduced_dims: &HashMap<char, usize>,
+) -> String {
+    let mut output = String::new();
+    for dim in term_a.chars().chain(term_b.chars()) {
+        if !output.contains(dim)
+            && (final_output.contains(dim) || reduced_dims.get(&dim).copied().unwrap_or(0) > 0)
+        {
+            output.push(dim);
+        }
     }
+    output
 }
 
 /// Convert an Einsum expression with many inputs into a sequence of steps which
@@ -601,13 +608,18 @@ fn replace_ellipsis(term: &str, broadcast_ndim: u8) -> String {
 /// `broadcast_ndim` specifies how many dimensions ellipses in input and output
 /// terms stand for. The ellipses are replaced with digit labels in the path.
 fn einsum_path(expr: &EinsumExpr, broadcast_ndim: u8) -> Vec<EinsumStep> {
-    let output = replace_ellipsis(&expr.output, broadcast_ndim);
+    let output = expand_ellipsis(&expr.output, broadcast_ndim as usize);
+    let in_terms: Vec<String> = expr
+        .inputs
+        .iter()
+        .map(|term| expand_ellipsis(term, broadcast_ndim as usize))
+        .collect();
     let input_term = |term: &str, index: u32| EinsumTerm {
-        term: replace_ellipsis(term, broadcast_ndim),
+        term: term.to_string(),
         input: EinsumInput::Index(index),
     };
 
-    match &expr.inputs[..] {
+    match &in_terms[..] {
         // This case shouldn't happen since Einsum equations must have at least
         // one input term.
         [] => Vec::new(),
@@ -631,39 +643,20 @@ fn einsum_path(expr: &EinsumExpr, broadcast_ndim: u8) -> Vec<EinsumStep> {
             let mut steps = Vec::with_capacity(all_terms.len() - 1);
 
             // Count how many terms use each reduced dimension.
-            let mut reduced_dims: HashMap<char, usize> = expr
-                .reduced_dims()
-                .into_iter()
-                .map(|dim| {
-                    (
-                        dim,
-                        all_terms.iter().filter(|term| term.contains(dim)).count(),
-                    )
-                })
-                .collect();
+            let mut reduced_dims: HashMap<char, usize> = HashMap::new();
+            for term in all_terms {
+                for dim in unique_dims(term) {
+                    if !output.contains(dim) {
+                        *reduced_dims.entry(dim).or_insert(0) += 1;
+                    }
+                }
+            }
 
             // Add step for first two terms.
-            for dim in term_a.chars() {
-                if let Some(count) = reduced_dims.get_mut(&dim) {
-                    *count -= 1;
-                }
-            }
-            for dim in term_b.chars() {
-                if let Some(count) = reduced_dims.get_mut(&dim) {
-                    *count -= 1;
-                }
-            }
+            subtract_term_dims(&mut reduced_dims, term_a);
+            subtract_term_dims(&mut reduced_dims, term_b);
 
-            // The output for each step consists of the unique input dim labels
-            // which either appear in the final output, or are reduced
-            // dimensions that appear in subsequent steps.
-            let mut next_output: String = term_a
-                .chars()
-                .chain(term_b.chars().filter(|c| !term_a.contains(*c)))
-                .filter(|dim| {
-                    expr.output.contains(*dim) || reduced_dims.get(dim).copied().unwrap_or(0) > 0
-                })
-                .collect();
+            let mut next_output = step_output(term_a, term_b, &output, &reduced_dims);
 
             steps.push(EinsumStep {
                 lhs: input_term(term_a, 0),
@@ -673,22 +666,12 @@ fn einsum_path(expr: &EinsumExpr, broadcast_ndim: u8) -> Vec<EinsumStep> {
 
             // Add a step for each remaining term.
             for (term_idx, term) in rest.iter().enumerate() {
-                for dim in term.chars() {
-                    if let Some(count) = reduced_dims.get_mut(&dim) {
-                        *count -= 1;
-                    }
-                }
+                subtract_term_dims(&mut reduced_dims, term);
                 let prev_output = next_output;
                 if term_idx == rest.len() - 1 {
                     next_output = output.clone();
                 } else {
-                    next_output = prev_output
-                        .chars()
-                        .chain(term.chars().filter(|c| !prev_output.contains(*c)))
-                        .filter(|dim| {
-                            output.contains(*dim) || reduced_dims.get(dim).copied().unwrap_or(0) > 0
-                        })
-                        .collect();
+                    next_output = step_output(&prev_output, term, &output, &reduced_dims);
                 }
                 steps.push(EinsumStep {
                     lhs: EinsumTerm {
@@ -729,6 +712,7 @@ mod tests {
         }
 
         let pool = BufferPool::new();
+        let scalar = Tensor::from(2.5);
         let vec_a = Tensor::arange(1., 10., None);
         let vec_b = Tensor::arange(1., 5., None);
 
@@ -760,6 +744,64 @@ mod tests {
 
         // 3D tensor with each dimension having a different size.
         let ijk = Tensor::zeros(&[10, 5, 8]);
+
+        let row_1x3 = Tensor::from([[1., 2., 3.]]);
+        let mat_4x3 = Tensor::from([[1., 2., 3.], [4., 5., 6.], [7., 8., 9.], [10., 11., 12.]]);
+        let empty_0x3 = Tensor::zeros(&[0, 3]);
+
+        // Expected output for matmul equations where the RHS has several
+        // dimensions which do not appear in the LHS.
+        let hmk = matmul_ab
+            .clone()
+            .into_shape([1, mat_a.size(0), mat_b.size(1)]);
+
+        // Inputs and expected output for an equation where the reduced
+        // dimension appears in only one of the two terms.
+        let mat_c = matmul_ab.clone();
+        let sum_ij_ik = mul(
+            &pool,
+            reduce_sum(&pool, mat_a.view(), Some(&[1]), true /* keep_dims */)
+                .unwrap()
+                .view(),
+            mat_c.view(),
+        )
+        .unwrap();
+
+        // Inputs for an equation where both terms have multiple dimensions
+        // which do not appear in the other term.
+        let abf = Tensor::arange(1., (2 * 3 * 4 + 1) as f32, None).into_shape([2, 3, 4].as_slice());
+        let fcd = Tensor::arange(1., (4 * 5 * 6 + 1) as f32, None).into_shape([4, 5, 6].as_slice());
+        let abcd = matmul(
+            &pool,
+            abf.reshaped([2 * 3, 4].as_slice()).view(),
+            fcd.reshaped([4, 5 * 6].as_slice()).view(),
+            None,
+        )
+        .unwrap()
+        .into_shape([2, 3, 5, 6].as_slice());
+
+        // Expected output for an equation which reduces over the first two
+        // dimensions of two 3D inputs.
+        let abf_sq_sum_ij = reduce_sum(
+            &pool,
+            mul(&pool, abf.view(), abf.view()).unwrap().view(),
+            Some(&[0, 1]),
+            false, /* keep_dims */
+        )
+        .unwrap();
+
+        // Expected output for an equation where one reduced dimension appears
+        // in both terms and another appears in only the second term.
+        let abf_summed_b =
+            reduce_sum(&pool, abf.view(), Some(&[1]), false /* keep_dims */).unwrap();
+        let af_prod = mul(&pool, mat_c.view(), abf_summed_b.view()).unwrap();
+        let sum_af_abf = reduce_sum(
+            &pool,
+            af_prod.view(),
+            Some(&[1]),
+            false, /* keep_dims */
+        )
+        .unwrap();
 
         let cases = [
             // Identity
@@ -803,6 +845,20 @@ mod tests {
                     false, /* keep_dims */
                 )
                 .unwrap()),
+            },
+            // Reduction of a single input over multiple dimensions, keeping
+            // one output dimension.
+            Case {
+                equation: "abf->a",
+                inputs: vec![abf.view()],
+                expected: reduce_sum(&pool, abf.view(), Some(&[1, 2]), false /* keep_dims */),
+            },
+            // As above, but where the kept dimension is not the first, so the
+            // input must be permuted before reducing.
+            Case {
+                equation: "abf->f",
+                inputs: vec![abf.view()],
+                expected: reduce_sum(&pool, abf.view(), Some(&[0, 1]), false /* keep_dims */),
             },
             // Outer product of two vectors
             Case {
@@ -863,11 +919,60 @@ mod tests {
                 inputs: vec![bhwc.as_dyn(), hck.permuted([0, 2, 1]).as_dyn()],
                 expected: Ok(bhwk.into_dyn()),
             },
+            // Matmul where the RHS has multiple dimensions that don't appear
+            // in the LHS.
+            //
+            // See https://github.com/robertknight/rten/issues/1361
+            Case {
+                equation: "mc,hck->hmk",
+                inputs: vec![mat_a.view(), hck.as_dyn()],
+                expected: Ok(hmk.clone().into_dyn()),
+            },
+            // As above, but with the output dimensions re-ordered.
+            Case {
+                equation: "mc,hck->khm",
+                inputs: vec![mat_a.view(), hck.as_dyn()],
+                expected: Ok(hmk.permuted([2, 0, 1]).to_tensor().into_dyn()),
+            },
+            // As above, but where the LHS has no dimensions that are not
+            // shared with the RHS, so an `M` dimension must be inserted.
+            Case {
+                equation: "c,hck->hk",
+                inputs: vec![mat_a.slice(0), hck.as_dyn()],
+                expected: Ok(matmul(&pool, mat_a.slice((..1, ..)), mat_b.view(), None).unwrap()),
+            },
+            // Matmul where both inputs have multiple dimensions that are not
+            // shared with the other input.
+            Case {
+                equation: "abf,fcd->abcd",
+                inputs: vec![abf.view(), fcd.view()],
+                expected: Ok(abcd),
+            },
+            // Reduced dimension which appears in only one of the two terms.
+            Case {
+                equation: "ij,ik->ik",
+                inputs: vec![mat_a.view(), mat_c.view()],
+                expected: Ok(sum_ij_ik.clone()),
+            },
+            // As above, but where the term containing the reduced dimension
+            // is on the right instead of the left.
+            Case {
+                equation: "ik,ij->ik",
+                inputs: vec![mat_c.view(), mat_a.view()],
+                expected: Ok(sum_ij_ik),
+            },
+            // One reduced dimension which appears in both terms plus one which
+            // appears only in the right term.
+            Case {
+                equation: "af,abf->a",
+                inputs: vec![mat_c.view(), abf.view()],
+                expected: Ok(sum_af_abf),
+            },
             // Incorrect input count
             Case {
                 equation: "ij,jk->ik",
                 inputs: vec![mat_a.view()],
-                expected: Err(OpError::InvalidValue(
+                expected: Err(OpError::invalid_value(
                     "Number of terms in Einsum equation does not match input tensor count",
                 )),
             },
@@ -905,6 +1010,47 @@ mod tests {
                 inputs: vec![bhwc.as_dyn(), bhwc.as_dyn()],
                 expected: Ok(Tensor::from(bhwc.iter().map(|x| x * x).sum::<f32>())),
             },
+            // Reduction over multiple dimensions where the inputs' dimensions
+            // are in a different order. The (non-square) inputs must be
+            // permuted to a common order before being reduced.
+            Case {
+                equation: "ij,ji->",
+                inputs: vec![mat_a.view(), mat_a.transposed()],
+                expected: Ok(Tensor::from(mat_a.iter().map(|x| x * x).sum::<f32>())),
+            },
+            // Reduction over multiple dimensions where one input has a
+            // 1-sized dimension which is broadcast.
+            Case {
+                equation: "ij,ij->",
+                inputs: vec![mat_a.slice((..1, ..)), mat_a.view()],
+                expected: Ok(Tensor::from(
+                    mul(&pool, mat_a.slice((..1, ..)), mat_a.view())
+                        .unwrap()
+                        .iter()
+                        .sum::<f32>(),
+                )),
+            },
+            // Broadcast a 1-sized reduced dimension in the LHS. The reduced
+            // dimension maps onto the `K` dimension of a matmul, which does not
+            // broadcast, so it must be expanded beforehand.
+            Case {
+                equation: "ij,ij->j",
+                inputs: vec![row_1x3.view(), mat_4x3.view()],
+                expected: Ok(Tensor::from([22., 52., 90.])),
+            },
+            // As above, but the 1-sized dimension is in the RHS.
+            Case {
+                equation: "ij,ij->j",
+                inputs: vec![mat_4x3.view(), row_1x3.view()],
+                expected: Ok(Tensor::from([22., 52., 90.])),
+            },
+            // Broadcast a 1-sized dimension against a zero-sized one. The
+            // broadcast size is 0, not 1.
+            Case {
+                equation: "ij,ij->",
+                inputs: vec![row_1x3.view(), empty_0x3.view()],
+                expected: Ok(Tensor::from(0.)),
+            },
             // Reduction over multiple dimensions where the reduced dimensions
             // are not present in all tensors.
             Case {
@@ -918,29 +1064,83 @@ mod tests {
                         .sum::<f32>(),
                 )),
             },
-            // Empty equation
+            // Empty equation with no inputs. The equation implies a single
+            // scalar input.
             Case {
                 equation: "",
                 inputs: vec![],
-                expected: Err(OpError::InvalidValue(
-                    "Einsum equation must have at least one term",
+                expected: Err(OpError::invalid_value(
+                    "Number of terms in Einsum equation does not match input tensor count",
                 )),
+            },
+            // Empty equation with a scalar input.
+            Case {
+                equation: "",
+                inputs: vec![scalar.view()],
+                expected: Ok(scalar.clone()),
+            },
+            // As above, in explicit form.
+            Case {
+                equation: "->",
+                inputs: vec![scalar.view()],
+                expected: Ok(scalar.clone()),
+            },
+            // Upper-case labels. These are not allowed by the ONNX spec, but
+            // are supported by `numpy.einsum` and ONNX Runtime.
+            //
+            // See https://github.com/robertknight/rten/issues/1386
+            Case {
+                equation: "C,MCN->MN",
+                inputs: vec![mat_a.slice(0), hck.as_dyn()],
+                expected: Ok(matmul(&pool, mat_a.slice((..1, ..)), mat_b.view(), None).unwrap()),
+            },
+            // Reduction over multiple dimensions with upper-case labels.
+            Case {
+                equation: "IJK,IJK->K",
+                inputs: vec![abf.view(), abf.view()],
+                expected: Ok(abf_sq_sum_ij.clone()),
+            },
+            // Labels are case-sensitive, so `i` and `I` are different
+            // dimensions.
+            Case {
+                equation: "iI->Ii",
+                inputs: vec![mat_a.view()],
+                expected: Ok(mat_a.transposed().to_tensor()),
+            },
+            // Repeated upper-case label takes the diagonal.
+            Case {
+                equation: "II->I",
+                inputs: vec![square_mat.view()],
+                expected: Ok(Tensor::from([1., 5., 9.])),
+            },
+            // Implicit output with mixed-case labels. Labels are ordered by
+            // ASCII code, so the output term here is "Bac".
+            Case {
+                equation: "aBc",
+                inputs: vec![abf.view()],
+                expected: Ok(abf.permuted(&[1, 0, 2]).to_tensor()),
+            },
+            // Upper-case labels combined with an ellipsis.
+            Case {
+                equation: "I...J->J...I",
+                inputs: vec![ijk.view()],
+                expected: Ok(ijk.transposed().to_tensor()),
             },
             // Invalid input terms
             Case {
-                equation: "IJ,JK", // Upper-case letters
-                inputs: vec![mat_a.view(), mat_b.view()],
-                expected: Err(OpError::InvalidValue("Input term is invalid")),
+                equation: "i1j", // Digits are used internally for ellipsis dims
+                inputs: vec![mat_a.view()],
+                expected: Err(OpError::invalid_value("Input term is invalid")),
             },
             Case {
                 equation: "i.j", // Period that is not part of an ellipsis
                 inputs: vec![mat_a.view()],
-                expected: Err(OpError::InvalidValue("Input term is invalid")),
+                expected: Err(OpError::invalid_value("Input term is invalid")),
             },
             Case {
                 equation: "i...j...", // Multiple ellipses in a term
                 inputs: vec![mat_a.view()],
-                expected: Err(OpError::InvalidValue("Input term is invalid")),
+                expected: Err(OpError::invalid_value("Input term is invalid")),
             },
             // Repeated labels in input term take the diagonal.
             Case {
@@ -963,21 +1163,30 @@ mod tests {
             Case {
                 equation: "ii->i",
                 inputs: vec![mat_a.view()],
-                expected: Err(OpError::InvalidValue(
+                expected: Err(OpError::invalid_value(
                     "Dimension sizes for repeated labels in term do not match",
                 )),
             },
             // Invalid output term
             Case {
+                equation: "ij,jk->i.k",
+                inputs: vec![mat_a.view(), mat_b.view()],
+                expected: Err(OpError::invalid_value("Output term is invalid")),
+            },
+            // Output labels which differ only in case from the input labels
+            // refer to dimensions which are not in any input.
+            Case {
                 equation: "ij,jk->IK",
                 inputs: vec![mat_a.view(), mat_b.view()],
-                expected: Err(OpError::InvalidValue("Output term is invalid")),
+                expected: Err(OpError::invalid_value(
+                    "Einsum output term contains a label not present in any input term",
+                )),
             },
             // Repeated labels in output term
             Case {
                 equation: "ij->ii",
                 inputs: vec![mat_a.view()],
-                expected: Err(OpError::InvalidValue(
+                expected: Err(OpError::invalid_value(
                     "Einsum output term contains repeated labels",
                 )),
             },
@@ -985,14 +1194,14 @@ mod tests {
             Case {
                 equation: "ij",
                 inputs: vec![vec_a.view()],
-                expected: Err(OpError::InvalidValue(
+                expected: Err(OpError::invalid_value(
                     "Einsum term dimension count does not match input tensor",
                 )),
             },
             Case {
                 equation: "i...j",
                 inputs: vec![vec_a.view()],
-                expected: Err(OpError::InvalidValue(
+                expected: Err(OpError::invalid_value(
                     "Einsum term dimension count does not match input tensor",
                 )),
             },
@@ -1000,7 +1209,7 @@ mod tests {
             Case {
                 equation: "abcdefghijkl...",
                 inputs: vec![TensorView::from_data([0; 12].as_slice(), &[])],
-                expected: Err(OpError::UnsupportedValue(
+                expected: Err(OpError::unsupported_value(
                     "Einsum input or term has too many dimensions",
                 )),
             },
@@ -1008,7 +1217,7 @@ mod tests {
             Case {
                 equation: "...",
                 inputs: vec![TensorView::from_data([0; 11].as_slice(), &[])],
-                expected: Err(OpError::UnsupportedValue(
+                expected: Err(OpError::unsupported_value(
                     "Einsum input or term has too many dimensions",
                 )),
             },
@@ -1046,11 +1255,39 @@ mod tests {
                 inputs: vec![mat_a.view()],
                 expected: reduce_sum(&pool, mat_a.view(), Some(&[-1]), false /* keep_dims */),
             },
+            // Matmul where the RHS's non-shared dimensions come from an
+            // ellipsis, and the LHS has no non-shared dimensions.
+            Case {
+                equation: "f,fc...->c...",
+                inputs: vec![mat_b.slice(0), fcd.view()],
+                expected: Ok(matmul(
+                    &pool,
+                    mat_b.slice((..1, ..)),
+                    fcd.reshaped([4, 30].as_slice()).view(),
+                    None,
+                )
+                .unwrap()
+                .into_shape([5, 6].as_slice())),
+            },
+            // Matmul where the RHS's only non-shared dimensions come from an
+            // ellipsis.
+            Case {
+                equation: "af,f...->a...",
+                inputs: vec![mat_c.view(), fcd.view()],
+                expected: Ok(matmul(
+                    &pool,
+                    mat_c.view(),
+                    fcd.reshaped([4, 30].as_slice()).view(),
+                    None,
+                )
+                .unwrap()
+                .into_shape([2, 5, 6].as_slice())),
+            },
             // Mismatch of dimension count for ellipsis
             Case {
                 equation: "...,...->...",
                 inputs: vec![vec_a.view(), mat_a.view()],
-                expected: Err(OpError::InvalidValue(
+                expected: Err(OpError::invalid_value(
                     "Number of broadcast dims does not match across inputs",
                 )),
             },
@@ -1158,6 +1395,68 @@ mod tests {
                 ]
                 .into(),
             },
+            // 3+ input terms where a term contains repeated labels.
+            //
+            // The repeated label must be counted once when determining whether
+            // later steps still need it, and appear only once in a step's
+            // output term.
+            Case {
+                equation: "ii,j,i->",
+                broadcast_ndim: 0,
+                path: [
+                    EinsumStep {
+                        lhs: new_term("ii", Some(0)),
+                        rhs: Some(new_term("j", Some(1))),
+                        // `i` is retained because the final term needs it.
+                        output: "i".to_string(),
+                    },
+                    EinsumStep {
+                        lhs: new_term("i", None),
+                        rhs: Some(new_term("i", Some(2))),
+                        output: "".to_string(),
+                    },
+                ]
+                .into(),
+            },
+            // As above, but with the terms reordered so that the other use of
+            // the repeated label is consumed by the first step of the path
+            // rather than a later one.
+            Case {
+                equation: "ii,i,j->",
+                broadcast_ndim: 0,
+                path: [
+                    EinsumStep {
+                        lhs: new_term("ii", Some(0)),
+                        rhs: Some(new_term("i", Some(1))),
+                        // `i` is dropped because no later term uses it.
+                        output: "".to_string(),
+                    },
+                    EinsumStep {
+                        lhs: new_term("", None),
+                        rhs: Some(new_term("j", Some(2))),
+                        output: "".to_string(),
+                    },
+                ]
+                .into(),
+            },
+            // 3+ input terms with repeated labels which are kept in the output.
+            Case {
+                equation: "ii,i,i->i",
+                broadcast_ndim: 0,
+                path: [
+                    EinsumStep {
+                        lhs: new_term("ii", Some(0)),
+                        rhs: Some(new_term("i", Some(1))),
+                        output: "i".to_string(),
+                    },
+                    EinsumStep {
+                        lhs: new_term("i", None),
+                        rhs: Some(new_term("i", Some(2))),
+                        output: "i".to_string(),
+                    },
+                ]
+                .into(),
+            },
             // Input terms with ellipses
             Case {
                 equation: "i...j->j...i",
@@ -1167,6 +1466,27 @@ mod tests {
                     rhs: None,
                     output: "j012i".to_string(),
                 }]
+                .into(),
+            },
+            // 3+ input terms with ellipses.
+            //
+            // Ellipses must be expanded before intermediate step outputs are
+            // built, otherwise the ellipsis is treated as an ordinary label.
+            Case {
+                equation: "...i,...j,...k->...ijk",
+                broadcast_ndim: 2,
+                path: [
+                    EinsumStep {
+                        lhs: new_term("01i", Some(0)),
+                        rhs: Some(new_term("01j", Some(1))),
+                        output: "01ij".to_string(),
+                    },
+                    EinsumStep {
+                        lhs: new_term("01ij", None),
+                        rhs: Some(new_term("01k", Some(2))),
+                        output: "01ijk".to_string(),
+                    },
+                ]
                 .into(),
             },
         ];

@@ -1,14 +1,10 @@
 use rayon::prelude::*;
 use std::mem::MaybeUninit;
 
-use rten_base::num::IsNaN;
 use rten_shape_inference::UnaryOp;
 use rten_shape_inference::ops as shape_ops;
-use rten_tensor::layout::ResizeLayout;
 use rten_tensor::prelude::*;
-use rten_tensor::slice_range::to_slice_items;
-use rten_tensor::storage::StorageMut;
-use rten_tensor::{NdTensorView, SliceItem, Tensor, TensorView, TensorViewMut};
+use rten_tensor::{InitEmpty, NdTensorView, SliceItem, Tensor, TensorBase, TensorView};
 use smallvec::SmallVec;
 
 use crate::buffer_pool::{AutoReturn, BufferPool};
@@ -17,11 +13,8 @@ use crate::operator::{
     IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
     OutputTypesContext,
 };
-use crate::ops::reduce::{cmp_nan_greater, cmp_nan_less};
-use crate::ops::{map_value_view, resolve_axis, resolve_index};
-use crate::value::ValueView;
-
-const INVALID_INDEX_ERR: OpError = OpError::InvalidValue("Entry in `indices` is out of range");
+use crate::ops::{invalid_index_err, map_value_view, resolve_axis, try_resolve_index};
+use crate::value::{Value, ValueView};
 
 /// Trait for random-access to 1D slices.
 trait GetItem {
@@ -81,14 +74,13 @@ pub fn gather<T: Copy + Default>(
         let output = if input.ndim() == 1 {
             // Fast path for indexing a vector with a scalar. This is common
             // in subgraphs that process tensor shapes.
-            let index = resolve_index(input.len(), *index as isize).ok_or(INVALID_INDEX_ERR)?;
+            let index = try_resolve_index(input.len(), *index)?;
             Tensor::full_in(pool, &[], input[[index]])
         } else {
+            let index = try_resolve_index(input.size(axis), *index)?;
             let mut slice_range = full_range(input.ndim());
-            slice_range[axis] = SliceItem::Index(*index as isize);
-            let slice = input
-                .try_slice(slice_range.as_slice())
-                .map_err(|_| INVALID_INDEX_ERR)?;
+            slice_range[axis] = SliceItem::Index(index as isize);
+            let slice = input.slice(slice_range.as_slice());
             slice.to_tensor_in(pool)
         };
         return Ok(output);
@@ -100,72 +92,58 @@ pub fn gather<T: Copy + Default>(
         &input.shape()[axis + 1..],
     ]
     .concat();
+    let mut out_data = pool.alloc(out_shape.iter().product());
 
-    // Fast path for common case of gathering from a contiguous input along
-    // axis zero. For example, when gathering from a `[token_id, embed_dim]`
-    // embedding matrix.
-    if axis == 0
-        && let Some(in_data) = input.data()
-    {
-        let in_slice_len = input.shape()[axis + 1..].iter().product();
-        let mut out_data = pool.alloc(out_shape.iter().product());
-        for index in indices.iter() {
-            let Some(index) = resolve_index(input.size(axis), *index as isize) else {
-                return Err(INVALID_INDEX_ERR);
-            };
-            let in_chunk = &in_data[index * in_slice_len..][..in_slice_len];
-            out_data.extend_from_slice(in_chunk);
+    let axis_size = input.size(axis);
+    let in_slice_len: usize = input.shape()[axis + 1..].iter().product();
+    let chunk_len = axis_size * in_slice_len;
+
+    // Early exit if chunks to copy are empty.
+    if chunk_len == 0 {
+        if axis_size == 0
+            && let Some(index) = indices.iter().next()
+        {
+            return Err(invalid_index_err(*index, axis_size));
         }
         return Ok(Tensor::from_data(&out_shape, out_data));
     }
 
-    // Construct layout for gathered slice of the input. Each slice has the same
-    // layout so we construct it once outside the loop and then reuse it on each
-    // iteration.
-    let mut in_slice_layout = input.layout().clone();
-    in_slice_layout.remove_axis_of_any_size(axis);
-    let in_slice_layout = in_slice_layout;
-
-    let mut output = Tensor::uninit_in(pool, &out_shape);
-    let mut out_slice_layout = output.layout().clone();
-    for _ in axis..axis + indices.ndim() {
-        out_slice_layout.remove_axis_of_any_size(axis);
-    }
-    let out_slice_layout = out_slice_layout;
-
-    let out_step = output.shape()[axis + indices.ndim()..].iter().product();
-    let in_slice_data_len = in_slice_layout.min_data_len();
-    let out_slice_data_len = out_slice_layout.min_data_len();
-
-    let mut n_init = 0;
-    let mut out_storage = output.storage_mut();
-    for (index, out_data_offset) in indices.iter().zip((0..).step_by(out_step)) {
-        let Some(index) = resolve_index(input.size(axis), *index as isize) else {
-            return Err(INVALID_INDEX_ERR);
-        };
-
-        // Compute storage offsets for this slice.
-        let in_offset = index * input.stride(axis);
-        let in_slice_data = input
-            .storage()
-            .slice(in_offset..in_offset + in_slice_data_len);
-        let out_slice_data =
-            out_storage.slice_mut(out_data_offset..out_data_offset + out_slice_data_len);
-
-        // Create input and output slices using the pre-computed layout.
-        let out_slice =
-            TensorViewMut::from_storage_and_layout(out_slice_data, out_slice_layout.clone());
-        let in_slice = TensorView::from_storage_and_layout(in_slice_data, in_slice_layout.clone());
-
-        // Copy data from input to output
-        let out_slice = out_slice.init_from(&in_slice);
-        n_init += out_slice.len();
+    // Fast path for gathering from a contiguous input. Each gathered slice is
+    // a contiguous chunk of the input, so the gather reduces to copying chunks.
+    if let Some(in_data) = input.data() {
+        for in_outer in in_data.chunks(chunk_len) {
+            for index in indices.iter() {
+                let index = try_resolve_index(axis_size, *index)?;
+                out_data.extend_from_slice(&in_outer[index * in_slice_len..][..in_slice_len]);
+            }
+        }
+        return Ok(Tensor::from_data(&out_shape, out_data));
     }
 
-    assert_eq!(n_init, output.len());
-    let output = unsafe { output.assume_init() };
+    let inner_dims = input.ndim() - axis;
+    for input_chunk in input.inner_iter_dyn(inner_dims) {
+        // Each entry to copy has the same layout but different offset. Prepare
+        // layout here and reuse it.
+        let entry = input_chunk.slice(0);
+        let entry_layout = entry.layout();
+        let entry_len = entry_layout.min_data_len();
 
-    Ok(output)
+        for index in indices.iter() {
+            let index = try_resolve_index(input_chunk.size(0), *index)?;
+
+            // Conceptually `entry = input_chunk.slice(index)` but we re-use
+            // the pre-prepared view layout.
+            let entry_offset = index * input_chunk.stride(0);
+            let entry_data = input_chunk
+                .storage()
+                .slice(entry_offset..entry_offset + entry_len);
+            let entry = TensorBase::from_storage_and_layout(entry_data, entry_layout);
+
+            entry.iter().for_each(|x| out_data.push(*x));
+        }
+    }
+
+    Ok(Tensor::from_data(&out_shape, out_data))
 }
 
 #[derive(Debug)]
@@ -216,7 +194,7 @@ pub fn gather_elements<T: Copy + Default + Send + Sync + std::fmt::Debug>(
     axis: isize,
 ) -> Result<Tensor<T>, OpError> {
     if input.ndim() != indices.ndim() {
-        return Err(OpError::IncompatibleInputShapes(
+        return Err(OpError::incompatible_input_shapes(
             "Input and indices must have same rank",
         ));
     }
@@ -226,7 +204,7 @@ pub fn gather_elements<T: Copy + Default + Send + Sync + std::fmt::Debug>(
     // corresponding input dimension, but not larger.
     for d in 0..input.ndim() {
         if d != axis && indices.size(d) > input.size(d) {
-            return Err(OpError::IncompatibleInputShapes(
+            return Err(OpError::incompatible_input_shapes(
                 "`indices` size must be <= input size in non-axis dimensions",
             ));
         }
@@ -250,23 +228,20 @@ pub fn gather_elements<T: Copy + Default + Send + Sync + std::fmt::Debug>(
         indices: impl Iterator<Item = &'a i32>,
         output: impl Iterator<Item = &'a mut MaybeUninit<T>>,
     ) -> Result<(), OpError> {
-        let axis_size = data.len() as i32;
+        let axis_size = data.len();
         for (&idx, out) in indices.zip(output) {
-            let idx = if idx < 0 { idx + axis_size } else { idx };
-            if let Some(el) = data.get(idx as usize) {
-                out.write(*el);
-            } else {
-                return Err(OpError::InvalidValue("Entry in `indices` is out of range"));
-            }
+            let idx = try_resolve_index(axis_size, idx)?;
+            // `try_resolve_index` checked that `idx` is in bounds.
+            out.write(*data.get(idx).unwrap());
         }
         Ok(())
     }
 
-    let mut output = Tensor::uninit_in(pool, indices.shape());
-    if output.is_empty() {
-        // Safety: Output has zero elements, so is fully "initialized".
-        return Ok(unsafe { output.assume_init() });
-    }
+    let output = Tensor::uninit_in(pool, indices.shape());
+    let mut output = match output.init_if_empty() {
+        InitEmpty::Empty(e) => return Ok(e),
+        InitEmpty::NotEmpty(ne) => ne,
+    };
 
     // When gathering from a stride-1 axis in a contiguous tensor, we can get
     // the 1D lanes by just splitting the data into chunks.
@@ -326,7 +301,13 @@ impl Operator for GatherElements {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(0)].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(GatherElements, _op, shape_ops::GatherElements);
 
 pub fn gather_nd<T: Clone + Default>(
     pool: &BufferPool,
@@ -335,25 +316,25 @@ pub fn gather_nd<T: Clone + Default>(
     batch_dims: usize,
 ) -> Result<Tensor<T>, OpError> {
     if input.ndim() < 1 || indices.ndim() < 1 {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "Input and indices must have >= 1 dims",
         ));
     }
     if batch_dims >= input.ndim().min(indices.ndim()) {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "`input` and `indices` ndim must be > `batch_dims`",
         ));
     }
 
     if input.shape()[..batch_dims] != indices.shape()[..batch_dims] {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "`input` and `indices` batch dims have different sizes",
         ));
     }
 
     let idx_tuple_size = indices.size(indices.ndim() - 1);
     if idx_tuple_size < 1 || idx_tuple_size > input.ndim() - batch_dims {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "Size of last dim of `indices` is incorrect",
         ));
     }
@@ -368,7 +349,12 @@ pub fn gather_nd<T: Clone + Default>(
     let out_slice_len = out_shape[out_shape.len() - out_slice_ndim..]
         .iter()
         .product();
-    let mut output = Tensor::<T>::uninit_in(pool, &out_shape);
+
+    let output = Tensor::<T>::uninit_in(pool, &out_shape);
+    let mut output = match output.init_if_empty() {
+        InitEmpty::Empty(e) => return Ok(e),
+        InitEmpty::NotEmpty(ne) => ne,
+    };
 
     let output_non_batch_dims = output.ndim() - batch_dims;
     let input_non_batch_dims = input.ndim() - batch_dims;
@@ -392,14 +378,15 @@ pub fn gather_nd<T: Clone + Default>(
             // the gather just amounts to copying chunks of the input to the
             // output.
             for (out_slice, idx) in out_slices.zip(idx_slices) {
-                let offset = idx
+                let offset: usize = idx
                     .iter()
-                    .zip(input.strides())
-                    .map(|(idx, stride)| *idx as usize * stride)
-                    .sum();
-                let in_slice = input_data
-                    .get(offset..offset + out_slice.len())
-                    .ok_or(OpError::InvalidValue("Invalid index"))?;
+                    .zip(input.shape().iter().zip(input.strides()))
+                    .map(|(idx, (size, stride))| {
+                        try_resolve_index(*size, *idx).map(|idx| idx * stride)
+                    })
+                    .sum::<Result<usize, OpError>>()?;
+
+                let in_slice = &input_data[offset..offset + out_slice.len()];
                 for (out, x) in out_slice.iter_mut().zip(in_slice) {
                     out.write(x.clone());
                 }
@@ -407,10 +394,14 @@ pub fn gather_nd<T: Clone + Default>(
             }
         } else {
             for (out_slice, idx) in out_slices.zip(idx_slices) {
-                let slice_items = to_slice_items(idx);
-                let in_slice = input
-                    .try_slice(slice_items.as_slice())
-                    .map_err(|_| OpError::InvalidValue("Invalid index"))?;
+                let slice_items: SmallVec<[SliceItem; 4]> = idx
+                    .iter()
+                    .zip(input.shape())
+                    .map(|(&index, &size)| {
+                        try_resolve_index(size, index).map(|index| SliceItem::Index(index as isize))
+                    })
+                    .collect::<Result<_, OpError>>()?;
+                let in_slice = input.slice(slice_items.as_slice());
 
                 for (out, x) in out_slice.iter_mut().zip(in_slice.iter()) {
                     out.write(x.clone());
@@ -452,214 +443,141 @@ impl Operator for GatherND {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(0)].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
 
-// Specifies how to combine an existing element value with an update in a
-// scatter operation.
+impl_infer_shapes!(
+    GatherND,
+    op,
+    shape_ops::GatherND {
+        batch_dims: op.batch_dims,
+    }
+);
+
+/// Order of the batch and time axes for [`ReverseSequence`].
 #[derive(Copy, Clone, Debug)]
-pub enum ScatterReduction {
-    /// Add the existing value and update.
-    Add,
-
-    /// Multiply the existing value with the update.
-    Mul,
-
-    /// Take the minimum of the existing value and the update, propagating NaNs.
-    Min,
-
-    /// Take the maximum of the existing value and the update, propagating NaNs.
-    Max,
+enum SequenceLayout {
+    /// Batch axis is 0, time axis is 1.
+    BatchFirst,
+    /// Time axis is 0, batch axis is 1.
+    TimeFirst,
 }
 
-fn scatter_reduce<
-    T: Copy + PartialOrd + std::ops::Add<Output = T> + std::ops::Mul<Output = T> + IsNaN,
->(
-    current: T,
-    update: T,
-    reduction: Option<ScatterReduction>,
-) -> T {
-    match reduction {
-        Some(ScatterReduction::Add) => current + update,
-        Some(ScatterReduction::Mul) => current * update,
-
-        // nb. In the operations below, we prefer to keep the current value
-        // unless the update is definitely less or NaN.
-        Some(ScatterReduction::Min) => match cmp_nan_less(update, current) {
-            std::cmp::Ordering::Less => update,
-            _ => current,
-        },
-        Some(ScatterReduction::Max) => match cmp_nan_greater(update, current) {
-            std::cmp::Ordering::Greater => update,
-            _ => current,
-        },
-        None => update,
-    }
-}
-
-pub fn scatter_elements<
-    T: Copy + Default + PartialOrd + std::ops::Add<Output = T> + std::ops::Mul<Output = T> + IsNaN,
->(
+/// Reverse variable-length slices of `input` along the time axis.
+///
+/// For each batch element `b` (indexed along the batch axis), the first
+/// `seq_lens[b]` elements along the time axis are reversed. Elements beyond
+/// `seq_lens[b]` are copied unchanged.
+fn reverse_sequence<T: Copy>(
     pool: &BufferPool,
-    data: TensorView<T>,
-    indices: TensorView<i32>,
-    updates: TensorView<T>,
-    axis: isize,
-    reduction: Option<ScatterReduction>,
+    input: TensorView<T>,
+    seq_lens: NdTensorView<i32, 1>,
+    layout: SequenceLayout,
 ) -> Result<Tensor<T>, OpError> {
-    if indices.ndim() != data.ndim() {
-        return Err(OpError::InvalidValue(
-            "`data` and `indices` must have same rank",
+    if input.ndim() < 2 {
+        return Err(OpError::invalid_value(
+            "ReverseSequence input must have at least 2 dims",
         ));
     }
-    if indices.shape() != updates.shape() {
-        return Err(OpError::InvalidValue(
-            "`indices` and `updates` must have same shape",
+
+    let (batch_size, time_size) = match layout {
+        SequenceLayout::BatchFirst => (input.size(0), input.size(1)),
+        SequenceLayout::TimeFirst => (input.size(1), input.size(0)),
+    };
+
+    if seq_lens.size(0) != batch_size {
+        return Err(OpError::invalid_value(
+            "sequence_lens length must match the batch dimension size",
         ));
     }
-    let axis = resolve_axis(data.ndim(), axis)?;
+    for &len in seq_lens.iter() {
+        if len < 0 || len as usize > time_size {
+            return Err(OpError::invalid_value(
+                "sequence_lens values must be in the range [0, time_size]",
+            ));
+        }
+    }
 
-    let axis_size = data.size(axis);
-    let mut output = data.to_tensor_in(pool);
+    // The batch and time axes are the first two dimensions in some order, so
+    // for a contiguous input, each (batch, time) coordinate selects a
+    // contiguous inner block which can be copied as a unit.
+    let input = input.to_contiguous_in(pool).auto_return(pool);
+    let in_data = input.data();
+    let d0 = input.size(0);
+    let d1 = input.size(1);
+    let inner_size: usize = input.shape()[2..].iter().product();
 
-    for (output_lane, (update_lane, index_lane)) in output
-        .lanes_mut(axis)
-        .zip(updates.lanes(axis).zip(indices.lanes(axis)))
-    {
-        let mut output_lane = output_lane.into_view();
+    let mut out_data = pool.alloc(in_data.len());
 
-        for (idx, update) in index_lane.zip(update_lane) {
-            let Some(idx) = resolve_index(axis_size, *idx as isize) else {
-                return Err(OpError::InvalidValue("Index is invalid"));
+    // Write output blocks in order. Reversal happens when we pick the input
+    // chunk to copy at each step.
+    for i0 in 0..d0 {
+        for i1 in 0..d1 {
+            // Map physical output coords to logical (batch, time) coords.
+            let (batch, time) = match layout {
+                SequenceLayout::BatchFirst => (i0, i1),
+                SequenceLayout::TimeFirst => (i1, i0),
             };
-            let out_el = &mut output_lane[[idx]];
-            *out_el = scatter_reduce(*out_el, *update, reduction);
+            let seq_len = seq_lens[[batch]] as usize;
+
+            // Read from the mirrored position within the reversed prefix.
+            let src_time = if time < seq_len {
+                seq_len - 1 - time
+            } else {
+                time
+            };
+
+            // Map logical (batch, src_time) back to physical input coords.
+            let (src0, src1) = match layout {
+                SequenceLayout::BatchFirst => (i0, src_time),
+                SequenceLayout::TimeFirst => (src_time, i1),
+            };
+            let src_offset = (src0 * d1 + src1) * inner_size;
+            out_data.extend_from_slice(&in_data[src_offset..src_offset + inner_size]);
         }
     }
 
-    Ok(output)
+    Ok(Tensor::from_data(input.shape(), out_data))
 }
 
 #[derive(Debug)]
-pub struct ScatterElements {
-    pub axis: isize,
-    pub reduction: Option<ScatterReduction>,
+pub struct ReverseSequence {
+    pub batch_axis: i32,
+    pub time_axis: i32,
 }
 
-impl Operator for ScatterElements {
+impl Operator for ReverseSequence {
     fn name(&self) -> &str {
-        "ScatterElements"
+        "ReverseSequence"
     }
 
     fn max_inputs(&self) -> Option<usize> {
-        Some(3)
+        Some(2)
     }
 
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
-        let inputs = ctx.inputs();
-        let data = inputs.require(0)?;
-        let indices = inputs.require_as(1)?;
+        let input = ctx.inputs().require(0)?;
+        let seq_lens: NdTensorView<i32, 1> = ctx.inputs().require_as(1)?;
 
-        map_value_view!(data, x, {
-            let updates = inputs.require_as(2)?;
-            scatter_elements(ctx.pool(), x, indices, updates, self.axis, self.reduction)
-                .into_op_result()
-        })
-    }
+        // `batch_axis` and `time_axis` must each be 0 or 1 and refer to
+        // different dimensions.
+        let layout = match (self.batch_axis, self.time_axis) {
+            (0, 1) => SequenceLayout::BatchFirst,
+            (1, 0) => SequenceLayout::TimeFirst,
+            _ => {
+                return Err(OpError::invalid_value(
+                    "batch_axis and time_axis must be 0 and 1 in some order",
+                ));
+            }
+        };
 
-    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
-        Some([OutputType::CopyFromInput(0)].into())
-    }
-}
-
-pub fn scatter_nd<
-    T: Copy + Default + PartialOrd + std::ops::Add<Output = T> + std::ops::Mul<Output = T> + IsNaN,
->(
-    pool: &BufferPool,
-    data: TensorView<T>,
-    indices: TensorView<i32>,
-    updates: TensorView<T>,
-    reduction: Option<ScatterReduction>,
-) -> Result<Tensor<T>, OpError> {
-    if data.ndim() == 0 || indices.ndim() == 0 {
-        return Err(OpError::InvalidValue(
-            "`data` and `indices` must have rank >= 1",
-        ));
-    }
-
-    // Per spec, the `indices` tensor is treated as a set of K-tuples where
-    // `k <= data.ndim()`, specifying the indices of slices to update.
-    let k = indices.size(indices.ndim() - 1);
-
-    let expected_update_dim = data.ndim() + indices.ndim() - k - 1;
-    if updates.ndim() != expected_update_dim {
-        return Err(OpError::InvalidValue(
-            "`updates` does not have expected rank",
-        ));
-    }
-
-    let mut expected_update_shape: SmallVec<[usize; 5]> = SmallVec::new();
-    expected_update_shape.extend_from_slice(&indices.shape()[..indices.ndim() - 1]);
-    expected_update_shape.extend_from_slice(&data.shape()[k..data.ndim()]);
-    if updates.shape() != expected_update_shape.as_slice() {
-        return Err(OpError::InvalidValue(
-            "`updates` does not have expected shape",
-        ));
-    }
-
-    // Assuming the updates and indices are likely already contiguous, we can
-    // optimize iterating over slices of the innermost dimensions using slice
-    // chunks.
-    let updates = updates.to_contiguous_in(pool).auto_return(pool);
-    let update_slice_len: usize = updates.shape()[indices.ndim() - 1..].iter().product();
-    let update_slices = updates.data().chunks(update_slice_len);
-
-    let indices = indices.to_contiguous_in(pool).auto_return(pool);
-    let index_slices = indices.data().chunks(indices.size(indices.ndim() - 1));
-
-    let mut output = data.to_tensor_in(pool);
-    for (index, update_slice) in index_slices.zip(update_slices) {
-        let mut output_slice_offset = 0;
-        for (i, (size, stride)) in index
-            .iter()
-            .zip(output.shape().iter().zip(output.strides().iter()))
-        {
-            let idx = resolve_index(*size, *i as isize)
-                .ok_or(OpError::InvalidValue("invalid scatter index"))?;
-            output_slice_offset += idx * stride;
-        }
-        let out_data = output.data_mut().unwrap();
-        let out_slice = &mut out_data[output_slice_offset..][..update_slice_len];
-
-        for (out_el, update) in out_slice.iter_mut().zip(update_slice.iter()) {
-            *out_el = scatter_reduce(*out_el, *update, reduction);
-        }
-    }
-    Ok(output)
-}
-
-#[derive(Debug)]
-pub struct ScatterND {
-    pub reduction: Option<ScatterReduction>,
-}
-
-impl Operator for ScatterND {
-    fn name(&self) -> &str {
-        "ScatterND"
-    }
-
-    fn max_inputs(&self) -> Option<usize> {
-        Some(3)
-    }
-
-    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
-        let inputs = ctx.inputs();
-        let data = inputs.require(0)?;
-        let indices = inputs.require_as(1)?;
-
-        map_value_view!(data, x, {
-            let updates = inputs.require_as(2)?;
-            scatter_nd(ctx.pool(), x, indices, updates, self.reduction).into_op_result()
-        })
+        let result = map_value_view!(input, input, {
+            reverse_sequence(ctx.pool(), input, seq_lens, layout).map(Value::from)
+        });
+        result.into_op_result()
     }
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
@@ -667,6 +585,8 @@ impl Operator for ScatterND {
     }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        // The output has the same shape as the (first) input, so we can reuse
+        // the shape inference for unary operators.
         Some(&UnaryOp)
     }
 }
@@ -682,10 +602,8 @@ mod tests {
     use rten_testing::TestCases;
 
     use crate::buffer_pool::BufferPool;
-    use crate::operator::OpError;
-    use crate::ops::{
-        ScatterReduction, gather, gather_elements, gather_nd, scatter_elements, scatter_nd,
-    };
+    use crate::operator::{OpError, OperatorExt};
+    use crate::ops::{ReverseSequence, gather, gather_elements, gather_nd, invalid_index_err};
 
     #[test]
     fn test_gather_scalar_index() {
@@ -740,6 +658,14 @@ mod tests {
         let result = gather(&pool, input.view(), 1, indices.view()).unwrap();
         expect_equal(&result, &expected)?;
 
+        // Gather along an inner axis where each gathered slice spans multiple
+        // elements.
+        let input = Tensor::from([[[1, 2], [3, 4], [5, 6]]]); // [1, 3, 2]
+        let indices = Tensor::from([[0, 2], [2, 1]]);
+        let expected = Tensor::from_data(&[1, 2, 2, 2], vec![1, 2, 5, 6, 5, 6, 3, 4]);
+        let result = gather(&pool, input.view(), 1, indices.view())?;
+        expect_equal(&result, &expected)?;
+
         // Negative index values.
         let input = Tensor::from([1, 2, 3]);
         let indices = Tensor::from([-1, -2, -3]);
@@ -749,6 +675,13 @@ mod tests {
 
         // Empty indices
         let input = Tensor::from([1, 2, 3]);
+        let indices = Tensor::from([0i32; 0]);
+        let expected = Tensor::from([0i32; 0]);
+        let result = gather(&pool, input.view(), 0, indices.view()).unwrap();
+        assert_eq!(&result, &expected);
+
+        // Empty input and empty indices
+        let input = Tensor::from([0i32; 0]);
         let indices = Tensor::from([0i32; 0]);
         let expected = Tensor::from([0i32; 0]);
         let result = gather(&pool, input.view(), 0, indices.view()).unwrap();
@@ -765,7 +698,12 @@ mod tests {
         let input = Tensor::<f32>::rand(&[128, 10], &mut rng);
         let indices = Tensor::from_data(&[2, 2], vec![2, 5, 8, 50]);
         let result = gather(&pool, input.view(), 5, indices.view());
-        assert_eq!(result.err(), Some(OpError::InvalidValue("Axis is invalid")));
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value(
+                "Axis 5 is out of range. Must be in [-2, 2)"
+            ))
+        );
     }
 
     #[test]
@@ -774,6 +712,7 @@ mod tests {
         struct Case {
             input: Tensor<i32>,
             indices: Tensor<i32>,
+            expected: OpError,
         }
 
         let cases = [
@@ -781,26 +720,40 @@ mod tests {
             Case {
                 input: Tensor::zeros(&[128, 10]),
                 indices: Tensor::from_data(&[2, 2], vec![2, 5, 8, 130]),
+                expected: invalid_index_err(130, 128),
+            },
+            // Non-scalar indices into an empty (size zero) axis
+            Case {
+                input: Tensor::zeros(&[0]),
+                indices: Tensor::from([0]),
+                expected: invalid_index_err(0, 0),
             },
             // Scalar indices, with 1D and ND inputs
             Case {
                 input: [1, 2, 3].into(),
                 indices: Tensor::from(4),
+                expected: invalid_index_err(4, 3),
             },
             Case {
                 input: [[1, 2, 3]].into(),
                 indices: Tensor::from(2),
+                expected: invalid_index_err(2, 1),
             },
         ];
 
         cases.test_each(|case| {
             let pool = BufferPool::new();
             let result = gather(&pool, case.input.view(), 0, case.indices.view());
-            assert_eq!(
-                result.err(),
-                Some(OpError::InvalidValue("Entry in `indices` is out of range"))
-            );
+            assert_eq!(result.err().as_ref(), Some(&case.expected));
         })
+    }
+
+    #[test]
+    fn test_invalid_index_err() {
+        assert_eq!(
+            invalid_index_err(4, 3).to_string(),
+            "input or attribute has invalid value: Index 4 is out of range. Must be in [-3, 3)"
+        );
     }
 
     #[test]
@@ -897,25 +850,27 @@ mod tests {
                 input: [[1, 2], [3, 4]].into(),
                 indices: [[0, 0], [1, 0]].into(),
                 axis: 2,
-                expected: OpError::InvalidValue("Axis is invalid"),
+                expected: OpError::invalid_value("Axis 2 is out of range. Must be in [-2, 2)"),
             },
             Case {
                 input: [[1, 2], [3, 4]].into(),
                 indices: [[0, 0], [1, 3]].into(),
                 axis: 1,
-                expected: OpError::InvalidValue("Entry in `indices` is out of range"),
+                expected: invalid_index_err(3, 2),
             },
             Case {
                 input: [[1, 2], [3, 4]].into(),
                 indices: [1, 2, 3].into(),
                 axis: 1,
-                expected: OpError::IncompatibleInputShapes("Input and indices must have same rank"),
+                expected: OpError::incompatible_input_shapes(
+                    "Input and indices must have same rank",
+                ),
             },
             Case {
                 input: [[1, 2], [3, 4]].into(),
                 indices: [[1, 2, 3], [4, 5, 6]].into(),
                 axis: 0,
-                expected: OpError::IncompatibleInputShapes(
+                expected: OpError::incompatible_input_shapes(
                     "`indices` size must be <= input size in non-axis dimensions",
                 ),
             },
@@ -976,15 +931,54 @@ mod tests {
                 indices: [[1], [0]].into(),
                 expected: Ok([[2, 3], [4, 5]].into()),
             },
+            // Negative indexes.
+            Case {
+                batch_dims: 0,
+                data: [[0, 1], [2, 3], [4, 5]].into(),
+                transpose: false,
+                indices: [[-1]].into(),
+                expected: Ok([[4, 5]].into()),
+            },
             // Invalid indexes
             Case {
                 batch_dims: 0,
                 data: [[0, 1], [2, 3]].into(),
                 transpose: false,
                 indices: [[0, 0], [1, 2]].into(),
-                expected: Err(OpError::InvalidValue("Invalid index")),
+                expected: Err(invalid_index_err(2, 2)),
             },
-            // Transposed input
+            Case {
+                batch_dims: 0,
+                data: [[0, 1], [2, 3]].into(),
+                transpose: false,
+                indices: [[-3, 0]].into(),
+                expected: Err(invalid_index_err(-3, 2)),
+            },
+            // Input with a zero-size dimension in the gathered slice.
+            Case {
+                batch_dims: 0,
+                data: Tensor::zeros(&[2, 0]),
+                transpose: false,
+                indices: [[0]].into(),
+                expected: Ok(Tensor::zeros(&[1, 0])),
+            },
+            // Empty `indices` combined with a zero-size input dimension.
+            Case {
+                batch_dims: 0,
+                data: Tensor::zeros(&[8, 0]),
+                transpose: false,
+                indices: Tensor::zeros(&[0, 1]),
+                expected: Ok(Tensor::zeros(&[0, 0])),
+            },
+            // Empty `indices` with a non-empty gathered slice.
+            Case {
+                batch_dims: 0,
+                data: [[0, 1], [2, 3]].into(),
+                transpose: false,
+                indices: Tensor::zeros(&[0, 1]),
+                expected: Ok(Tensor::zeros(&[0, 2])),
+            },
+            // Transposed (non-contiguous) input.
             Case {
                 batch_dims: 0,
                 data: [[0, 1], [2, 3]].into(),
@@ -997,7 +991,22 @@ mod tests {
                 data: [[0, 1], [2, 3]].into(),
                 transpose: true,
                 indices: [[0, 1], [1, 2]].into(),
-                expected: Err(OpError::InvalidValue("Invalid index")),
+                expected: Err(invalid_index_err(2, 2)),
+            },
+            // Negative indexes with a transposed (non-contiguous) input.
+            Case {
+                batch_dims: 0,
+                data: [[0, 1], [2, 3]].into(),
+                transpose: true,
+                indices: [[-1, -1], [-2, -1]].into(),
+                expected: Ok([3, 2].into()),
+            },
+            Case {
+                batch_dims: 0,
+                data: [[0, 1], [2, 3]].into(),
+                transpose: true,
+                indices: [[-3, 0]].into(),
+                expected: Err(invalid_index_err(-3, 2)),
             },
         ];
 
@@ -1018,283 +1027,100 @@ mod tests {
     }
 
     #[test]
-    fn test_scatter_elements() {
+    fn test_reverse_sequence() {
         #[derive(Debug)]
         struct Case {
-            data: Tensor,
-            indices: Tensor<i32>,
-            updates: Tensor,
-            axis: isize,
-            expected: Result<Tensor, OpError>,
+            input: Tensor<f32>,
+            seq_lens: Tensor<i32>,
+            batch_axis: i32,
+            time_axis: i32,
+            expected: Result<Tensor<f32>, OpError>,
         }
 
+        // 4x4 matrix with values 0..16.
+        let input = Tensor::from([
+            [0., 1., 2., 3.],
+            [4., 5., 6., 7.],
+            [8., 9., 10., 11.],
+            [12., 13., 14., 15.],
+        ]);
+
         let cases = [
-            // Example #1 from ONNX spec
+            // time_axis=0, batch_axis=1 (reverse down columns).
             Case {
-                data: Tensor::zeros(&[3, 3]),
-                indices: Tensor::from([[1, 0, 2], [0, 2, 1]]),
-                updates: Tensor::from([[1., 1.1, 1.2], [2., 2.1, 2.2]]),
-                axis: 0,
-                expected: Ok(Tensor::from([[2., 1.1, 0.], [1., 0., 2.2], [0., 2.1, 1.2]])),
+                input: input.clone(),
+                seq_lens: Tensor::from([4, 3, 2, 1]),
+                batch_axis: 1,
+                time_axis: 0,
+                expected: Ok(Tensor::from([
+                    [12., 9., 6., 3.],
+                    [8., 5., 2., 7.],
+                    [4., 1., 10., 11.],
+                    [0., 13., 14., 15.],
+                ])),
             },
-            // Example #2 from ONNX spec
+            // time_axis=1, batch_axis=0 (reverse along rows).
             Case {
-                data: Tensor::from([[1., 2., 3., 4., 5.]]),
-                indices: Tensor::from([[1, 3]]),
-                updates: Tensor::from([[1.1, 2.1]]),
-                axis: 1,
-                expected: Ok(Tensor::from([[1., 1.1, 3., 2.1, 5.]])),
+                input: input.clone(),
+                seq_lens: Tensor::from([1, 2, 3, 4]),
+                batch_axis: 0,
+                time_axis: 1,
+                expected: Ok(Tensor::from([
+                    [0., 1., 2., 3.],
+                    [5., 4., 6., 7.],
+                    [10., 9., 8., 11.],
+                    [15., 14., 13., 12.],
+                ])),
             },
-            // Invalid index
+            // 3D input, where each (batch, time) coordinate selects a
+            // contiguous block of elements rather than a single element.
             Case {
-                data: Tensor::from([1., 2., 3.]),
-                indices: Tensor::from([4]),
-                updates: Tensor::from([1.]),
-                axis: 0,
-                expected: Err(OpError::InvalidValue("Index is invalid")),
+                input: Tensor::from([[[0., 1.], [2., 3.]], [[4., 5.], [6., 7.]]]),
+                seq_lens: Tensor::from([2, 1]),
+                batch_axis: 0,
+                time_axis: 1,
+                expected: Ok(Tensor::from([[[2., 3.], [0., 1.]], [[4., 5.], [6., 7.]]])),
             },
-            // Rank mismatch
+            // Mismatched `sequence_lens` length.
             Case {
-                data: Tensor::from([1., 2., 3.]),
-                indices: Tensor::from([[4]]),
-                updates: Tensor::from([[1.]]),
-                axis: 0,
-                expected: Err(OpError::InvalidValue(
-                    "`data` and `indices` must have same rank",
+                input: input.clone(),
+                seq_lens: Tensor::from([1, 2]),
+                batch_axis: 1,
+                time_axis: 0,
+                expected: Err(OpError::invalid_value(
+                    "sequence_lens length must match the batch dimension size",
                 )),
             },
-            // `indices` and `updates` shape mismatch
+            // Out-of-range sequence length.
             Case {
-                data: Tensor::from([1., 2., 3.]),
-                indices: Tensor::from([4]),
-                updates: Tensor::from([1., 2.]),
-                axis: 0,
-                expected: Err(OpError::InvalidValue(
-                    "`indices` and `updates` must have same shape",
+                input: input.clone(),
+                seq_lens: Tensor::from([1, 2, 3, 5]),
+                batch_axis: 1,
+                time_axis: 0,
+                expected: Err(OpError::invalid_value(
+                    "sequence_lens values must be in the range [0, time_size]",
+                )),
+            },
+            // Invalid axes.
+            Case {
+                input: input.clone(),
+                seq_lens: Tensor::from([4, 4, 4, 4]),
+                batch_axis: 0,
+                time_axis: 2,
+                expected: Err(OpError::invalid_value(
+                    "batch_axis and time_axis must be 0 and 1 in some order",
                 )),
             },
         ];
 
         cases.test_each(|case| {
-            let pool = BufferPool::new();
-            let result = scatter_elements(
-                &pool,
-                case.data.view(),
-                case.indices.view(),
-                case.updates.view(),
-                case.axis,
-                None,
-            );
+            let op = ReverseSequence {
+                batch_axis: case.batch_axis,
+                time_axis: case.time_axis,
+            };
+            let result: Result<Tensor<f32>, _> =
+                op.run_simple((case.input.view(), case.seq_lens.view()));
             assert_eq!(result, case.expected);
         });
-    }
-
-    #[test]
-    fn test_scatter_elements_reduction() {
-        let pool = BufferPool::new();
-
-        let data = Tensor::from([1, 2, 3, 4]);
-        let indices = Tensor::from([1, 3]);
-        let updates = Tensor::from([2, 2]);
-
-        let scatter = |reduction: Option<ScatterReduction>| {
-            scatter_elements(
-                &pool,
-                data.view(),
-                indices.view(),
-                updates.view(),
-                0, /* axis */
-                reduction,
-            )
-            .unwrap()
-        };
-
-        let result = scatter(Some(ScatterReduction::Add));
-        assert_eq!(result, Tensor::from([1, 4, 3, 6]));
-
-        let result = scatter(Some(ScatterReduction::Mul));
-        assert_eq!(result, Tensor::from([1, 4, 3, 8]));
-
-        let result = scatter(Some(ScatterReduction::Min));
-        assert_eq!(result, Tensor::from([1, 2, 3, 2]));
-
-        let result = scatter(Some(ScatterReduction::Max));
-        assert_eq!(result, Tensor::from([1, 2, 3, 4]));
-    }
-
-    #[test]
-    fn test_scatter_nd() {
-        #[derive(Debug)]
-        struct Case {
-            data: Tensor<i32>,
-            indices: Tensor<i32>,
-            updates: Tensor<i32>,
-            expected: Tensor<i32>,
-        }
-
-        let cases = [
-            // Example 1 from ONNX spec.
-            Case {
-                data: [1, 2, 3, 4, 5, 6, 7, 8].into(),
-                indices: Tensor::from_data(&[4, 1], vec![4, 3, 1, 7]),
-                updates: [9, 10, 11, 12].into(),
-                expected: [1, 11, 3, 10, 9, 6, 7, 12].into(),
-            },
-            // Example 2 from ONNX spec.
-            Case {
-                data: [
-                    [[1, 2, 3, 4], [5, 6, 7, 8], [8, 7, 6, 5], [4, 3, 2, 1]],
-                    [[1, 2, 3, 4], [5, 6, 7, 8], [8, 7, 6, 5], [4, 3, 2, 1]],
-                    [[8, 7, 6, 5], [4, 3, 2, 1], [1, 2, 3, 4], [5, 6, 7, 8]],
-                    [[8, 7, 6, 5], [4, 3, 2, 1], [1, 2, 3, 4], [5, 6, 7, 8]],
-                ]
-                .into(),
-                indices: [[0], [2]].into(),
-                updates: [
-                    [[5, 5, 5, 5], [6, 6, 6, 6], [7, 7, 7, 7], [8, 8, 8, 8]],
-                    [[1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3], [4, 4, 4, 4]],
-                ]
-                .into(),
-                expected: [
-                    [[5, 5, 5, 5], [6, 6, 6, 6], [7, 7, 7, 7], [8, 8, 8, 8]],
-                    [[1, 2, 3, 4], [5, 6, 7, 8], [8, 7, 6, 5], [4, 3, 2, 1]],
-                    [[1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3], [4, 4, 4, 4]],
-                    [[8, 7, 6, 5], [4, 3, 2, 1], [1, 2, 3, 4], [5, 6, 7, 8]],
-                ]
-                .into(),
-            },
-            // Test for issue when `updates` has a lower rank than `indices`.
-            Case {
-                data: [[1, 2], [3, 4]].into(),
-                indices: [[0, 0], [0, 1]].into(),
-                updates: [5, 6].into(),
-                expected: [[5, 6], [3, 4]].into(),
-            },
-        ];
-
-        cases.test_each(|case| {
-            let pool = BufferPool::new();
-            let result = scatter_nd(
-                &pool,
-                case.data.view(),
-                case.indices.view(),
-                case.updates.view(),
-                None,
-            )
-            .unwrap();
-            assert_eq!(result, case.expected);
-        })
-    }
-
-    #[test]
-    fn test_scatter_nd_reduce() {
-        #[derive(Debug)]
-        struct Case {
-            data: Tensor<f32>,
-            indices: Tensor<i32>,
-            updates: Tensor<f32>,
-            expected: Tensor<f32>,
-            reduction: ScatterReduction,
-        }
-
-        let cases = [
-            Case {
-                data: Tensor::arange(1., 5., None),
-                indices: Tensor::from_data(&[4, 1], vec![0, 1, 2, 3]),
-                updates: [1., 2., 3., 4.].into(),
-                expected: [2., 4., 6., 8.].into(),
-                reduction: ScatterReduction::Add,
-            },
-            Case {
-                data: Tensor::arange(1., 5., None),
-                indices: Tensor::from_data(&[4, 1], vec![0, 1, 2, 3]),
-                updates: [1., 2., 3., 4.].into(),
-                expected: [1., 4., 9., 16.].into(),
-                reduction: ScatterReduction::Mul,
-            },
-            Case {
-                data: Tensor::arange(1., 5., None),
-                indices: Tensor::from_data(&[4, 1], vec![0, 1, 2, 3]),
-                updates: [1., -2., 3., -4.].into(),
-                expected: [1., -2., 3., -4.].into(),
-                reduction: ScatterReduction::Min,
-            },
-            Case {
-                data: Tensor::arange(1., 5., None),
-                indices: Tensor::from_data(&[4, 1], vec![0, 1, 2, 3]),
-                updates: [1., -2., 3., -4.].into(),
-                expected: [1., 2., 3., 4.].into(),
-                reduction: ScatterReduction::Max,
-            },
-        ];
-
-        cases.test_each(|case| {
-            let pool = BufferPool::new();
-            let result = scatter_nd(
-                &pool,
-                case.data.view(),
-                case.indices.view(),
-                case.updates.view(),
-                Some(case.reduction),
-            )
-            .unwrap();
-            assert_eq!(result, case.expected);
-        })
-    }
-
-    #[test]
-    fn test_scatter_nd_invalid() {
-        #[derive(Debug)]
-        struct Case {
-            data: Tensor<f32>,
-            indices: Tensor<i32>,
-            updates: Tensor<f32>,
-            expected: OpError,
-        }
-
-        let cases = [
-            Case {
-                data: (5.).into(),
-                indices: [0].into(),
-                updates: [0.].into(),
-                expected: OpError::InvalidValue("`data` and `indices` must have rank >= 1"),
-            },
-            Case {
-                data: Tensor::from([0.]),
-                indices: Tensor::from(0),
-                updates: [0.].into(),
-                expected: OpError::InvalidValue("`data` and `indices` must have rank >= 1"),
-            },
-            Case {
-                data: Tensor::arange(1., 5., None),
-                indices: [[0], [1], [2], [3]].into(),
-                updates: [[1., 2., 3., 4.]].into(),
-                expected: OpError::InvalidValue("`updates` does not have expected rank"),
-            },
-            Case {
-                data: Tensor::arange(1., 5., None),
-                indices: [[0], [1], [2], [3]].into(),
-                updates: [1., 2., 3., 4., 5.].into(),
-                expected: OpError::InvalidValue("`updates` does not have expected shape"),
-            },
-            Case {
-                data: Tensor::arange(1., 5., None),
-                indices: [[0], [1], [2], [4]].into(),
-                updates: [1., 2., 3., 4.].into(),
-                expected: OpError::InvalidValue("invalid scatter index"),
-            },
-        ];
-
-        cases.test_each(|case| {
-            let pool = BufferPool::new();
-            let result = scatter_nd(
-                &pool,
-                case.data.view(),
-                case.indices.view(),
-                case.updates.view(),
-                None,
-            );
-            assert_eq!(result.as_ref(), Err(&case.expected));
-        })
     }
 }

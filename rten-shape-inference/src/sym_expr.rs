@@ -19,8 +19,12 @@ use smallvec::SmallVec;
 pub struct Symbol {
     pub name: String,
 
-    // True if this value is assumed to be >= 0.
+    /// True if this value is assumed to be >= 0.
     pub positive: bool,
+
+    /// True if this is a synthetic/unknown variable created to represent a
+    /// value that could not be computed.
+    pub synthetic: bool,
 }
 
 /// Symbolic expression representing an integer value.
@@ -242,7 +246,12 @@ impl SymExpr {
 
         match self {
             Self::Value(_) | Self::Var(_) => self.clone(),
-            Self::Neg(expr) => Self::Neg(expr.canonicalize().into()),
+            // Fold negation of a constant so it sorts and combines with other
+            // constant terms (eg. in `3 + x + -3`).
+            Self::Neg(expr) => match expr.canonicalize() {
+                SymExpr::Value(x) if x != i32::MIN => SymExpr::Value(-x),
+                e => Self::Neg(e.into()),
+            },
             Self::Mul(..) => reassociate_terms(
                 self,
                 &|term| {
@@ -339,6 +348,24 @@ impl SymExpr {
         self.canonicalize().simplify_canonical()
     }
 
+    /// Return true of the depth of the expression exceeds `depth`.
+    pub fn exceeds_depth(&self, depth: u32) -> bool {
+        match self {
+            Self::Value(_) | Self::Var(_) => false,
+            Self::Neg(expr) => depth == 0 || expr.exceeds_depth(depth - 1),
+            Self::Add(lhs, rhs)
+            | Self::Sub(lhs, rhs)
+            | Self::Mul(lhs, rhs)
+            | Self::Div(lhs, rhs)
+            | Self::DivCeil(lhs, rhs)
+            | Self::Max(lhs, rhs)
+            | Self::Min(lhs, rhs)
+            | Self::Broadcast(lhs, rhs) => {
+                depth == 0 || lhs.exceeds_depth(depth - 1) || rhs.exceeds_depth(depth - 1)
+            }
+        }
+    }
+
     /// Simplify an expression which is assumed to have been put in canonical
     /// form by [`canonicalize`](Self::canonicalize).
     fn simplify_canonical(self) -> SymExpr {
@@ -346,6 +373,7 @@ impl SymExpr {
             Self::Value(_) | Self::Var(_) => self.clone(),
             Self::Neg(expr) => match Arc::unwrap_or_clone(expr).simplify_canonical() {
                 SymExpr::Value(x) => SymExpr::Value(-x),
+                SymExpr::Neg(inner) => Arc::unwrap_or_clone(inner),
                 expr => Self::Neg(expr.into()),
             },
             Self::Add(lhs, rhs) => {
@@ -495,6 +523,7 @@ impl SymExpr {
             Symbol {
                 name: name.to_string(),
                 positive: false,
+                synthetic: false,
             }
             .into(),
         )
@@ -506,6 +535,7 @@ impl SymExpr {
             Symbol {
                 name: name.to_string(),
                 positive: true,
+                synthetic: false,
             }
             .into(),
         )
@@ -651,6 +681,23 @@ fn remove_common_factors(lhs: SymExpr, rhs: SymExpr) -> (SymExpr, SymExpr) {
         } else {
             i += 1;
         }
+    }
+
+    // Divide out the greatest common divisor of the constant factors on each
+    // side. For example `(768 * x) / 256` reduces the constants to `(3 * x) / 1`.
+    let const_term = |terms: &[SymExpr]| {
+        terms.iter().enumerate().find_map(|(i, t)| match t {
+            SymExpr::Value(x) => Some((i, *x)),
+            _ => None,
+        })
+    };
+    if let (Some((li, lc)), Some((ri, rc))) = (const_term(&lhs_terms), const_term(&rhs_terms))
+        && let Some(g) = gcd(lc, rc)
+        && g > 1
+        && rc != 0
+    {
+        lhs_terms[li] = SymExpr::Value(lc / g);
+        rhs_terms[ri] = SymExpr::Value(rc / g);
     }
 
     // Construct simplified LHS and RHS
@@ -825,6 +872,7 @@ impl<'a> From<&'a str> for SymExpr {
             Symbol {
                 name: name.to_string(),
                 positive: true,
+                synthetic: false,
             }
             .into(),
         )
@@ -906,6 +954,19 @@ impl fmt::Display for SymExpr {
     }
 }
 
+/// Return the greatest common divisor of the absolute values of `a` and `b`.
+///
+/// Returns `None` if the result doesn't fit in an `i32`. This happens only when
+/// both `a` and `b` are `i32::MIN`, giving a GCD of `2^31`.
+fn gcd(a: i32, b: i32) -> Option<i32> {
+    let mut a = a.unsigned_abs();
+    let mut b = b.unsigned_abs();
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    i32::try_from(a).ok()
+}
+
 /// Copied from unstable [`i32::div_ceil`] in the standard library.
 pub const fn div_ceil(lhs: i32, rhs: i32) -> i32 {
     let d = lhs / rhs;
@@ -976,6 +1037,28 @@ mod tests {
 
         let y = SymExpr::var("y");
         assert_eq!(y.range(), (i32::MIN, i32::MAX));
+    }
+
+    #[test]
+    fn test_exceeds_depth() {
+        // Leaf nodes (values and variables) have a depth of zero.
+        assert!(!SymExpr::var("x").exceeds_depth(0));
+        assert!(!SymExpr::from(5).exceeds_depth(0));
+
+        // A binary operation adds one level of depth.
+        let add = SymExpr::var("x") + SymExpr::var("y");
+        assert!(add.exceeds_depth(0));
+        assert!(!add.exceeds_depth(1));
+
+        // A unary operation (negation) also adds one level of depth.
+        let neg = -SymExpr::var("x");
+        assert!(neg.exceeds_depth(0));
+        assert!(!neg.exceeds_depth(1));
+
+        // Nested expressions accumulate depth from the deepest branch.
+        let nested = (SymExpr::var("x") + SymExpr::var("y")) + SymExpr::var("z");
+        assert!(nested.exceeds_depth(1));
+        assert!(!nested.exceeds_depth(2));
     }
 
     #[test]
@@ -1139,6 +1222,13 @@ mod tests {
         // (x * (y + z)) / x => y + z
         let expr = (x.clone() * (y.clone() + z.clone())) / x.clone();
         assert_eq!(expr.simplify(), y.clone() + z.clone());
+
+        // (768 * x) / 256 => x * 3
+        let c1 = SymExpr::from(768);
+        let c2 = SymExpr::from(256);
+        let three = SymExpr::from(3);
+        let expr = (c1 * x.clone()) / c2;
+        assert_eq!(expr.simplify(), three * x.clone());
     }
 
     #[test]
@@ -1284,6 +1374,19 @@ mod tests {
     fn test_simplify_neg() {
         let minus_one = -SymExpr::from(1);
         assert_eq!(minus_one.simplify(), SymExpr::from(-1));
+
+        // -(-x) => x
+        let x = SymExpr::pos_var("x");
+        assert_eq!((-(-x.clone())).simplify(), x);
+
+        // -(-5) => 5
+        assert_eq!((-(-SymExpr::from(5))).simplify(), SymExpr::from(5));
+
+        // (x + 3) - 3 => x
+        assert_eq!(
+            ((x.clone() + SymExpr::from(3)) - SymExpr::from(3)).simplify(),
+            x
+        );
     }
 
     #[test]

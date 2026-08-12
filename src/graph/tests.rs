@@ -2,9 +2,11 @@ use std::error::Error;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rten_base::bit_set::BitSet;
 use rten_tensor::prelude::*;
 use rten_tensor::test_util::{expect_equal, expect_equal_with_tolerance};
 use rten_tensor::{Tensor, TensorView};
+use rten_testing::TestCases;
 
 use smallvec::{SmallVec, smallvec};
 
@@ -12,9 +14,10 @@ use super::{CachedPlan, CaptureEnv, PlanOptions};
 use crate::graph::{
     Dimension, Graph, Node, NodeId, RunError, RunErrorKind, RunOptions, TypedConstant,
 };
+use crate::infer_shapes::InferShapes;
 use crate::operator::{
-    IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputTypeList, OutputTypesContext,
-    PrepackedInput, SubgraphOperator,
+    InPlaceInputs, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputMask,
+    OutputTypeList, OutputTypesContext, PrepackedInput, SubgraphOperator,
 };
 use crate::ops::{Add, Concat, Conv, Identity, If, MatMul, Mul, Relu, Shape};
 use crate::timing::Profiler;
@@ -55,16 +58,24 @@ impl<Op: Operator> Operator for TrackUsage<Op> {
         self.inner.name()
     }
 
-    fn can_run_in_place(&self) -> bool {
-        self.inner.can_run_in_place()
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        self.inner.in_place_inputs()
     }
 
     fn is_commutative(&self) -> bool {
         self.inner.is_commutative()
     }
 
+    fn is_associative(&self) -> bool {
+        self.inner.is_associative()
+    }
+
     fn max_inputs(&self) -> Option<usize> {
         self.inner.max_inputs()
+    }
+
+    fn max_outputs(&self) -> Option<usize> {
+        self.inner.max_outputs()
     }
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
@@ -79,37 +90,43 @@ impl<Op: Operator> Operator for TrackUsage<Op> {
         self.inner.run(ctx)
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
         {
             let mut m = self.metrics.lock().unwrap();
             m.run_in_place_count += 1;
         }
-        self.inner.run_in_place(input, ctx)
+        self.inner.run_in_place(in_place, ctx)
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        self.inner.as_infer_shapes()
     }
 }
 
 /// Operator that wraps a function.
 ///
 /// Useful for tests that want to inspect operator inputs.
-struct RunFn<V: Into<Value>, F: Fn(&OpRunContext) -> Result<V, OpError> + 'static> {
+struct RunFn<F: Fn(&OpRunContext) -> Result<OutputList, OpError> + 'static> {
     run: F,
 }
 
-impl<V: Into<Value>, F: Fn(&OpRunContext) -> Result<V, OpError>> RunFn<V, F> {
+impl<F: Fn(&OpRunContext) -> Result<OutputList, OpError>> RunFn<F> {
     fn new(run: F) -> Self {
         Self { run }
     }
 }
 
-impl<V: Into<Value>, F: Fn(&OpRunContext) -> Result<V, OpError>> std::fmt::Debug for RunFn<V, F> {
+impl<F: Fn(&OpRunContext) -> Result<OutputList, OpError>> std::fmt::Debug for RunFn<F> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(fmt, "RunFn")
     }
 }
 
-impl<V: Into<Value> + 'static, F: Fn(&OpRunContext) -> Result<V, OpError>> Operator
-    for RunFn<V, F>
-{
+impl<F: Fn(&OpRunContext) -> Result<OutputList, OpError>> Operator for RunFn<F> {
     fn name(&self) -> &str {
         "RunFn"
     }
@@ -118,12 +135,20 @@ impl<V: Into<Value> + 'static, F: Fn(&OpRunContext) -> Result<V, OpError>> Opera
         None
     }
 
+    fn max_outputs(&self) -> Option<usize> {
+        None
+    }
+
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         None
     }
 
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
-        (self.run)(ctx).map(|v| [v.into()].into())
+        (self.run)(ctx).map(|v| v.into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        None
     }
 }
 
@@ -181,6 +206,31 @@ fn test_graph_run() -> Result<(), Box<dyn Error>> {
     )?;
 
     Ok(())
+}
+
+#[test]
+fn test_op_node_trailing_unused_outputs() {
+    let mut g = Graph::new();
+
+    let input_id = g.add_value(Some("input"), None, None);
+    let relu_out_id = g.add_value(Some("relu_out"), None, None);
+
+    g.add_op(
+        Some("relu"),
+        Arc::new(Relu {}),
+        &[Some(input_id)],
+        // Add operator with unused output IDs. When checking actual vs
+        // expected outputs at runtime, these should be ignored.
+        &[Some(relu_out_id), None, None],
+    );
+
+    g.run(
+        vec![(input_id, Tensor::from(1.).into())],
+        &[relu_out_id],
+        None,
+        None,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -265,6 +315,97 @@ fn test_graph_node_shapes() {
 }
 
 #[test]
+fn test_graph_run_invalid_input() {
+    #[derive(Debug)]
+    struct Case {
+        expected_shape: Option<Vec<Dimension>>,
+        expected_dtype: Option<ValueType>,
+        input: Value,
+        expected_error: Option<&'static str>,
+    }
+
+    let cases = [
+        // Input matches expected shape and dtype.
+        Case {
+            expected_shape: Some(vec![
+                Dimension::Symbolic("N".to_string()),
+                Dimension::Fixed(2),
+            ]),
+            expected_dtype: Some(ValueType::Tensor(DataType::Float)),
+            input: Tensor::<f32>::zeros(&[3, 2]).into(),
+            expected_error: None,
+        },
+        // Input node has no shape or dtype metadata.
+        Case {
+            expected_shape: None,
+            expected_dtype: None,
+            input: Tensor::<f32>::zeros(&[3]).into(),
+            expected_error: None,
+        },
+        // Wrong dtype.
+        Case {
+            expected_shape: None,
+            expected_dtype: Some(ValueType::Tensor(DataType::Float)),
+            input: Tensor::<i32>::zeros(&[3, 2]).into(),
+            expected_error: Some(
+                "input \"input\" is invalid: expected type tensor(f32) but got tensor(i32)",
+            ),
+        },
+        // Wrong rank.
+        Case {
+            expected_shape: Some(vec![
+                Dimension::Symbolic("N".to_string()),
+                Dimension::Fixed(2),
+            ]),
+            expected_dtype: None,
+            input: Tensor::<f32>::zeros(&[3]).into(),
+            expected_error: Some(
+                "input \"input\" is invalid: expected tensor with 2 dims but got 1",
+            ),
+        },
+        // Wrong size for fixed dimension.
+        Case {
+            expected_shape: Some(vec![
+                Dimension::Symbolic("N".to_string()),
+                Dimension::Fixed(2),
+            ]),
+            expected_dtype: None,
+            input: Tensor::<f32>::zeros(&[3, 4]).into(),
+            expected_error: Some(
+                "input \"input\" is invalid: expected dim 1 to have size 2 but got 4",
+            ),
+        },
+    ];
+
+    cases.test_each(|case| {
+        let mut g = Graph::new();
+        let input_id = g.add_value(
+            Some("input"),
+            case.expected_shape.clone(),
+            case.expected_dtype,
+        );
+        let (_, op_out) = g.add_simple_op("relu", Relu {}, &[input_id]);
+
+        let result = g.run(
+            vec![(input_id, case.input.as_view().into())],
+            &[op_out],
+            None,
+            None,
+        );
+
+        match (&result, case.expected_error) {
+            (Ok(_), None) => {}
+            (Err(err), Some(expected_error)) => {
+                assert_eq!(err.kind(), RunErrorKind::InvalidInput);
+                assert_eq!(err.to_string(), expected_error);
+            }
+            (Ok(_), Some(_)) => panic!("expected run to fail"),
+            (Err(err), None) => panic!("expected run to succeed but got error: {}", err),
+        }
+    })
+}
+
+#[test]
 fn test_graph_value_dtype() {
     let mut g = Graph::new();
     for dtype in [
@@ -298,6 +439,10 @@ impl Operator for AddOne {
         let input: TensorView<f32> = ctx.inputs().require_as(0)?;
         let output_data: Vec<f32> = input.iter().map(|x| x + 1.0).collect();
         Tensor::<f32>::from_data(input.shape().into(), output_data).into_op_result()
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        None
     }
 }
 
@@ -576,6 +721,25 @@ fn test_no_source_for_output() {
 }
 
 #[test]
+fn test_graph_input_as_output() -> Result<(), Box<dyn Error>> {
+    // Graph with a value that is both an input and an output.
+    let mut g = Graph::new();
+    let val = g.add_value(Some("x"), None, None);
+
+    // A partial run with no inputs, as used for constant propagation, should
+    // succeed and produce no values for the pass-through output.
+    let partial_outs = g.partial_run(vec![], &[val], None)?;
+    assert_eq!(partial_outs.len(), 0);
+
+    // A full run providing the input should pass the value through.
+    let input = Tensor::from([1., 2.]);
+    let result = g.run(vec![(val, input.view().into())], &[val], None, None)?;
+    assert_eq!(result, [Value::FloatTensor(input)]);
+
+    Ok(())
+}
+
+#[test]
 fn test_invalid_input_id() {
     let mut g = Graph::new();
 
@@ -719,8 +883,8 @@ impl Operator for AddOneInPlace {
         None
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
@@ -731,12 +895,20 @@ impl Operator for AddOneInPlace {
         input.to_tensor().into_op_result()
     }
 
-    fn run_in_place(&self, input: Value, _ctx: &OpRunContext) -> Result<Value, OpError> {
-        let mut output = input.into_tensor::<f32>().unwrap();
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        _ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let mut output = in_place.into_single().into_tensor::<f32>().unwrap();
         for x in output.iter_mut() {
             *x = *x + 1.0;
         }
-        Ok(output.into())
+        output.into_op_result()
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        None
     }
 }
 
@@ -849,6 +1021,221 @@ fn test_runs_commutative_op_in_place() {
     assert_eq!(op2_metrics.run_in_place_count, 1);
 }
 
+/// Operator that runs in-place on its second input.
+#[derive(Debug)]
+struct InPlaceSecondInput {}
+
+impl Operator for InPlaceSecondInput {
+    fn name(&self) -> &str {
+        "InPlaceSecondInput"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        None
+    }
+
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([1])
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let second: TensorView<f32> = ctx.inputs().require_as(1)?;
+        second.to_tensor().into_op_result()
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        _ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let mut output = in_place.into_single().into_tensor::<f32>().unwrap();
+        for x in output.iter_mut() {
+            *x += 1.0;
+        }
+        output.into_op_result()
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        None
+    }
+}
+
+#[test]
+fn test_runs_non_commutative_op_in_place_with_non_first_input() {
+    let mut g = Graph::new();
+    let first_id = g.add_value(Some("first"), None, None);
+    let second_id = g.add_value(Some("second"), None, None);
+
+    let (_, second_temp) = g.add_simple_op("identity", Identity {}, &[second_id]);
+    let op = TrackUsage::new(InPlaceSecondInput {});
+    let op_metrics = op.metrics();
+    let (_, op_out) = g.add_simple_op("op", op, &[first_id, second_temp]);
+
+    let first = Tensor::from([1.0f32, 2.0, 3.0]);
+    let second = Tensor::from([10.0f32, 20.0, 30.0]);
+    let results = g
+        .run(
+            vec![
+                (first_id, first.view().into()),
+                (second_id, second.view().into()),
+            ],
+            &[op_out],
+            None,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        results[0]
+            .as_tensor_view::<f32>()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        &[11., 21., 31.]
+    );
+
+    let op_metrics = op_metrics.lock().unwrap();
+    assert_eq!(op_metrics.run_count, 0);
+    assert_eq!(op_metrics.run_in_place_count, 1);
+}
+
+/// Test operator that can modify both of its inputs in-place.
+#[derive(Debug)]
+struct AddTwoInPlace {}
+impl Operator for AddTwoInPlace {
+    fn name(&self) -> &str {
+        "AddTwoInPlace"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        None
+    }
+
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0, 1])
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let first: TensorView<f32> = ctx.inputs().require_as(0)?;
+        first.to_tensor().into_op_result()
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        _ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let mut inputs: Vec<(usize, Tensor<f32>)> = in_place
+            .into_iter()
+            .map(|(index, value)| (index, value.into_tensor::<f32>().unwrap()))
+            .collect();
+        inputs.sort_by_key(|(index, _)| *index);
+        let (_, mut a) = inputs.remove(0);
+        let (_, b) = inputs.remove(0);
+        for (x, y) in a.iter_mut().zip(b.iter()) {
+            *x += *y;
+        }
+        a.into_op_result()
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        None
+    }
+}
+
+// Test that an operator with multiple in-place inputs runs in-place only when
+// all of those inputs are available to take as owned values.
+#[test]
+fn test_runs_op_in_place_with_multiple_inputs() {
+    let first = Tensor::from([1.0f32, 2.0, 3.0]);
+    let second = Tensor::from([10.0f32, 20.0, 30.0]);
+
+    // Both inputs are owned temporaries, so the operator runs in-place.
+    {
+        let mut g = Graph::new();
+        let first_id = g.add_value(Some("first"), None, None);
+        let second_id = g.add_value(Some("second"), None, None);
+        let (_, first_temp) = g.add_simple_op("id1", Identity {}, &[first_id]);
+        let (_, second_temp) = g.add_simple_op("id2", Identity {}, &[second_id]);
+
+        let op = TrackUsage::new(AddTwoInPlace {});
+        let op_metrics = op.metrics();
+        let (_, op_out) = g.add_simple_op("op", op, &[first_temp, second_temp]);
+
+        let results = g
+            .run(
+                vec![
+                    (first_id, first.view().into()),
+                    (second_id, second.view().into()),
+                ],
+                &[op_out],
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            results[0]
+                .as_tensor_view::<f32>()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            &[11., 22., 33.]
+        );
+
+        let op_metrics = op_metrics.lock().unwrap();
+        assert_eq!(op_metrics.run_count, 0);
+        assert_eq!(op_metrics.run_in_place_count, 1);
+    }
+
+    // The first input is a graph input passed by view, so it cannot be taken.
+    // With the all-or-nothing approach the operator does not run in-place.
+    {
+        let mut g = Graph::new();
+        let first_id = g.add_value(Some("first"), None, None);
+        let second_id = g.add_value(Some("second"), None, None);
+        let (_, second_temp) = g.add_simple_op("id2", Identity {}, &[second_id]);
+
+        let op = TrackUsage::new(AddTwoInPlace {});
+        let op_metrics = op.metrics();
+        let (_, op_out) = g.add_simple_op("op", op, &[first_id, second_temp]);
+
+        let results = g
+            .run(
+                vec![
+                    (first_id, first.view().into()),
+                    (second_id, second.view().into()),
+                ],
+                &[op_out],
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            results[0]
+                .as_tensor_view::<f32>()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            &[1., 2., 3.]
+        );
+
+        let op_metrics = op_metrics.lock().unwrap();
+        assert_eq!(op_metrics.run_count, 1);
+        assert_eq!(op_metrics.run_in_place_count, 0);
+    }
+}
+
 /// Test operator that produces multiple outputs
 #[derive(Debug)]
 struct Split {
@@ -872,6 +1259,10 @@ impl Operator for Split {
         Some(1)
     }
 
+    fn max_outputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         None
     }
@@ -887,6 +1278,10 @@ impl Operator for Split {
         let left_split = Tensor::from_vec(input.iter().take(left_split_len).copied().collect());
         let right_split = Tensor::from_vec(input.iter().skip(left_split_len).copied().collect());
         Ok(smallvec![left_split.into(), right_split.into()])
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        None
     }
 }
 
@@ -1076,6 +1471,10 @@ impl Operator for Counter {
         let count = self.count.fetch_add(1, Ordering::SeqCst);
         Ok([Tensor::from(count).into()].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        None
+    }
 }
 
 #[test]
@@ -1154,18 +1553,26 @@ impl Operator for Subgraph {
         None
     }
 
+    fn max_outputs(&self) -> Option<usize> {
+        None
+    }
+
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         None
     }
 
     fn run(&self, _ctx: &OpRunContext) -> Result<OutputList, OpError> {
-        Err(OpError::InvalidValue(
+        Err(OpError::invalid_value(
             "operator must be run with `run_subgraph`",
         ))
     }
 
     fn as_subgraph_op(&self) -> Option<&dyn SubgraphOperator> {
         Some(self as &dyn SubgraphOperator)
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        None
     }
 }
 
@@ -1534,6 +1941,10 @@ impl Operator for MatMulExpectPacked {
         assert!(prepacked.is_some());
         self.inner.run(ctx)
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        self.inner.as_infer_shapes()
+    }
 }
 
 #[test]
@@ -1589,20 +2000,100 @@ fn test_prepack_weights() {
 }
 
 #[test]
-fn test_run_context_num_outputs() {
+fn test_run_context_outputs() {
     let mut g = Graph::new();
     let input_id = g.add_value(Some("input"), None, None);
-    let (_, op_out) = g.add_simple_op(
-        "test_op",
-        RunFn::new(|ctx| {
-            assert_eq!(ctx.num_outputs(), Some(1));
-            Ok(Tensor::from_scalar(0.))
-        }),
-        &[input_id],
+    let out_0 = g.add_value(Some("out_0"), None, None);
+    let out_1 = g.add_value(Some("out_1"), None, None);
+    g.add_op(
+        Some("test_op"),
+        Arc::new(RunFn::new(|ctx| {
+            assert_eq!(
+                ctx.outputs(),
+                OutputMask::new(BitSet::from_indices([0, 3]), 4)
+            );
+            Ok([
+                // Expected output.
+                Tensor::from(1.).into(),
+                // Dummy values for unused outputs. This should use `None`,
+                // but `OutputList` can't represent non-present values yet.
+                Tensor::from(0.).into(),
+                Tensor::from(0.).into(),
+                // Expected output.
+                Tensor::from(2.).into(),
+            ]
+            .into_iter()
+            .collect())
+        })),
+        &[Some(input_id)],
+        // Operator has 4 outputs, only two are used.
+        &[Some(out_0), None, None, Some(out_1)],
     );
     let input = Tensor::from([1, 2, 3]);
-    g.run(vec![(input_id, input.into())], &[op_out], None, None)
+    g.run(vec![(input_id, input.into())], &[out_0, out_1], None, None)
         .unwrap();
+}
+
+#[test]
+fn test_clear_operator_output() {
+    let mut g = Graph::new();
+    let input_id = g.add_value(Some("input"), None, None);
+    let out_0 = g.add_value(Some("out_0"), None, None);
+    let out_1 = g.add_value(Some("out_1"), None, None);
+    let op_id = g.add_op(
+        Some("test_op"),
+        Arc::new(RunFn::new(|ctx| {
+            assert_eq!(ctx.outputs(), OutputMask::new(BitSet::from_indices([0]), 2));
+
+            // Values only have to be returned for outputs which are used.
+            Ok([Tensor::from(1.).into()].into_iter().collect())
+        })),
+        &[Some(input_id)],
+        &[Some(out_0), Some(out_1)],
+    );
+
+    assert_eq!(g.clear_operator_output(op_id, 1), Some(out_1));
+    assert_eq!(g.clear_operator_output(op_id, 1), None);
+
+    let (_, op) = g.get_source_node(out_0).unwrap();
+    assert_eq!(op.output_ids(), [Some(out_0), None]);
+    assert!(g.get_source_node(out_1).is_none());
+
+    let input = Tensor::from([1, 2, 3]);
+    g.run(vec![(input_id, input.into())], &[out_0], None, None)
+        .unwrap();
+}
+
+#[test]
+fn test_operator_with_many_outputs() {
+    // Operators can have more outputs than the mask tracks individually. All
+    // outputs beyond the first 32 are treated as used.
+    let n_outputs = 65;
+
+    let mut g = Graph::new();
+    let input_id = g.add_value(Some("input"), None, None);
+    let output_ids: Vec<_> = (0..n_outputs)
+        .map(|i| Some(g.add_value(Some(&format!("out_{}", i)), None, None)))
+        .collect();
+    g.add_op(
+        Some("test_op"),
+        Arc::new(RunFn::new(move |ctx| {
+            assert_eq!(ctx.outputs(), OutputMask::all_used(n_outputs));
+            Ok((0..n_outputs)
+                .map(|i| Tensor::from(i as i32).into())
+                .collect())
+        })),
+        &[Some(input_id)],
+        &output_ids,
+    );
+
+    let input = Tensor::from([1, 2, 3]);
+    let last_out = output_ids.last().copied().flatten().unwrap();
+    let mut results = g
+        .run(vec![(input_id, input.into())], &[last_out], None, None)
+        .unwrap();
+    let result: Tensor<i32> = results.remove(0).try_into().unwrap();
+    assert_eq!(result, Tensor::from(n_outputs as i32 - 1));
 }
 
 #[test]
@@ -1613,7 +2104,7 @@ fn test_run_context_name() {
         "test_op",
         RunFn::new(|ctx| {
             assert_eq!(ctx.name(), Some("test_op"));
-            Ok(Tensor::from_scalar(0.))
+            Ok([Tensor::from_scalar(0.).into()].into_iter().collect())
         }),
         &[input_id],
     );

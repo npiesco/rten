@@ -2,6 +2,7 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
+use rten_base::bit_set::BitSet;
 use rten_simd::SimdOp;
 use rten_tensor::prelude::*;
 use rten_tensor::{NdTensorView, Tensor, TensorView};
@@ -10,12 +11,10 @@ use rten_vecmath as vecmath;
 use crate::buffer_pool::BufferPool;
 use crate::infer_shapes::{InferShapes, UnaryOp};
 use crate::operator::{
-    IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
-    OutputTypesContext,
+    InPlaceInputs, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
+    OutputTypeList, OutputTypesContext, check_eq,
 };
 use crate::ops::resolve_axis;
-use crate::slice_reductions::slice_max;
-use crate::value::Value;
 
 /// Specifies how to normalize the mean and variance.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -201,8 +200,14 @@ pub fn batch_norm_in_place(
     epsilon: f32,
 ) -> Result<(), OpError> {
     if input.ndim() < 1 {
-        return Err(OpError::InvalidValue("Input must have at least 1 dim"));
+        return Err(OpError::invalid_value("Input must have at least 1 dim"));
     }
+
+    let channels = if input.ndim() >= 2 { input.size(1) } else { 1 };
+    check_eq!(scale.size(0), channels)?;
+    check_eq!(bias.size(0), channels)?;
+    check_eq!(mean.size(0), channels)?;
+    check_eq!(var.size(0), channels)?;
 
     normalize_each_channel(input, |chan| NormalizeOptions {
         mean_normalize: MeanNormalize::Static {
@@ -240,12 +245,30 @@ pub struct BatchNormalization {
     pub epsilon: f32,
 }
 
+impl BatchNormalization {
+    fn check_outputs(&self, ctx: &OpRunContext) -> Result<(), OpError> {
+        let outputs = ctx.outputs();
+        outputs.check_unsupported(1, "running_mean")?;
+        outputs.check_unsupported(2, "running_var")?;
+        outputs.check_unsupported(3, "saved_mean")?;
+        outputs.check_unsupported(4, "saved_var")?;
+        Ok(())
+    }
+}
+
 impl Operator for BatchNormalization {
     fn name(&self) -> &str {
         "BatchNormalization"
     }
 
     fn max_inputs(&self) -> Option<usize> {
+        Some(5)
+    }
+
+    fn max_outputs(&self) -> Option<usize> {
+        // Outputs are Y, running_mean, running_var, saved_mean, saved_var.
+        // The last 4 are for training mode, which is unsupported. `saved_mean`
+        // and `saved_var` were removed in opset 14.
         Some(5)
     }
 
@@ -257,24 +280,32 @@ impl Operator for BatchNormalization {
         let mean = inputs.require_as(3)?;
         let var = inputs.require_as(4)?;
 
+        self.check_outputs(ctx)?;
+
         batch_norm(ctx.pool(), input, &scale, &bias, &mean, &var, self.epsilon).into_op_result()
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
         let inputs = ctx.inputs();
-        let mut output: Tensor = input.try_into()?;
-        let scale = inputs.require_as(0)?;
-        let bias = inputs.require_as(1)?;
-        let mean = inputs.require_as(2)?;
-        let var = inputs.require_as(3)?;
+        let mut output: Tensor = in_place.into_single().try_into()?;
+        let scale = inputs.require_as(1)?;
+        let bias = inputs.require_as(2)?;
+        let mean = inputs.require_as(3)?;
+        let var = inputs.require_as(4)?;
+
+        self.check_outputs(ctx)?;
 
         batch_norm_in_place(&mut output, &scale, &bias, &mean, &var, self.epsilon)?;
 
-        Ok(output.into())
+        output.into_op_result()
     }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
@@ -305,20 +336,20 @@ pub fn instance_normalization_in_place(
     epsilon: Option<f32>,
 ) -> Result<(), OpError> {
     let &[_batch, chans, ..] = input.shape() else {
-        return Err(OpError::InvalidValue("expected input with >= 2 dims"));
+        return Err(OpError::invalid_value("expected input with >= 2 dims"));
     };
 
     // If epsilon is None, use default from ONNX spec.
     let epsilon = epsilon.unwrap_or(1e-5);
 
     if scale.size(0) != chans {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "scale length should match channel count",
         ));
     }
 
     if bias.size(0) != chans {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "bias length should match channel count",
         ));
     }
@@ -357,19 +388,23 @@ impl Operator for InstanceNormalization {
         instance_normalization(ctx.pool(), input, scale, bias, self.epsilon).into_op_result()
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
-        let mut output: Tensor = input.try_into()?;
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let mut output: Tensor = in_place.into_single().try_into()?;
         let inputs = ctx.inputs();
-        let scale = inputs.require_as(0)?;
-        let bias = inputs.require_as(1)?;
+        let scale = inputs.require_as(1)?;
+        let bias = inputs.require_as(2)?;
 
         instance_normalization_in_place(&mut output, scale, bias, self.epsilon)?;
 
-        Ok(output.into())
+        output.into_op_result()
     }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
@@ -431,40 +466,40 @@ fn layer_normalization_impl(
     let resolved_axis = resolve_axis(input.ndim(), axis)?;
     let normalized_slice_shape = &input.shape()[resolved_axis..];
 
-    if !scale.can_broadcast_to(input.shape()) {
-        return Err(OpError::IncompatibleInputShapes(
-            "`scale` cannot be broadcast to input shape",
-        ));
-    }
-    if scale.shape() != normalized_slice_shape {
-        return Err(OpError::UnsupportedValue(
-            "`scale` shape does not match normalized axes of input",
-        ));
-    }
+    let scale_elements;
+    let (scale_scalar, scale_data) = if let Some(value) = scale.item() {
+        (*value, None)
+    } else {
+        scale_elements = scale
+            .try_broadcast(normalized_slice_shape)
+            .map_err(|_| {
+                OpError::invalid_value("`scale` is not broadcastable to normalized axes of input")
+            })?
+            .to_contiguous_in(pool);
+        (1.0, Some(scale_elements.data()))
+    };
 
-    if let Some(bias) = bias.as_ref() {
-        if !bias.can_broadcast_to(input.shape()) {
-            return Err(OpError::IncompatibleInputShapes(
-                "`bias` cannot be broadcast to input shape",
-            ));
+    let bias_elements;
+    let (bias_scalar, bias_data) = match bias {
+        None => (0.0, None),
+        Some(bias) if bias.item().is_some() => (*bias.item().unwrap(), None),
+        Some(bias) => {
+            bias_elements = bias
+                .try_broadcast(normalized_slice_shape)
+                .map_err(|_| {
+                    OpError::invalid_value(
+                        "`bias` is not broadcastable to normalized axes of input",
+                    )
+                })?
+                .to_contiguous_in(pool);
+            (0.0, Some(bias_elements.data()))
         }
-        if bias.shape() != normalized_slice_shape {
-            return Err(OpError::UnsupportedValue(
-                "`bias` shape does not match normalized axes of input",
-            ));
-        }
-    }
+    };
 
     let input = input.to_contiguous_in(pool);
 
     let mut output = pool.alloc(input.len());
-    let chunk_size = input.shape()[resolved_axis..].iter().product();
-
-    let bias = bias.map(|b| b.to_contiguous_in(pool));
-    let bias_data = bias.as_ref().map(|b| b.data());
-
-    let scale = scale.to_contiguous_in(pool);
-    let scale_data = scale.data();
+    let chunk_size = normalized_slice_shape.iter().product();
 
     let n_init = AtomicUsize::new(0);
     let out_uninit = &mut output.spare_capacity_mut()[..input.len()];
@@ -478,9 +513,10 @@ fn layer_normalization_impl(
                 NormalizeOptions {
                     mean_normalize,
                     epsilon,
-                    element_scale: Some(scale_data),
+                    scale: scale_scalar,
+                    bias: bias_scalar,
+                    element_scale: scale_data,
                     element_bias: bias_data,
-                    ..Default::default()
                 },
             );
             n_init.fetch_add(normalized.len(), Ordering::SeqCst);
@@ -509,7 +545,17 @@ impl Operator for LayerNormalization {
         Some(3)
     }
 
+    fn max_outputs(&self) -> Option<usize> {
+        // Outputs are Y, Mean and InvStdDev. The last 2 are for training mode,
+        // which is unsupported.
+        Some(3)
+    }
+
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let outputs = ctx.outputs();
+        outputs.check_unsupported(1, "Mean")?;
+        outputs.check_unsupported(2, "InvStdDev")?;
+
         let inputs = ctx.inputs();
         let input = inputs.require_as(0)?;
         let scale = inputs.require_as(1)?;
@@ -567,18 +613,103 @@ impl Operator for RMSNormalization {
     }
 }
 
+/// Normalize lanes of `input` along `axis` by their L1 or L2 norm.
+pub fn lp_normalization(
+    pool: &BufferPool,
+    input: TensorView,
+    axis: isize,
+    p: u32,
+) -> Result<Tensor, OpError> {
+    let mut output = input.to_tensor_in(pool);
+    lp_normalization_in_place(&mut output, axis, p)?;
+    Ok(output)
+}
+
+pub fn lp_normalization_in_place(output: &mut Tensor, axis: isize, p: u32) -> Result<(), OpError> {
+    fn scale_by_norm(lane: &mut [f32], norm: f32) {
+        // ONNX specifies a zero output, rather than NaN, for zero norms.
+        if norm == 0. {
+            lane.fill(0.);
+            return;
+        }
+        let norm_recip = norm.recip();
+        for x in lane {
+            *x *= norm_recip;
+        }
+    }
+
+    let normalize: fn(&mut [f32]) = match p {
+        1 => |lane: &mut [f32]| {
+            let norm = vecmath::SumAbs::new(lane).dispatch();
+            scale_by_norm(lane, norm);
+        },
+        2 => |lane: &mut [f32]| {
+            let norm = vecmath::SumSquare::new(lane).dispatch().sqrt();
+            scale_by_norm(lane, norm);
+        },
+        _ => {
+            return Err(OpError::unsupported_value("`p` must be 1 or 2"));
+        }
+    };
+
+    normalize_lanes(output, axis, normalize)
+}
+
+#[derive(Debug)]
+pub struct LpNormalization {
+    pub axis: isize,
+    pub p: u32,
+}
+
+impl Operator for LpNormalization {
+    fn name(&self) -> &str {
+        "LpNormalization"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let input = ctx.inputs().require_as(0)?;
+        lp_normalization(ctx.pool(), input, self.axis, self.p).into_op_result()
+    }
+
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        _ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let mut output: Tensor = in_place.into_single().try_into()?;
+        lp_normalization_in_place(&mut output, self.axis, self.p)?;
+        output.into_op_result()
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(&UnaryOp)
+    }
+}
+
 pub fn log_softmax(pool: &BufferPool, input: TensorView, axis: isize) -> Result<Tensor, OpError> {
     let mut output = input.to_tensor_in(pool);
     log_softmax_in_place(&mut output, axis)?;
     Ok(output)
 }
 
-/// Grain size for parallelizing softmax.
-const SOFTMAX_GRAIN_SIZE: usize = 1024;
+/// Grain size for parallelizing [`normalize_lanes`].
+const NORMALIZE_GRAIN_SIZE: usize = 1024;
 
 /// Apply an operation `op` to all 1D lanes of the tensor along a given axis.
-fn softmax_lanes<F: Fn(&mut [f32]) + Send + Sync>(
-    output: &mut Tensor,
+fn normalize_lanes<T: Clone + Send, F: Fn(&mut [T]) + Send + Sync>(
+    output: &mut Tensor<T>,
     axis: isize,
     apply_op: F,
 ) -> Result<(), OpError> {
@@ -591,8 +722,8 @@ fn softmax_lanes<F: Fn(&mut [f32]) + Send + Sync>(
     // allows the `apply_op` function to use optimized code that works with
     // contiguous slices.
     //
-    // In the common case where softmax is applied over the last dimension of
-    // an already-contiguous tensor, the data is already laid out in the
+    // In the common case where normalization is applied over the last dimension
+    // of an already-contiguous tensor, the data is already laid out in the
     // ideal order.
     if resolved_axis != output.ndim() - 1 {
         output.move_axis(resolved_axis, output.ndim() - 1);
@@ -605,7 +736,7 @@ fn softmax_lanes<F: Fn(&mut [f32]) + Send + Sync>(
         output.size(output.ndim() - 1)
     };
 
-    let grain_size = SOFTMAX_GRAIN_SIZE.max(lane_size);
+    let grain_size = NORMALIZE_GRAIN_SIZE.max(lane_size);
     let n_grains = output.len().div_ceil(grain_size);
 
     let out_data = output.data_mut().unwrap();
@@ -630,29 +761,8 @@ fn softmax_lanes<F: Fn(&mut [f32]) + Send + Sync>(
 }
 
 pub fn log_softmax_in_place(output: &mut Tensor, axis: isize) -> Result<(), OpError> {
-    softmax_lanes(output, axis, |lane| {
-        // This operator computes:
-        //
-        //   log(exp(xi) / sum(exp(x)))
-        //
-        // Improve numerical stability by first subtracting max value, as we do
-        // for the softmax op:
-        //
-        //   log(exp(xi - xmax) / sum(exp(x - xmax)))
-        //
-        // Then using log identities to simplify:
-        //
-        //   = log(exp(xi - xmax)) - log(sum(exp(x - xmax)))
-        //   = xi - xmax - log(sum(exp(x - xmax)))
-
-        let max_val = slice_max(lane);
-        let log_exp_sum = lane
-            .iter()
-            .fold(0., |exp_sum, x| exp_sum + (x - max_val).exp())
-            .ln();
-        for el in lane.iter_mut() {
-            *el = (*el - max_val) - log_exp_sum
-        }
+    normalize_lanes(output, axis, |lane| {
+        vecmath::LogSoftmax::new_mut(lane).dispatch();
     })
 }
 
@@ -675,14 +785,18 @@ impl Operator for LogSoftmax {
         log_softmax(ctx.pool(), input, self.axis).into_op_result()
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, _ctx: &OpRunContext) -> Result<Value, OpError> {
-        let mut output: Tensor = input.try_into()?;
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        _ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let mut output: Tensor = in_place.into_single().try_into()?;
         log_softmax_in_place(&mut output, self.axis)?;
-        Ok(output.into())
+        output.into_op_result()
     }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
@@ -723,7 +837,7 @@ pub fn softmax_in_place(
         NanHandling::KeepNans => false,
         NanHandling::FlushToZero => true,
     };
-    softmax_lanes(output, axis, |lane| {
+    normalize_lanes(output, axis, |lane| {
         vecmath::Softmax::new_mut(lane)
             .flush_nans_to_zero(flush_nans)
             .dispatch();
@@ -767,14 +881,18 @@ impl Operator for Softmax {
         softmax(ctx.pool(), input, self.axis, self.nan_handling()).into_op_result()
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, _ctx: &OpRunContext) -> Result<Value, OpError> {
-        let mut output = input.try_into()?;
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        _ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let mut output = in_place.into_single().try_into()?;
         softmax_in_place(&mut output, self.axis, self.nan_handling())?;
-        Ok(output.into())
+        output.into_op_result()
     }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
@@ -786,6 +904,14 @@ impl Operator for Softmax {
     }
 }
 
+#[cfg(feature = "contrib")]
+pub use contrib::{
+    SimplifiedLayerNormalization, SkipLayerNormalization, SkipSimplifiedLayerNormalization,
+};
+
+#[cfg(feature = "contrib")]
+mod contrib;
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -796,12 +922,13 @@ mod tests {
     use rten_tensor::{NdTensor, NdTensorView, Tensor};
     use rten_testing::TestCases;
 
-    use super::SOFTMAX_GRAIN_SIZE;
+    use super::NORMALIZE_GRAIN_SIZE;
     use super::{
-        NanHandling, batch_norm, batch_norm_in_place, instance_normalization, layer_normalization,
-        log_softmax, rms_normalization, softmax,
+        LpNormalization, NanHandling, batch_norm, batch_norm_in_place, instance_normalization,
+        layer_normalization, log_softmax, lp_normalization, rms_normalization, softmax,
     };
     use crate::buffer_pool::BufferPool;
+    use crate::operator::{InputList, OperatorExt};
     use crate::ops::OpError;
     use crate::ops::tests::expect_eq_1e4;
 
@@ -848,13 +975,15 @@ mod tests {
                 input.map(|&x| (x - mean[0]) / (var[0] + epsilon).sqrt() * scale[0] + bias[0])
             };
 
+            let n_chans = if input.ndim() >= 2 { 2 } else { 1 };
+
             let result = batch_norm(
                 &pool,
                 input.view(),
-                &scale.into(),
-                &bias.into(),
-                &mean.into(),
-                &var.into(),
+                &scale[..n_chans].into(),
+                &bias[..n_chans].into(),
+                &mean[..n_chans].into(),
+                &var[..n_chans].into(),
                 epsilon,
             )
             .unwrap();
@@ -885,7 +1014,7 @@ mod tests {
 
         assert_eq!(
             result,
-            Err(OpError::InvalidValue("Input must have at least 1 dim"))
+            Err(OpError::invalid_value("Input must have at least 1 dim"))
         );
     }
 
@@ -1011,8 +1140,8 @@ mod tests {
                 scale: Tensor::full(&[2, 3], 1.0),
                 bias: None,
                 axis: -1,
-                expected: Err(OpError::UnsupportedValue(
-                    "`scale` shape does not match normalized axes of input",
+                expected: Err(OpError::invalid_value(
+                    "`scale` is not broadcastable to normalized axes of input",
                 )),
             },
             // Unsupported bias shape
@@ -1021,9 +1150,26 @@ mod tests {
                 scale: Tensor::from([1., 1., 1.]),
                 bias: Some(Tensor::full(&[2, 3], 1.0)),
                 axis: -1,
-                expected: Err(OpError::UnsupportedValue(
-                    "`bias` shape does not match normalized axes of input",
+                expected: Err(OpError::invalid_value(
+                    "`bias` is not broadcastable to normalized axes of input",
                 )),
+            },
+            // Scalar (broadcast) scale and bias. Per the ONNX spec `scale` and
+            // `bias` need only be broadcastable to the input.
+            Case {
+                input: Tensor::from([[0., 1., 2., 3.]]),
+                scale: Tensor::from_scalar(2.0),
+                bias: Some(Tensor::from_scalar(0.5)),
+                axis: -1,
+                expected: Ok(Tensor::from([[-2.1833, -0.3944, 1.3944, 3.1833]])),
+            },
+            // Scalar (broadcast) scale, no bias.
+            Case {
+                input: Tensor::from([[0., 1., 2., 3.]]),
+                scale: Tensor::from_scalar(2.0),
+                bias: None,
+                axis: -1,
+                expected: Ok(Tensor::from([[-2.6833, -0.8944, 0.8944, 2.6833]])),
             },
         ];
 
@@ -1079,6 +1225,46 @@ mod tests {
 
         let expected = reference_rms(input.nd_view(), scale.nd_view()).into_dyn();
         expect_eq_1e4(&result, &expected)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_lp_normalization() -> Result<(), Box<dyn Error>> {
+        let pool = BufferPool::new();
+        let input = Tensor::from([[3., 4.], [1., -1.]]);
+
+        // L2 normalization along the last axis.
+        let result = lp_normalization(&pool, input.view(), -1, 2).unwrap();
+        let norm_1 = 2f32.sqrt();
+        let expected = Tensor::from([[3. / 5., 4. / 5.], [1. / norm_1, -1. / norm_1]]);
+        expect_equal(&result, &expected)?;
+
+        // L1 normalization along axis 0.
+        let result = lp_normalization(&pool, input.view(), 0, 1).unwrap();
+        let expected = Tensor::from([[3. / 4., 4. / 5.], [1. / 4., -1. / 5.]]);
+        expect_equal(&result, &expected)?;
+
+        // Lanes with a zero norm are set to zero rather than NaN.
+        let zero_input = Tensor::from([[0., 0.], [3., 4.]]);
+        let result = lp_normalization(&pool, zero_input.view(), -1, 2).unwrap();
+        let expected = Tensor::from([[0., 0.], [3. / 5., 4. / 5.]]);
+        expect_equal(&result, &expected)?;
+
+        // Normalization applied in-place.
+        let op = LpNormalization { axis: -1, p: 2 };
+        let result: Tensor = op
+            .run_simple_in_place(input.clone(), InputList::new())
+            .unwrap();
+        let expected = Tensor::from([[3. / 5., 4. / 5.], [1. / norm_1, -1. / norm_1]]);
+        expect_equal(&result, &expected)?;
+
+        // Unsupported p value.
+        let result = lp_normalization(&pool, input.view(), 0, 3);
+        assert_eq!(
+            result.err(),
+            Some(OpError::unsupported_value("`p` must be 1 or 2"))
+        );
 
         Ok(())
     }
@@ -1208,7 +1394,7 @@ mod tests {
 
         // "Large" output, where output size exceeds the parallelism grain size.
         let mut rng = XorShiftRng::new(1234);
-        let input = Tensor::rand(&[4, SOFTMAX_GRAIN_SIZE / 2], &mut rng);
+        let input = Tensor::rand(&[4, NORMALIZE_GRAIN_SIZE / 2], &mut rng);
         let result = softmax(&pool, input.view(), 1, NanHandling::KeepNans).unwrap();
         check_result(result);
     }

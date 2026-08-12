@@ -11,19 +11,23 @@ use crate::model::external_data::DataLocation;
 pub enum AttrValue {
     Bool(bool),
     Float(f32),
+    Floats(Vec<f32>),
     Graph(onnx::GraphProto),
     Int(i64),
     Ints(Vec<i64>),
     String(String),
+    Strings(Vec<String>),
     Tensor(onnx::TensorProto),
 }
 
 enum_from!(AttrValue, Bool, bool);
 enum_from!(AttrValue, Float, f32);
+enum_from!(AttrValue, Floats, Vec<f32>);
 enum_from!(AttrValue, Graph, onnx::GraphProto);
 enum_from!(AttrValue, Int, i64);
 enum_from!(AttrValue, Ints, Vec<i64>);
 enum_from!(AttrValue, String, String);
+enum_from!(AttrValue, Strings, Vec<String>);
 enum_from!(AttrValue, Tensor, onnx::TensorProto);
 
 pub fn create_attr(name: &str, value: AttrValue) -> onnx::AttributeProto {
@@ -32,10 +36,12 @@ pub fn create_attr(name: &str, value: AttrValue) -> onnx::AttributeProto {
     match value {
         AttrValue::Bool(val) => attr.i = Some(val as i64),
         AttrValue::Float(val) => attr.f = Some(val),
+        AttrValue::Floats(val) => attr.floats = val,
         AttrValue::Graph(val) => attr.g = Some(val),
         AttrValue::Int(val) => attr.i = Some(val),
         AttrValue::Ints(val) => attr.ints = val,
         AttrValue::String(val) => attr.s = Some(val),
+        AttrValue::Strings(val) => attr.strings = val,
         AttrValue::Tensor(val) => attr.t = Some(val),
     }
     attr
@@ -96,6 +102,7 @@ pub trait NodeProtoExt {
     fn with_domain(self, domain: &str) -> Self;
     fn with_name(self, name: &str) -> Self;
     fn with_input(self, name: &str) -> Self;
+    fn with_output(self, name: &str) -> Self;
 }
 
 impl NodeProtoExt for onnx::NodeProto {
@@ -116,6 +123,11 @@ impl NodeProtoExt for onnx::NodeProto {
 
     fn with_input(mut self, name: &str) -> Self {
         self.input.push(name.to_string());
+        self
+    }
+
+    fn with_output(mut self, name: &str) -> Self {
+        self.output.push(name.to_string());
         self
     }
 }

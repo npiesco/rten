@@ -1,30 +1,31 @@
 use std::arch::wasm32::{
-    f32x4_abs, f32x4_add, f32x4_convert_i32x4, f32x4_div, f32x4_eq, f32x4_extract_lane, f32x4_ge,
-    f32x4_gt, f32x4_le, f32x4_lt, f32x4_max, f32x4_min, f32x4_mul, f32x4_nearest, f32x4_neg,
-    f32x4_splat, f32x4_sub, i8x16_add, i8x16_all_true, i8x16_eq, i8x16_ge, i8x16_gt, i8x16_neg,
-    i8x16_shl, i8x16_shr, i8x16_shuffle, i8x16_splat, i8x16_sub, i16x8_add, i16x8_all_true,
-    i16x8_eq, i16x8_extend_high_i8x16, i16x8_extend_low_i8x16, i16x8_extmul_high_i8x16,
-    i16x8_extmul_low_i8x16, i16x8_ge, i16x8_gt, i16x8_mul, i16x8_narrow_i32x4, i16x8_neg,
-    i16x8_shl, i16x8_shr, i16x8_shuffle, i16x8_splat, i16x8_sub, i32x4_add, i32x4_all_true,
-    i32x4_eq, i32x4_extend_high_i16x8, i32x4_extend_low_i16x8, i32x4_ge, i32x4_gt, i32x4_mul,
-    i32x4_neg, i32x4_shl, i32x4_shr, i32x4_shuffle, i32x4_splat, i32x4_sub, i32x4_trunc_sat_f32x4,
-    u8x16_add, u8x16_eq, u8x16_ge, u8x16_gt, u8x16_narrow_i16x8, u8x16_shl, u8x16_shr,
-    u8x16_shuffle, u8x16_splat, u8x16_sub, u16x8_add, u16x8_eq, u16x8_extend_high_u8x16,
-    u16x8_extend_low_u8x16, u16x8_extmul_high_u8x16, u16x8_extmul_low_u8x16, u16x8_ge, u16x8_gt,
-    u16x8_mul, u16x8_shl, u16x8_shr, u16x8_splat, u16x8_sub, v128, v128_and, v128_any_true,
-    v128_bitselect, v128_load, v128_not, v128_or, v128_store, v128_xor,
+    f32x4, f32x4_abs, f32x4_add, f32x4_convert_i32x4, f32x4_div, f32x4_eq, f32x4_extract_lane,
+    f32x4_ge, f32x4_gt, f32x4_le, f32x4_lt, f32x4_max, f32x4_min, f32x4_mul, f32x4_nearest,
+    f32x4_neg, f32x4_splat, f32x4_sub, i8x16_add, i8x16_all_true, i8x16_eq, i8x16_ge, i8x16_gt,
+    i8x16_neg, i8x16_shl, i8x16_shr, i8x16_shuffle, i8x16_splat, i8x16_sub, i16x8_add,
+    i16x8_all_true, i16x8_eq, i16x8_extend_high_i8x16, i16x8_extend_low_i8x16,
+    i16x8_extmul_high_i8x16, i16x8_extmul_low_i8x16, i16x8_ge, i16x8_gt, i16x8_mul,
+    i16x8_narrow_i32x4, i16x8_neg, i16x8_shl, i16x8_shr, i16x8_shuffle, i16x8_splat, i16x8_sub,
+    i32x4_add, i32x4_all_true, i32x4_eq, i32x4_extend_high_i16x8, i32x4_extend_low_i16x8, i32x4_ge,
+    i32x4_gt, i32x4_mul, i32x4_neg, i32x4_shl, i32x4_shr, i32x4_shuffle, i32x4_splat, i32x4_sub,
+    i32x4_trunc_sat_f32x4, u8x16_add, u8x16_eq, u8x16_ge, u8x16_gt, u8x16_narrow_i16x8, u8x16_shl,
+    u8x16_shr, u8x16_shuffle, u8x16_splat, u8x16_sub, u16x8, u16x8_add, u16x8_eq,
+    u16x8_extend_high_u8x16, u16x8_extend_low_u8x16, u16x8_extmul_high_u8x16,
+    u16x8_extmul_low_u8x16, u16x8_ge, u16x8_gt, u16x8_mul, u16x8_shl, u16x8_shr, u16x8_splat,
+    u16x8_sub, v128, v128_and, v128_any_true, v128_bitselect, v128_load, v128_not, v128_or,
+    v128_store, v128_xor,
 };
 use std::mem::transmute;
 
 #[cfg(target_feature = "relaxed-simd")]
-use std::arch::wasm32::f32x4_relaxed_madd;
+use std::arch::wasm32::{f32x4_relaxed_madd, f32x4_relaxed_nmadd};
 
 use super::{lanes, simd_type};
 use crate::ops::{
-    Concat, Extend, FloatOps, IntOps, Interleave, MaskOps, NarrowSaturate, NumOps, SignedIntOps,
-    ToFloat,
+    BitOps, Concat, Extend, FloatOps, IntOps, Interleave, MaskOps, NarrowSaturate, NumOps,
+    SignedIntOps, ToFloat,
 };
-use crate::{Isa, Mask, Simd};
+use crate::{Isa, Mask, Simd, f16};
 
 simd_type!(F32x4, v128, f32, M32, Wasm32Isa);
 simd_type!(I32x4, v128, i32, M32, Wasm32Isa);
@@ -33,6 +34,7 @@ simd_type!(I8x16, v128, i8, M8, Wasm32Isa);
 simd_type!(U8x16, v128, u8, M8, Wasm32Isa);
 simd_type!(U16x8, v128, u16, M16, Wasm32Isa);
 simd_type!(U32x4, v128, u32, M32, Wasm32Isa);
+simd_type!(F16x8, v128, f16, M16, Wasm32Isa);
 
 #[derive(Copy, Clone)]
 pub struct Wasm32Isa {
@@ -58,9 +60,17 @@ unsafe impl Isa for Wasm32Isa {
     type U8 = U8x16;
     type U16 = U16x8;
     type U32 = U32x4;
+    type F16 = F16x8;
     type Bits = I32x4;
 
-    fn f32(self) -> impl FloatOps<f32, Simd = Self::F32, Int = Self::I32> {
+    fn f32(
+        self,
+    ) -> impl FloatOps<f32, Simd = Self::F32, Int = Self::I32>
+    + NarrowSaturate<f32, f16, Output = Self::F16> {
+        self
+    }
+
+    fn f16(self) -> impl Extend<f16, Output = Self::F32, Simd = Self::F16> {
         self
     }
 
@@ -142,7 +152,7 @@ macro_rules! simd_ops_common {
         unsafe fn load_ptr_mask(self, ptr: *const <$simd as Simd>::Elem, mask: $mask) -> $simd {
             type Elem = <$simd as Simd>::Elem;
             let mask_array = Mask::to_array(mask);
-            let mut vec = Simd::to_array(NumOps::<Elem>::zero(self));
+            let mut vec = Simd::to_array(BitOps::<Elem>::zero(self));
             for i in 0..mask_array.len() {
                 if mask_array[i] {
                     vec[i] = *ptr.add(i);
@@ -162,7 +172,7 @@ macro_rules! simd_ops_common {
 
             let mask_array = Mask::to_array(mask);
             let x_array = Simd::to_array(x);
-            for i in 0..NumOps::<Elem>::len(self) {
+            for i in 0..BitOps::<Elem>::len(self) {
                 if mask_array[i] {
                     *ptr.add(i) = x_array[i];
                 }
@@ -196,9 +206,16 @@ macro_rules! simd_ops_common {
     };
 }
 
-unsafe impl NumOps<f32> for Wasm32Isa {
+unsafe impl BitOps<f32> for Wasm32Isa {
     simd_ops_common!(F32x4, M32, i32);
 
+    #[inline]
+    fn splat(self, x: f32) -> F32x4 {
+        F32x4(f32x4_splat(x))
+    }
+}
+
+unsafe impl NumOps<f32> for Wasm32Isa {
     #[inline]
     fn add(self, x: F32x4, y: F32x4) -> F32x4 {
         F32x4(f32x4_add(x.0, y.0))
@@ -262,11 +279,6 @@ unsafe impl NumOps<f32> for Wasm32Isa {
     }
 
     #[inline]
-    fn splat(self, x: f32) -> F32x4 {
-        F32x4(f32x4_splat(x))
-    }
-
-    #[inline]
     fn sum(self, x: F32x4) -> f32 {
         // See https://github.com/WebAssembly/simd/issues/20.
         let lo_2 = x.0;
@@ -325,9 +337,16 @@ impl FloatOps<f32> for Wasm32Isa {
     }
 }
 
-unsafe impl NumOps<i32> for Wasm32Isa {
+unsafe impl BitOps<i32> for Wasm32Isa {
     simd_ops_common!(I32x4, M32, i32);
 
+    #[inline]
+    fn splat(self, x: i32) -> I32x4 {
+        I32x4(i32x4_splat(x))
+    }
+}
+
+unsafe impl NumOps<i32> for Wasm32Isa {
     #[inline]
     fn add(self, x: I32x4, y: I32x4) -> I32x4 {
         I32x4(i32x4_add(x.0, y.0))
@@ -341,11 +360,6 @@ unsafe impl NumOps<i32> for Wasm32Isa {
     #[inline]
     fn mul(self, x: I32x4, y: I32x4) -> I32x4 {
         I32x4(i32x4_mul(x.0, y.0))
-    }
-
-    #[inline]
-    fn splat(self, x: i32) -> I32x4 {
-        I32x4(i32x4_splat(x))
     }
 
     #[inline]
@@ -413,9 +427,16 @@ impl ToFloat<i32> for Wasm32Isa {
     }
 }
 
-unsafe impl NumOps<i16> for Wasm32Isa {
+unsafe impl BitOps<i16> for Wasm32Isa {
     simd_ops_common!(I16x8, M16, i16);
 
+    #[inline]
+    fn splat(self, x: i16) -> I16x8 {
+        I16x8(i16x8_splat(x))
+    }
+}
+
+unsafe impl NumOps<i16> for Wasm32Isa {
     #[inline]
     fn add(self, x: I16x8, y: I16x8) -> I16x8 {
         I16x8(i16x8_add(x.0, y.0))
@@ -429,11 +450,6 @@ unsafe impl NumOps<i16> for Wasm32Isa {
     #[inline]
     fn mul(self, x: I16x8, y: I16x8) -> I16x8 {
         I16x8(i16x8_mul(x.0, y.0))
-    }
-
-    #[inline]
-    fn splat(self, x: i16) -> I16x8 {
-        I16x8(i16x8_splat(x))
     }
 
     #[inline]
@@ -475,10 +491,13 @@ impl Extend<i16> for Wasm32Isa {
     type Output = I32x4;
 
     #[inline]
-    fn extend(self, x: I16x8) -> (I32x4, I32x4) {
-        let low = i32x4_extend_low_i16x8(x.0);
-        let high = i32x4_extend_high_i16x8(x.0);
-        (low.into(), high.into())
+    fn extend_low(self, x: I16x8) -> I32x4 {
+        i32x4_extend_low_i16x8(x.0).into()
+    }
+
+    #[inline]
+    fn extend_high(self, x: I16x8) -> I32x4 {
+        i32x4_extend_high_i16x8(x.0).into()
     }
 }
 
@@ -503,9 +522,16 @@ impl NarrowSaturate<i16, u8> for Wasm32Isa {
     }
 }
 
-unsafe impl NumOps<i8> for Wasm32Isa {
+unsafe impl BitOps<i8> for Wasm32Isa {
     simd_ops_common!(I8x16, M8, i8);
 
+    #[inline]
+    fn splat(self, x: i8) -> I8x16 {
+        I8x16(i8x16_splat(x))
+    }
+}
+
+unsafe impl NumOps<i8> for Wasm32Isa {
     #[inline]
     fn add(self, x: I8x16, y: I8x16) -> I8x16 {
         I8x16(i8x16_add(x.0, y.0))
@@ -528,11 +554,6 @@ unsafe impl NumOps<i8> for Wasm32Isa {
         );
 
         I8x16(prod_i8)
-    }
-
-    #[inline]
-    fn splat(self, x: i8) -> I8x16 {
-        I8x16(i8x16_splat(x))
     }
 
     #[inline]
@@ -574,10 +595,13 @@ impl Extend<i8> for Wasm32Isa {
     type Output = I16x8;
 
     #[inline]
-    fn extend(self, x: I8x16) -> (I16x8, I16x8) {
-        let low = i16x8_extend_low_i8x16(x.0);
-        let high = i16x8_extend_high_i8x16(x.0);
-        (low.into(), high.into())
+    fn extend_low(self, x: I8x16) -> I16x8 {
+        i16x8_extend_low_i8x16(x.0).into()
+    }
+
+    #[inline]
+    fn extend_high(self, x: I8x16) -> I16x8 {
+        i16x8_extend_high_i8x16(x.0).into()
     }
 }
 
@@ -594,9 +618,16 @@ impl Interleave<i8> for Wasm32Isa {
     }
 }
 
-unsafe impl NumOps<u8> for Wasm32Isa {
+unsafe impl BitOps<u8> for Wasm32Isa {
     simd_ops_common!(U8x16, M8, i8);
 
+    #[inline]
+    fn splat(self, x: u8) -> U8x16 {
+        U8x16(u8x16_splat(x))
+    }
+}
+
+unsafe impl NumOps<u8> for Wasm32Isa {
     #[inline]
     fn add(self, x: U8x16, y: U8x16) -> U8x16 {
         U8x16(u8x16_add(x.0, y.0))
@@ -622,11 +653,6 @@ unsafe impl NumOps<u8> for Wasm32Isa {
     }
 
     #[inline]
-    fn splat(self, x: u8) -> U8x16 {
-        U8x16(u8x16_splat(x))
-    }
-
-    #[inline]
     fn eq(self, x: U8x16, y: U8x16) -> M8 {
         M8(u8x16_eq(x.0, y.0))
     }
@@ -642,9 +668,16 @@ unsafe impl NumOps<u8> for Wasm32Isa {
     }
 }
 
-unsafe impl NumOps<u16> for Wasm32Isa {
+unsafe impl BitOps<u16> for Wasm32Isa {
     simd_ops_common!(U16x8, M16, u16);
 
+    #[inline]
+    fn splat(self, x: u16) -> U16x8 {
+        U16x8(u16x8_splat(x))
+    }
+}
+
+unsafe impl NumOps<u16> for Wasm32Isa {
     #[inline]
     fn add(self, x: U16x8, y: U16x8) -> U16x8 {
         U16x8(u16x8_add(x.0, y.0))
@@ -658,11 +691,6 @@ unsafe impl NumOps<u16> for Wasm32Isa {
     #[inline]
     fn mul(self, x: U16x8, y: U16x8) -> U16x8 {
         U16x8(u16x8_mul(x.0, y.0))
-    }
-
-    #[inline]
-    fn splat(self, x: u16) -> U16x8 {
-        U16x8(u16x8_splat(x))
     }
 
     #[inline]
@@ -697,10 +725,13 @@ impl Extend<u8> for Wasm32Isa {
     type Output = U16x8;
 
     #[inline]
-    fn extend(self, x: U8x16) -> (U16x8, U16x8) {
-        let low = u16x8_extend_low_u8x16(x.0);
-        let high = u16x8_extend_high_u8x16(x.0);
-        (low.into(), high.into())
+    fn extend_low(self, x: U8x16) -> U16x8 {
+        u16x8_extend_low_u8x16(x.0).into()
+    }
+
+    #[inline]
+    fn extend_high(self, x: U8x16) -> U16x8 {
+        u16x8_extend_high_u8x16(x.0).into()
     }
 }
 
@@ -726,6 +757,63 @@ impl Interleave<u8> for Wasm32Isa {
     fn interleave_high(self, a: U8x16, b: U8x16) -> U8x16 {
         u8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(a.0, b.0)
             .into()
+    }
+}
+
+unsafe impl BitOps<f16> for Wasm32Isa {
+    simd_ops_common!(F16x8, M16, u16);
+
+    #[inline]
+    fn splat(self, x: f16) -> F16x8 {
+        F16x8(u16x8_splat(x.to_bits()))
+    }
+}
+
+// f16 <-> f32 conversion uses scalar operations because wasm lacks intrinsics.
+// This could probably be improved by vectorizing the scalar version.
+impl Extend<f16> for Wasm32Isa {
+    type Output = F32x4;
+
+    #[inline]
+    fn extend_low(self, x: F16x8) -> F32x4 {
+        let lanes = x.to_array();
+        F32x4(f32x4(
+            lanes[0].to_f32(),
+            lanes[1].to_f32(),
+            lanes[2].to_f32(),
+            lanes[3].to_f32(),
+        ))
+    }
+
+    #[inline]
+    fn extend_high(self, x: F16x8) -> F32x4 {
+        let lanes = x.to_array();
+        F32x4(f32x4(
+            lanes[4].to_f32(),
+            lanes[5].to_f32(),
+            lanes[6].to_f32(),
+            lanes[7].to_f32(),
+        ))
+    }
+}
+
+impl NarrowSaturate<f32, f16> for Wasm32Isa {
+    type Output = F16x8;
+
+    #[inline]
+    fn narrow_saturate(self, low: F32x4, high: F32x4) -> F16x8 {
+        let low = low.to_array();
+        let high = high.to_array();
+        F16x8(u16x8(
+            f16::from_f32(low[0]).to_bits(),
+            f16::from_f32(low[1]).to_bits(),
+            f16::from_f32(low[2]).to_bits(),
+            f16::from_f32(low[3]).to_bits(),
+            f16::from_f32(high[0]).to_bits(),
+            f16::from_f32(high[1]).to_bits(),
+            f16::from_f32(high[2]).to_bits(),
+            f16::from_f32(high[3]).to_bits(),
+        ))
     }
 }
 

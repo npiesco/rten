@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
@@ -14,8 +15,9 @@ use crate::iterators::{
     Lanes, LanesMut, for_each_mut,
 };
 use crate::layout::{
-    AsIndex, BroadcastLayout, DynLayout, InsertDim, IntoLayout, Layout, LayoutExt, MatrixLayout,
-    MutLayout, NdLayout, OverlapPolicy, RemoveDim, ResizeLayout, SliceWith, TrustedLayout,
+    AsIndex, AsShape, BroadcastLayout, DynLayout, FromShape, InsertDim, IntoLayout, Layout,
+    LayoutExt, MatrixLayout, MutLayout, NdLayout, OverlapPolicy, RemoveDim, ResizeLayout,
+    SizeArray, SliceWith, TrustedLayout,
 };
 use crate::overlap::may_have_internal_overlap;
 use crate::slice_range::{IntoSliceItems, SliceItem};
@@ -229,7 +231,7 @@ pub trait AsView: Layout {
     fn map<F, U>(&self, f: F) -> TensorBase<Vec<U>, Self::Layout>
     where
         F: Fn(&Self::Elem) -> U,
-        Self::Layout: MutLayout,
+        Self::Layout: FromShape,
     {
         self.view().map(f)
     }
@@ -238,7 +240,7 @@ pub trait AsView: Layout {
     fn map_in<A: Alloc, F, U>(&self, alloc: A, f: F) -> TensorBase<Vec<U>, Self::Layout>
     where
         F: Fn(&Self::Elem) -> U,
-        Self::Layout: MutLayout,
+        Self::Layout: FromShape,
     {
         self.view().map_in(alloc, f)
     }
@@ -301,7 +303,6 @@ pub trait AsView: Layout {
     ) -> TensorBase<CowData<'_, Self::Elem>, S::Layout>
     where
         Self::Elem: Clone,
-        Self::Layout: MutLayout,
     {
         self.view().reshaped(shape)
     }
@@ -315,7 +316,6 @@ pub trait AsView: Layout {
     ) -> TensorBase<CowData<'_, Self::Elem>, S::Layout>
     where
         Self::Elem: Clone,
-        Self::Layout: MutLayout,
     {
         self.view().reshaped_in(alloc, shape)
     }
@@ -401,7 +401,7 @@ pub trait AsView: Layout {
         Self::Layout: SliceWith<
                 R,
                 R::Count,
-                Layout: for<'a> Layout<Index<'a>: TryFrom<&'a [usize], Error: Debug>>,
+                Layout: FromShape + for<'a> Layout<Shape<'a>: TryFrom<&'a [usize], Error: Debug>>,
             >,
     {
         self.slice_copy_in(GlobalAlloc::new(), range)
@@ -419,7 +419,7 @@ pub trait AsView: Layout {
         Self::Layout: SliceWith<
                 R,
                 R::Count,
-                Layout: for<'a> Layout<Index<'a>: TryFrom<&'a [usize], Error: Debug>>,
+                Layout: FromShape + for<'a> Layout<Shape<'a>: TryFrom<&'a [usize], Error: Debug>>,
             >,
     {
         // Fast path for slice ranges supported by `Tensor::slice`. This includes
@@ -490,7 +490,7 @@ pub trait AsView: Layout {
     fn to_contiguous(&self) -> Contiguous<TensorBase<CowData<'_, Self::Elem>, Self::Layout>>
     where
         Self::Elem: Clone,
-        Self::Layout: MutLayout,
+        Self::Layout: FromShape,
     {
         self.view().to_contiguous()
     }
@@ -503,7 +503,7 @@ pub trait AsView: Layout {
     ) -> Contiguous<TensorBase<CowData<'_, Self::Elem>, Self::Layout>>
     where
         Self::Elem: Clone,
-        Self::Layout: MutLayout,
+        Self::Layout: FromShape,
     {
         self.view().to_contiguous_in(alloc)
     }
@@ -511,8 +511,7 @@ pub trait AsView: Layout {
     /// Return a copy of this tensor with a given shape.
     fn to_shape<S: IntoLayout>(&self, shape: S) -> TensorBase<Vec<Self::Elem>, S::Layout>
     where
-        Self::Elem: Clone,
-        Self::Layout: MutLayout;
+        Self::Elem: Clone;
 
     /// Return a slice containing the elements of this tensor in their logical
     /// order, ie. as if the tensor were flattened into one dimension.
@@ -531,7 +530,7 @@ pub trait AsView: Layout {
     fn to_tensor(&self) -> TensorBase<Vec<Self::Elem>, Self::Layout>
     where
         Self::Elem: Clone,
-        Self::Layout: MutLayout,
+        Self::Layout: FromShape,
     {
         self.to_tensor_in(GlobalAlloc::new())
     }
@@ -540,7 +539,7 @@ pub trait AsView: Layout {
     fn to_tensor_in<A: Alloc>(&self, alloc: A) -> TensorBase<Vec<Self::Elem>, Self::Layout>
     where
         Self::Elem: Clone,
-        Self::Layout: MutLayout,
+        Self::Layout: FromShape,
     {
         TensorBase::from_data(self.layout().shape(), self.to_vec_in(alloc))
     }
@@ -557,20 +556,16 @@ impl<S: Storage, L: Layout> TensorBase<S, L> {
     ///
     /// Panics if the data length does not match the product of `shape`.
     #[track_caller]
-    pub fn from_data<D: IntoStorage<Output = S>>(shape: L::Index<'_>, data: D) -> TensorBase<S, L>
+    pub fn from_data<D: IntoStorage<Output = S>>(shape: L::Shape<'_>, data: D) -> TensorBase<S, L>
     where
-        for<'a> L::Index<'a>: Clone,
-        L: MutLayout,
+        L: FromShape,
+        for<'a> L::Shape<'a>: Clone,
     {
         let data = data.into_storage();
         let len = data.len();
         match Self::try_from_data(shape.clone(), data) {
             Ok(data) => data,
-            Err(_) => panic!(
-                "data length {} does not match shape {:?}",
-                len,
-                shape.as_ref()
-            ),
+            Err(_) => panic!("data length {} does not match shape {:?}", len, shape),
         }
     }
 
@@ -578,11 +573,11 @@ impl<S: Storage, L: Layout> TensorBase<S, L> {
     ///
     /// This will fail if the data length does not match the product of `shape`.
     pub fn try_from_data<D: IntoStorage<Output = S>>(
-        shape: L::Index<'_>,
+        shape: L::Shape<'_>,
         data: D,
     ) -> Result<TensorBase<S, L>, FromDataError>
     where
-        L: MutLayout,
+        L: FromShape,
     {
         let data = data.into_storage();
         let layout = L::from_shape(shape);
@@ -598,10 +593,7 @@ impl<S: Storage, L: Layout> TensorBase<S, L> {
     /// is mutable and the layout may map multiple indices to the same offset.
     pub fn from_storage_and_layout(data: S, layout: L) -> TensorBase<S, L> {
         assert!(data.len() >= layout.min_data_len());
-        assert!(
-            !S::MUTABLE
-                || !may_have_internal_overlap(layout.shape().as_ref(), layout.strides().as_ref())
-        );
+        assert!(!S::MUTABLE || !may_have_internal_overlap(layout.shape(), layout.strides()));
         TensorBase { data, layout }
     }
 
@@ -614,10 +606,7 @@ impl<S: Storage, L: Layout> TensorBase<S, L> {
     /// same offset.
     pub(crate) unsafe fn from_storage_and_layout_unchecked(data: S, layout: L) -> TensorBase<S, L> {
         debug_assert!(data.len() >= layout.min_data_len());
-        debug_assert!(
-            !S::MUTABLE
-                || !may_have_internal_overlap(layout.shape().as_ref(), layout.strides().as_ref())
-        );
+        debug_assert!(!S::MUTABLE || !may_have_internal_overlap(layout.shape(), layout.strides()));
         TensorBase { data, layout }
     }
 
@@ -629,9 +618,9 @@ impl<S: Storage, L: Layout> TensorBase<S, L> {
     /// See also [`TensorBase::from_slice_with_strides`] which is a similar method
     /// for immutable views that does allow overlapping strides.
     pub fn from_data_with_strides<D: IntoStorage<Output = S>>(
-        shape: L::Index<'_>,
+        shape: L::Shape<'_>,
         data: D,
-        strides: L::Index<'_>,
+        strides: L::Strides<'_>,
     ) -> Result<TensorBase<S, L>, FromDataError>
     where
         L: MutLayout,
@@ -719,15 +708,38 @@ impl<S: Storage, L: Layout> TensorBase<S, L> {
 
     /// Attempt to convert this tensor's layout to a static-rank layout with `N`
     /// dimensions.
-    fn nd_layout<const N: usize>(&self) -> Option<NdLayout<N>> {
+    fn nd_layout<const N: usize>(&self) -> Result<NdLayout<N>, DimensionError> {
         if self.ndim() != N {
-            return None;
+            return Err(DimensionError {
+                actual: self.ndim(),
+                expected: N,
+            });
         }
         let shape: [usize; N] = std::array::from_fn(|i| self.size(i));
         let strides: [usize; N] = std::array::from_fn(|i| self.stride(i));
         let layout = NdLayout::from_shape_and_strides(shape, strides, OverlapPolicy::AllowOverlap)
             .expect("invalid layout");
-        Some(layout)
+        Ok(layout)
+    }
+
+    /// Convert this tensor into a tensor with rank `N`.
+    pub fn into_rank<const N: usize>(self) -> Result<TensorBase<S, NdLayout<N>>, DimensionError> {
+        let layout = self.nd_layout()?;
+        Ok(TensorBase {
+            data: self.data,
+            layout,
+        })
+    }
+
+    /// Convert this tensor into one with dimensions re-ordered.
+    pub fn into_permuted(self, order: L::Index<'_>) -> TensorBase<S, L>
+    where
+        L: MutLayout,
+    {
+        TensorBase {
+            layout: self.layout.permuted(order),
+            data: self.data,
+        }
     }
 
     /// Return a raw pointer to the tensor's underlying data.
@@ -892,10 +904,7 @@ impl<S: StorageMut, L: Clone + Layout> TensorBase<S, L> {
     }
 
     /// Return a mutable iterator over the N innermost dimensions of this tensor.
-    pub fn inner_iter_mut<const N: usize>(&mut self) -> InnerIterMut<'_, S::Elem, NdLayout<N>>
-    where
-        L: MutLayout,
-    {
+    pub fn inner_iter_mut<const N: usize>(&mut self) -> InnerIterMut<'_, S::Elem, NdLayout<N>> {
         InnerIterMut::new(self.view_mut())
     }
 
@@ -903,10 +912,7 @@ impl<S: StorageMut, L: Clone + Layout> TensorBase<S, L> {
     ///
     /// Prefer [`inner_iter_mut`](TensorBase::inner_iter_mut) if `N` is known
     /// at compile time.
-    pub fn inner_iter_dyn_mut(&mut self, n: usize) -> InnerIterMut<'_, S::Elem, DynLayout>
-    where
-        L: MutLayout,
-    {
+    pub fn inner_iter_dyn_mut(&mut self, n: usize) -> InnerIterMut<'_, S::Elem, DynLayout> {
         InnerIterMut::new_dyn(self.view_mut(), n)
     }
 
@@ -959,10 +965,7 @@ impl<S: StorageMut, L: Clone + Layout> TensorBase<S, L> {
     pub fn reshaped_mut<SH: IntoLayout>(
         &mut self,
         shape: SH,
-    ) -> Result<TensorBase<ViewMutData<'_, S::Elem>, SH::Layout>, ReshapeError>
-    where
-        L: MutLayout,
-    {
+    ) -> Result<TensorBase<ViewMutData<'_, S::Elem>, SH::Layout>, ReshapeError> {
         let layout = self.layout.reshaped_for_view(shape)?;
         Ok(TensorBase {
             layout,
@@ -1048,8 +1051,8 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     pub fn arange(start: T, end: T, step: Option<T>) -> TensorBase<Vec<T>, L>
     where
         T: Copy + PartialOrd + From<bool> + std::ops::Add<Output = T>,
-        [usize; 1]: AsIndex<L>,
-        L: MutLayout,
+        [usize; 1]: AsShape<L>,
+        L: FromShape,
     {
         let step = step.unwrap_or((true).into());
         let mut data = Vec::new();
@@ -1058,7 +1061,7 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
             data.push(curr);
             curr = curr + step;
         }
-        TensorBase::from_data([data.len()].as_index(), data)
+        TensorBase::from_data([data.len()].as_shape(), data)
     }
 
     /// Append elements from `other` to this tensor along a given axis.
@@ -1091,11 +1094,27 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
         let new_data_len = new_layout.min_data_len();
         self.layout = new_layout;
 
-        // Safety: The `copy_from` call below will initialize all elements
-        // added to the tensor.
-        assert!(self.data.capacity() >= new_data_len);
-        unsafe {
-            self.data.set_len(new_data_len);
+        // Fast path for the case where we can avoid initializing new elements
+        // before copying the data.
+        if self.layout.is_contiguous() && self.data.len() + other.len() == new_data_len {
+            let added = new_data_len - self.data.len();
+            other.copy_into_slice(&mut self.data.spare_capacity_mut()[..added]);
+
+            // Safety: `copy_into_slice` initialized every element between the
+            // old and new lengths.
+            unsafe {
+                self.data.set_len(new_data_len);
+            }
+
+            return Ok(());
+        }
+
+        // Initialize new capacity if needed.
+        if self.data.len() < new_data_len {
+            // `other` must be non-empty here as otherwise the old/new layouts
+            // would be the same and the `min_data_len` would not have grown.
+            let fill = *other.iter().next().unwrap();
+            self.data.resize(new_data_len, fill);
         }
 
         self.slice_axis_mut(axis, old_size..new_size)
@@ -1107,10 +1126,10 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     /// Create a new 1D tensor from a `Vec<T>`.
     pub fn from_vec(vec: Vec<T>) -> TensorBase<Vec<T>, L>
     where
-        [usize; 1]: AsIndex<L>,
-        L: MutLayout,
+        [usize; 1]: AsShape<L>,
+        L: FromShape,
     {
-        TensorBase::from_data([vec.len()].as_index(), vec)
+        TensorBase::from_data([vec.len()].as_shape(), vec)
     }
 
     /// Clip dimension `dim` to `[range.start, range.end)`. The new size for
@@ -1163,10 +1182,7 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
         let new_data_len = new_layout.min_data_len();
 
         let has_capacity = new_data_len <= self.data.capacity()
-            && !may_have_internal_overlap(
-                new_layout.shape().as_ref(),
-                new_layout.strides().as_ref(),
-            );
+            && !may_have_internal_overlap(new_layout.shape(), new_layout.strides());
 
         has_capacity.then_some(new_layout)
     }
@@ -1223,7 +1239,6 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     pub fn into_shape<S: Copy + IntoLayout>(self, shape: S) -> TensorBase<Vec<T>, S::Layout>
     where
         T: Clone,
-        L: MutLayout,
     {
         let Ok(layout) = self.layout.reshaped_for_copy(shape) else {
             panic!(
@@ -1245,24 +1260,39 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     /// corresponding value. If the function does not need this index, use
     /// [`from_simple_fn`](TensorBase::from_simple_fn) instead, as it is faster.
     pub fn from_fn<F: FnMut(L::Index<'_>) -> T, Idx>(
-        shape: L::Index<'_>,
+        shape: L::Shape<'_>,
+        f: F,
+    ) -> TensorBase<Vec<T>, L>
+    where
+        L::Indices: Iterator<Item = Idx>,
+        Idx: AsIndex<L>,
+        L: FromShape,
+    {
+        Self::from_fn_in(GlobalAlloc::new(), shape, f)
+    }
+
+    /// Variant of [`from_fn`](TensorBase::from_fn) that takes an allocator.
+    pub fn from_fn_in<A: Alloc, F: FnMut(L::Index<'_>) -> T, Idx>(
+        alloc: A,
+        shape: L::Shape<'_>,
         mut f: F,
     ) -> TensorBase<Vec<T>, L>
     where
         L::Indices: Iterator<Item = Idx>,
         Idx: AsIndex<L>,
-        L: MutLayout,
+        L: FromShape,
     {
         let layout = L::from_shape(shape);
-        let data: Vec<T> = layout.indices().map(|idx| f(idx.as_index())).collect();
+        let mut data = alloc.alloc(layout.len());
+        data.extend(layout.indices().map(|idx| f(idx.as_index())));
         TensorBase { data, layout }
     }
 
     /// Create a new tensor with a given shape and values generated by calling
     /// `f` repeatedly.
-    pub fn from_simple_fn<F: FnMut() -> T>(shape: L::Index<'_>, f: F) -> TensorBase<Vec<T>, L>
+    pub fn from_simple_fn<F: FnMut() -> T>(shape: L::Shape<'_>, f: F) -> TensorBase<Vec<T>, L>
     where
-        L: MutLayout,
+        L: FromShape,
     {
         Self::from_simple_fn_in(GlobalAlloc::new(), shape, f)
     }
@@ -1271,13 +1301,13 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     /// an allocator.
     pub fn from_simple_fn_in<A: Alloc, F: FnMut() -> T>(
         alloc: A,
-        shape: L::Index<'_>,
+        shape: L::Shape<'_>,
         mut f: F,
     ) -> TensorBase<Vec<T>, L>
     where
-        L: MutLayout,
+        L: FromShape,
     {
-        let len = shape.as_ref().iter().product();
+        let len = shape.iter().product();
         let mut data = alloc.alloc(len);
         data.extend(std::iter::from_fn(|| Some(f())).take(len));
         TensorBase::from_data(shape, data)
@@ -1286,28 +1316,28 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     /// Create a new 0D tensor from a scalar value.
     pub fn from_scalar(value: T) -> TensorBase<Vec<T>, L>
     where
-        [usize; 0]: AsIndex<L>,
-        L: MutLayout,
+        [usize; 0]: AsShape<L>,
+        L: FromShape,
     {
-        TensorBase::from_data([].as_index(), vec![value])
+        TensorBase::from_data([].as_shape(), vec![value])
     }
 
     /// Create a new tensor with a given shape and all elements set to `value`.
-    pub fn full(shape: L::Index<'_>, value: T) -> TensorBase<Vec<T>, L>
+    pub fn full(shape: L::Shape<'_>, value: T) -> TensorBase<Vec<T>, L>
     where
         T: Clone,
-        L: MutLayout,
+        L: FromShape,
     {
         Self::full_in(GlobalAlloc::new(), shape, value)
     }
 
     /// Variant of [`full`](TensorBase::full) which takes an allocator.
-    pub fn full_in<A: Alloc>(alloc: A, shape: L::Index<'_>, value: T) -> TensorBase<Vec<T>, L>
+    pub fn full_in<A: Alloc>(alloc: A, shape: L::Shape<'_>, value: T) -> TensorBase<Vec<T>, L>
     where
         T: Clone,
-        L: MutLayout,
+        L: FromShape,
     {
-        let len = shape.as_ref().iter().product();
+        let len = shape.iter().product();
         let mut data = alloc.alloc(len);
         data.resize(len, value);
         TensorBase::from_data(shape, data)
@@ -1322,7 +1352,7 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     pub fn make_contiguous(&mut self)
     where
         T: Clone,
-        L: MutLayout,
+        L: FromShape,
     {
         if self.is_contiguous() {
             return;
@@ -1331,33 +1361,45 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
         self.layout = L::from_shape(self.layout.shape());
     }
 
+    /// Convert this tensor into a contiguous tensor.
+    ///
+    /// This is cheap if the tensor is already contiguous, otherwise the
+    /// elements are copied into a new contiguous buffer.
+    pub fn into_contiguous(self) -> Contiguous<Self>
+    where
+        T: Clone,
+        L: FromShape,
+    {
+        Contiguous::from_owned(self)
+    }
+
     /// Create a new tensor with a given shape and elements populated using
     /// numbers generated by `rand_src`.
     ///
     /// A more general version of this method that generates values using any
     /// function is [`from_simple_fn`](Self::from_simple_fn).
-    pub fn rand<R: RandomSource<T>>(shape: L::Index<'_>, rand_src: &mut R) -> TensorBase<Vec<T>, L>
+    pub fn rand<R: RandomSource<T>>(shape: L::Shape<'_>, rand_src: &mut R) -> TensorBase<Vec<T>, L>
     where
-        L: MutLayout,
+        L: FromShape,
     {
         Self::from_simple_fn(shape, || rand_src.next())
     }
 
     /// Create a new tensor with a given shape, with all elements set to their
     /// default value (ie. zero for numeric types).
-    pub fn zeros(shape: L::Index<'_>) -> TensorBase<Vec<T>, L>
+    pub fn zeros(shape: L::Shape<'_>) -> TensorBase<Vec<T>, L>
     where
         T: Clone + Default,
-        L: MutLayout,
+        L: FromShape,
     {
         Self::zeros_in(GlobalAlloc::new(), shape)
     }
 
     /// Variant of [`zeros`](TensorBase::zeros) which takes an allocator.
-    pub fn zeros_in<A: Alloc>(alloc: A, shape: L::Index<'_>) -> TensorBase<Vec<T>, L>
+    pub fn zeros_in<A: Alloc>(alloc: A, shape: L::Shape<'_>) -> TensorBase<Vec<T>, L>
     where
         T: Clone + Default,
-        L: MutLayout,
+        L: FromShape,
     {
         // We delegate to `full_in` here and rely on compiler optimizations to
         // take advantage of the value being statically known to be zero.
@@ -1369,20 +1411,20 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     /// The caller must initialize elements and then call
     /// [`assume_init`](TensorBase::assume_init) to convert to an initialized
     /// `Tensor<T>`.
-    pub fn uninit(shape: L::Index<'_>) -> TensorBase<Vec<MaybeUninit<T>>, L>
+    pub fn uninit(shape: L::Shape<'_>) -> TensorBase<Vec<MaybeUninit<T>>, L>
     where
         MaybeUninit<T>: Clone,
-        L: MutLayout,
+        L: FromShape,
     {
         Self::uninit_in(GlobalAlloc::new(), shape)
     }
 
     /// Variant of [`uninit`](TensorBase::uninit) which takes an allocator.
-    pub fn uninit_in<A: Alloc>(alloc: A, shape: L::Index<'_>) -> TensorBase<Vec<MaybeUninit<T>>, L>
+    pub fn uninit_in<A: Alloc>(alloc: A, shape: L::Shape<'_>) -> TensorBase<Vec<MaybeUninit<T>>, L>
     where
-        L: MutLayout,
+        L: FromShape,
     {
-        let len = shape.as_ref().iter().product();
+        let len = shape.iter().product();
         let mut data = alloc.alloc(len);
 
         // Safety: Since the contents of the `Vec` are `MaybeUninit`, we don't
@@ -1403,7 +1445,7 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     ) -> Result<TensorBase<Vec<T>, L>, ExpandError>
     where
         T: Copy,
-        L: MutLayout,
+        L: FromShape + MutLayout,
     {
         let first = tensors.first().ok_or(ExpandError::ShapeMismatch)?;
         let total_dim_size: usize = tensors.iter().map(|t| t.size(dim)).sum();
@@ -1424,10 +1466,10 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     /// `shape` specifies the maximum shape that the tensor can be expanded to
     /// without reallocating. The initial shape will be the same, except for
     /// the dimension specified by `expand_dim`, which will be zero.
-    pub fn with_capacity(shape: L::Index<'_>, expand_dim: usize) -> TensorBase<Vec<T>, L>
+    pub fn with_capacity(shape: L::Shape<'_>, expand_dim: usize) -> TensorBase<Vec<T>, L>
     where
         T: Copy,
-        L: MutLayout,
+        L: FromShape + MutLayout,
     {
         Self::with_capacity_in(GlobalAlloc::new(), shape, expand_dim)
     }
@@ -1435,12 +1477,12 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     /// Variant of [`with_capacity`](Self::with_capacity) which takes an allocator.
     pub fn with_capacity_in<A: Alloc>(
         alloc: A,
-        shape: L::Index<'_>,
+        shape: L::Shape<'_>,
         expand_dim: usize,
     ) -> TensorBase<Vec<T>, L>
     where
         T: Copy,
-        L: MutLayout,
+        L: FromShape + MutLayout,
     {
         let mut tensor = Self::uninit_in(alloc, shape);
         tensor.clip_dim(expand_dim, 0..0);
@@ -1451,7 +1493,7 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
     }
 }
 
-impl<T, L: Layout> TensorBase<CowData<'_, T>, L> {
+impl<'a, T, L: Layout> TensorBase<CowData<'a, T>, L> {
     /// Consume self and return the underlying data in whatever order the
     /// elements are currently stored, if the storage is owned, or `None` if
     /// it is borrowed.
@@ -1464,6 +1506,89 @@ impl<T, L: Layout> TensorBase<CowData<'_, T>, L> {
             CowData::Borrowed(_) => None,
         }
     }
+
+    /// Convert this copy-on-write tensor into an owned tensor.
+    ///
+    /// This is cheap if the data is already owned or requires a copy otherwise.
+    pub fn into_owned(self) -> TensorBase<Vec<T>, L>
+    where
+        L: Clone + FromShape,
+        T: Clone,
+    {
+        self.into_owned_in(GlobalAlloc::new())
+    }
+
+    /// Variant of [`into_owned`](Self) that takes an allocator.
+    pub fn into_owned_in<A: Alloc>(self, alloc: A) -> TensorBase<Vec<T>, L>
+    where
+        L: Clone + FromShape,
+        T: Clone,
+    {
+        match self.data {
+            CowData::Owned(data) => TensorBase {
+                data,
+                layout: self.layout,
+            },
+            CowData::Borrowed(_) => {
+                let data = self.to_vec_in(alloc);
+                let layout = L::from_shape(self.shape());
+                TensorBase { data, layout }
+            }
+        }
+    }
+
+    /// Consume self and return a new contiguous tensor with the given shape.
+    ///
+    /// This avoids copying the data if it is already contiguous.
+    pub fn into_shape<S: Clone + IntoLayout>(
+        self,
+        shape: S,
+    ) -> TensorBase<CowData<'a, T>, S::Layout>
+    where
+        T: Clone,
+        L: Clone,
+    {
+        self.into_shape_in(GlobalAlloc::new(), shape)
+    }
+
+    /// Variant of [`into_shape`](Self::into_shape) which takes an allocator.
+    pub fn into_shape_in<A: Alloc, S: Clone + IntoLayout>(
+        self,
+        alloc: A,
+        shape: S,
+    ) -> TensorBase<CowData<'a, T>, S::Layout>
+    where
+        T: Clone,
+        L: Clone,
+    {
+        if let Ok(layout) = self.layout.reshaped_for_view(shape.clone()) {
+            TensorBase {
+                data: self.data,
+                layout,
+            }
+        } else {
+            let Ok(layout) = self.layout.reshaped_for_copy(shape.clone()) else {
+                panic!(
+                    "element count mismatch reshaping {:?} to {:?}",
+                    self.shape(),
+                    shape
+                );
+            };
+
+            TensorBase {
+                data: CowData::Owned(self.to_vec_in(alloc)),
+                layout,
+            }
+        }
+    }
+}
+
+/// Result of [`TensorBase::init_if_empty`].
+pub enum InitEmpty<Init: Storage, Uninit: Storage, L: Layout> {
+    /// Empty tensor with initialized storage.
+    Empty(TensorBase<Init, L>),
+    /// Non-empty tensor with uninitialized storage.
+    NotEmpty(TensorBase<Uninit, L>),
 }
 
 impl<T, S: Storage<Elem = MaybeUninit<T>> + AssumeInit, L: Layout + Clone> TensorBase<S, L>
@@ -1483,6 +1608,16 @@ where
         TensorBase {
             layout: self.layout,
             data: unsafe { self.data.assume_init() },
+        }
+    }
+
+    /// Convert `self` to an initialized tensor, if it has no elements.
+    pub fn init_if_empty(self) -> InitEmpty<<S as AssumeInit>::Output, S, L> {
+        if self.is_empty() {
+            // The tensor has no elements, and thus is initialized.
+            InitEmpty::Empty(unsafe { self.assume_init() })
+        } else {
+            InitEmpty::NotEmpty(self)
         }
     }
 
@@ -1620,9 +1755,9 @@ impl<'a, T, L: Clone + Layout> TensorBase<ViewData<'a, T>, L> {
     /// instead. This method is similar to [`TensorBase::from_data_with_strides`],
     /// but allows strides that lead to internal overlap (see [`OverlapPolicy`]).
     pub fn from_slice_with_strides(
-        shape: L::Index<'_>,
+        shape: L::Shape<'_>,
         data: &'a [T],
-        strides: L::Index<'_>,
+        strides: L::Strides<'_>,
     ) -> Result<TensorBase<ViewData<'a, T>, L>, FromDataError>
     where
         L: MutLayout,
@@ -1742,7 +1877,6 @@ impl<'a, T, L: Clone + Layout> TensorBase<ViewData<'a, T>, L> {
     pub fn reshaped<S: Copy + IntoLayout>(&self, shape: S) -> TensorBase<CowData<'a, T>, S::Layout>
     where
         T: Clone,
-        L: MutLayout,
     {
         self.reshaped_in(GlobalAlloc::new(), shape)
     }
@@ -1755,7 +1889,6 @@ impl<'a, T, L: Clone + Layout> TensorBase<ViewData<'a, T>, L> {
     ) -> TensorBase<CowData<'a, T>, S::Layout>
     where
         T: Clone,
-        L: MutLayout,
     {
         if let Ok(layout) = self.layout.reshaped_for_view(shape) {
             TensorBase {
@@ -1877,7 +2010,7 @@ impl<'a, T, L: Clone + Layout> TensorBase<ViewData<'a, T>, L> {
     pub fn to_contiguous(&self) -> Contiguous<TensorBase<CowData<'a, T>, L>>
     where
         T: Clone,
-        L: MutLayout,
+        L: FromShape,
     {
         self.to_contiguous_in(GlobalAlloc::new())
     }
@@ -1887,7 +2020,7 @@ impl<'a, T, L: Clone + Layout> TensorBase<ViewData<'a, T>, L> {
     pub fn to_contiguous_in<A: Alloc>(&self, alloc: A) -> Contiguous<TensorBase<CowData<'a, T>, L>>
     where
         T: Clone,
-        L: MutLayout,
+        L: FromShape,
     {
         let tensor = if let Some(data) = self.data() {
             TensorBase {
@@ -1963,6 +2096,14 @@ impl<'a, T, L: Clone + Layout> TensorBase<ViewData<'a, T>, L> {
 }
 
 impl<S: Storage, L: Layout> Layout for TensorBase<S, L> {
+    type Shape<'a>
+        = L::Shape<'a>
+    where
+        Self: 'a;
+    type Strides<'a>
+        = L::Strides<'a>
+    where
+        Self: 'a;
     type Index<'a> = L::Index<'a>;
     type Indices = L::Indices;
 
@@ -1978,7 +2119,7 @@ impl<S: Storage, L: Layout> Layout for TensorBase<S, L> {
         self.layout.is_empty()
     }
 
-    fn shape(&self) -> Self::Index<'_> {
+    fn shape(&self) -> Self::Shape<'_> {
         self.layout.shape()
     }
 
@@ -1986,7 +2127,7 @@ impl<S: Storage, L: Layout> Layout for TensorBase<S, L> {
         self.layout.size(dim)
     }
 
-    fn strides(&self) -> Self::Index<'_> {
+    fn strides(&self) -> Self::Strides<'_> {
         self.layout.strides()
     }
 
@@ -2078,7 +2219,7 @@ impl<T, S: Storage<Elem = T>, L: Layout + Clone> AsView for TensorBase<S, L> {
     fn map<F, U>(&self, f: F) -> TensorBase<Vec<U>, L>
     where
         F: Fn(&Self::Elem) -> U,
-        L: MutLayout,
+        L: FromShape,
     {
         self.map_in(GlobalAlloc::new(), f)
     }
@@ -2086,7 +2227,7 @@ impl<T, S: Storage<Elem = T>, L: Layout + Clone> AsView for TensorBase<S, L> {
     fn map_in<A: Alloc, F, U>(&self, alloc: A, f: F) -> TensorBase<Vec<U>, L>
     where
         F: Fn(&Self::Elem) -> U,
-        L: MutLayout,
+        L: FromShape,
     {
         let len = self.len();
         let mut buf = alloc.alloc(len);
@@ -2170,7 +2311,6 @@ impl<T, S: Storage<Elem = T>, L: Layout + Clone> AsView for TensorBase<S, L> {
     fn to_shape<SH: IntoLayout>(&self, shape: SH) -> TensorBase<Vec<Self::Elem>, SH::Layout>
     where
         T: Clone,
-        L: MutLayout,
     {
         TensorBase {
             data: self.to_vec(),
@@ -2295,46 +2435,46 @@ impl<'a, T, L: Layout> TensorBase<ViewMutData<'a, T>, L> {
     }
 }
 
-impl<T, L: MutLayout> FromIterator<T> for TensorBase<Vec<T>, L>
+impl<T, L: FromShape> FromIterator<T> for TensorBase<Vec<T>, L>
 where
-    [usize; 1]: AsIndex<L>,
+    [usize; 1]: AsShape<L>,
 {
     /// Create a new 1D tensor filled with an arithmetic sequence of values
     /// in the range `[start, end)` separated by `step`. If `step` is omitted,
     /// it defaults to 1.
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> TensorBase<Vec<T>, L> {
         let data: Vec<T> = iter.into_iter().collect();
-        TensorBase::from_data([data.len()].as_index(), data)
+        TensorBase::from_data([data.len()].as_shape(), data)
     }
 }
 
-impl<T, L: MutLayout> From<Vec<T>> for TensorBase<Vec<T>, L>
+impl<T, L: FromShape> From<Vec<T>> for TensorBase<Vec<T>, L>
 where
-    [usize; 1]: AsIndex<L>,
+    [usize; 1]: AsShape<L>,
 {
     /// Create a 1D tensor from a vector.
     fn from(vec: Vec<T>) -> Self {
-        Self::from_data([vec.len()].as_index(), vec)
+        Self::from_data([vec.len()].as_shape(), vec)
     }
 }
 
-impl<'a, T, L: MutLayout> From<&'a [T]> for TensorBase<ViewData<'a, T>, L>
+impl<'a, T, L: FromShape> From<&'a [T]> for TensorBase<ViewData<'a, T>, L>
 where
-    [usize; 1]: AsIndex<L>,
+    [usize; 1]: AsShape<L>,
 {
     /// Create a 1D view from a slice.
     fn from(slice: &'a [T]) -> Self {
-        Self::from_data([slice.len()].as_index(), slice)
+        Self::from_data([slice.len()].as_shape(), slice)
     }
 }
 
-impl<'a, T, L: MutLayout, const N: usize> From<&'a [T; N]> for TensorBase<ViewData<'a, T>, L>
+impl<'a, T, L: FromShape, const N: usize> From<&'a [T; N]> for TensorBase<ViewData<'a, T>, L>
 where
-    [usize; 1]: AsIndex<L>,
+    [usize; 1]: AsShape<L>,
 {
     /// Create a 1D view from a slice of known length.
     fn from(slice: &'a [T; N]) -> Self {
-        Self::from_data([slice.len()].as_index(), slice.as_slice())
+        Self::from_data([slice.len()].as_shape(), slice.as_slice())
     }
 }
 
@@ -2503,7 +2643,20 @@ impl<T: PartialEq, S: Storage<Elem = T>, L: Layout + Clone, V: AsView<Elem = T>>
     for TensorBase<S, L>
 {
     fn eq(&self, other: &V) -> bool {
-        self.shape().as_ref() == other.shape().as_ref() && self.iter().eq(other.iter())
+        self.shape().iter().eq(other.shape().iter()) && self.iter().eq(other.iter())
+    }
+}
+
+impl<T: Eq, S: Storage<Elem = T>, L: Layout + Clone> Eq for TensorBase<S, L> {}
+
+impl<T: Hash, S: Storage<Elem = T>, L: Layout + Clone> Hash for TensorBase<S, L> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for dim in self.shape().iter() {
+            dim.hash(state);
+        }
+        for elem in self.iter() {
+            elem.hash(state);
+        }
     }
 }
 
@@ -2567,9 +2720,9 @@ impl_scalar!(String);
 // impl for a nested array literal, as it prevents `T` from matching an array
 // type.
 
-impl<T: Clone + Scalar, L: MutLayout> From<T> for TensorBase<Vec<T>, L>
+impl<T: Clone + Scalar, L: Clone + FromShape> From<T> for TensorBase<Vec<T>, L>
 where
-    [usize; 0]: AsIndex<L>,
+    [usize; 0]: AsShape<L>,
 {
     /// Construct a scalar tensor from a scalar value.
     fn from(value: T) -> Self {
@@ -2577,33 +2730,33 @@ where
     }
 }
 
-impl<T: Clone + Scalar, L: MutLayout, const D0: usize> From<[T; D0]> for TensorBase<Vec<T>, L>
+impl<T: Clone + Scalar, L: FromShape, const D0: usize> From<[T; D0]> for TensorBase<Vec<T>, L>
 where
-    [usize; 1]: AsIndex<L>,
+    [usize; 1]: AsShape<L>,
 {
     /// Construct a 1D tensor from a 1D array.
     fn from(value: [T; D0]) -> Self {
         let data: Vec<T> = value.iter().cloned().collect();
-        Self::from_data([D0].as_index(), data)
+        Self::from_data([D0].as_shape(), data)
     }
 }
 
-impl<T: Clone + Scalar, L: MutLayout, const D0: usize, const D1: usize> From<[[T; D1]; D0]>
+impl<T: Clone + Scalar, L: FromShape, const D0: usize, const D1: usize> From<[[T; D1]; D0]>
     for TensorBase<Vec<T>, L>
 where
-    [usize; 2]: AsIndex<L>,
+    [usize; 2]: AsShape<L>,
 {
     /// Construct a 2D tensor from a nested array.
     fn from(value: [[T; D1]; D0]) -> Self {
         let data: Vec<_> = value.iter().flat_map(|y| y.iter()).cloned().collect();
-        Self::from_data([D0, D1].as_index(), data)
+        Self::from_data([D0, D1].as_shape(), data)
     }
 }
 
-impl<T: Clone + Scalar, L: MutLayout, const D0: usize, const D1: usize, const D2: usize>
+impl<T: Clone + Scalar, L: FromShape, const D0: usize, const D1: usize, const D2: usize>
     From<[[[T; D2]; D1]; D0]> for TensorBase<Vec<T>, L>
 where
-    [usize; 3]: AsIndex<L>,
+    [usize; 3]: AsShape<L>,
 {
     /// Construct a 3D tensor from a nested array.
     fn from(value: [[[T; D2]; D1]; D0]) -> Self {
@@ -2612,7 +2765,7 @@ where
             .flat_map(|y| y.iter().flat_map(|z| z.iter()))
             .cloned()
             .collect();
-        Self::from_data([D0, D1, D2].as_index(), data)
+        Self::from_data([D0, D1, D2].as_shape(), data)
     }
 }
 
@@ -2628,6 +2781,14 @@ pub struct WeaklyCheckedView<S: Storage, L: Layout> {
 }
 
 impl<T, S: Storage<Elem = T>, L: Layout> Layout for WeaklyCheckedView<S, L> {
+    type Shape<'a>
+        = L::Shape<'a>
+    where
+        Self: 'a;
+    type Strides<'a>
+        = L::Strides<'a>
+    where
+        Self: 'a;
     type Index<'a> = L::Index<'a>;
     type Indices = L::Indices;
 
@@ -2643,11 +2804,11 @@ impl<T, S: Storage<Elem = T>, L: Layout> Layout for WeaklyCheckedView<S, L> {
         self.base.len()
     }
 
-    fn shape(&self) -> Self::Index<'_> {
+    fn shape(&self) -> Self::Shape<'_> {
         self.base.shape()
     }
 
-    fn strides(&self) -> Self::Index<'_> {
+    fn strides(&self) -> Self::Strides<'_> {
         self.base.strides()
     }
 

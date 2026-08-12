@@ -1,28 +1,30 @@
 use std::arch::aarch64::{
-    float32x4_t, int8x16_t, int16x8_t, int32x4_t, uint8x16_t, uint16x8_t, uint32x4_t, vabsq_f32,
-    vaddq_f32, vaddq_s8, vaddq_s16, vaddq_s32, vaddq_u8, vaddq_u16, vaddvq_f32, vandq_u8,
-    vandq_u16, vandq_u32, vbslq_f32, vbslq_s8, vbslq_s16, vbslq_s32, vbslq_u8, vbslq_u16,
+    float16x8_t, float32x4_t, int8x16_t, int16x8_t, int32x4_t, uint8x16_t, uint16x8_t, uint32x4_t,
+    vabsq_f32, vaddq_f32, vaddq_s8, vaddq_s16, vaddq_s32, vaddq_u8, vaddq_u16, vaddvq_f32,
+    vandq_u8, vandq_u16, vandq_u32, vbslq_f32, vbslq_s8, vbslq_s16, vbslq_s32, vbslq_u8, vbslq_u16,
     vceqq_f32, vceqq_s8, vceqq_s16, vceqq_s32, vceqq_u8, vceqq_u16, vcgeq_f32, vcgeq_s8, vcgeq_s16,
     vcgeq_s32, vcgeq_u8, vcgeq_u16, vcgtq_f32, vcgtq_s8, vcgtq_s16, vcgtq_s32, vcgtq_u8, vcgtq_u16,
     vcleq_f32, vcleq_s8, vcleq_s16, vcleq_u8, vcleq_u16, vcltq_f32, vcltq_s8, vcltq_s16, vcltq_u8,
-    vcltq_u16, vcombine_s16, vcombine_s32, vcombine_u8, vcvtnq_s32_f32, vcvtq_f32_s32,
-    vcvtq_s32_f32, vdivq_f32, vdupq_laneq_f32, vdupq_n_f32, vdupq_n_s8, vdupq_n_s16, vdupq_n_s32,
-    vdupq_n_u8, vdupq_n_u16, veorq_u32, vfmaq_f32, vfmsq_f32, vget_high_s32, vget_low_s8,
-    vget_low_s16, vget_low_s32, vget_low_u8, vld1q_f32, vld1q_s8, vld1q_s16, vld1q_s32, vld1q_u8,
-    vld1q_u16, vld1q_u32, vmaxq_f32, vmaxvq_u8, vmaxvq_u16, vmaxvq_u32, vminq_f32, vminvq_u8,
-    vminvq_u16, vminvq_u32, vmovl_high_s8, vmovl_high_s16, vmovl_high_u8, vmovl_s8, vmovl_s16,
-    vmovl_u8, vmulq_f32, vmulq_s8, vmulq_s16, vmulq_s32, vmulq_u8, vmulq_u16, vmvnq_u32, vnegq_f32,
-    vnegq_s8, vnegq_s16, vnegq_s32, vorrq_u32, vqmovn_s32, vqmovun_s16, vrndnq_f32, vshlq_n_s8,
-    vshlq_n_s16, vshlq_n_s32, vshlq_n_u8, vshlq_n_u16, vshrq_n_s8, vshrq_n_s16, vshrq_n_s32,
-    vshrq_n_u8, vshrq_n_u16, vst1q_f32, vst1q_s8, vst1q_s16, vst1q_s32, vst1q_u8, vst1q_u16,
-    vsubq_f32, vsubq_s8, vsubq_s16, vsubq_s32, vsubq_u8, vsubq_u16, vzip1q_s8, vzip1q_s16,
-    vzip1q_u8, vzip2q_s8, vzip2q_s16, vzip2q_u8,
+    vcltq_u16, vcombine_s16, vcombine_s32, vcombine_u8, vcvt_f16_f32, vcvt_f32_f16,
+    vcvt_high_f16_f32, vcvt_high_f32_f16, vcvtnq_s32_f32, vcvtq_f32_s32, vcvtq_s32_f32, vdivq_f32,
+    vdupq_laneq_f32, vdupq_n_f32, vdupq_n_s8, vdupq_n_s16, vdupq_n_s32, vdupq_n_u8, vdupq_n_u16,
+    veorq_u32, vfmaq_f32, vfmsq_f32, vget_high_s32, vget_low_f16, vget_low_s8, vget_low_s16,
+    vget_low_s32, vget_low_u8, vld1q_f32, vld1q_s8, vld1q_s16, vld1q_s32, vld1q_u8, vld1q_u16,
+    vld1q_u32, vmaxq_f32, vmaxvq_u8, vmaxvq_u16, vmaxvq_u32, vminq_f32, vminvq_u8, vminvq_u16,
+    vminvq_u32, vmovl_high_s8, vmovl_high_s16, vmovl_high_u8, vmovl_s8, vmovl_s16, vmovl_u8,
+    vmulq_f32, vmulq_s8, vmulq_s16, vmulq_s32, vmulq_u8, vmulq_u16, vmvnq_u32, vnegq_f32, vnegq_s8,
+    vnegq_s16, vnegq_s32, vorrq_u32, vqmovn_s32, vqmovun_s16, vrndnq_f32, vshlq_n_s8, vshlq_n_s16,
+    vshlq_n_s32, vshlq_n_u8, vshlq_n_u16, vshrq_n_s8, vshrq_n_s16, vshrq_n_s32, vshrq_n_u8,
+    vshrq_n_u16, vst1q_f32, vst1q_s8, vst1q_s16, vst1q_s32, vst1q_u8, vst1q_u16, vsubq_f32,
+    vsubq_s8, vsubq_s16, vsubq_s32, vsubq_u8, vsubq_u16, vzip1q_s8, vzip1q_s16, vzip1q_u8,
+    vzip2q_s8, vzip2q_s16, vzip2q_u8,
 };
 use std::mem::transmute;
 
+use crate::f16;
 use crate::ops::{
-    Concat, Extend, FloatOps, IntOps, Interleave, MaskOps, NarrowSaturate, NumOps, SignedIntOps,
-    ToFloat,
+    BitOps, Concat, Extend, FloatOps, IntOps, Interleave, MaskOps, NarrowSaturate, NumOps,
+    SignedIntOps, ToFloat,
 };
 use crate::{Isa, Mask, Simd};
 
@@ -49,9 +51,17 @@ unsafe impl Isa for ArmNeonIsa {
     type U8 = uint8x16_t;
     type U16 = uint16x8_t;
     type U32 = uint32x4_t;
+    type F16 = float16x8_t;
     type Bits = int32x4_t;
 
-    fn f32(self) -> impl FloatOps<f32, Simd = Self::F32, Int = Self::I32> {
+    fn f32(
+        self,
+    ) -> impl FloatOps<f32, Simd = Self::F32, Int = Self::I32>
+    + NarrowSaturate<f32, f16, Output = Self::F16> {
+        self
+    }
+
+    fn f16(self) -> impl Extend<f16, Output = Self::F32, Simd = Self::F16> {
         self
     }
 
@@ -117,7 +127,7 @@ macro_rules! simd_ops_common {
             type Elem = <$simd as Simd>::Elem;
 
             let mask_array = Mask::to_array(mask);
-            let mut vec = Simd::to_array(<Self as NumOps<Elem>>::zero(self));
+            let mut vec = Simd::to_array(<Self as BitOps<Elem>>::zero(self));
             for i in 0..mask_array.len() {
                 if mask_array[i] {
                     vec[i] = *ptr.add(i);
@@ -137,7 +147,7 @@ macro_rules! simd_ops_common {
 
             let mask_array = Mask::to_array(mask);
             let x_array = Simd::to_array(x);
-            for i in 0..<Self as NumOps<Elem>>::len(self) {
+            for i in 0..<Self as BitOps<Elem>>::len(self) {
                 if mask_array[i] {
                     *ptr.add(i) = x_array[i];
                 }
@@ -189,9 +199,47 @@ macro_rules! simd_ops_common {
     };
 }
 
-unsafe impl NumOps<f32> for ArmNeonIsa {
+unsafe impl BitOps<f32> for ArmNeonIsa {
     simd_ops_common!(float32x4_t, uint32x4_t);
 
+    #[inline]
+    fn broadcast_lane<const LANE: i32>(self, x: float32x4_t) -> float32x4_t {
+        unsafe { vdupq_laneq_f32(x, LANE) }
+    }
+
+    #[inline]
+    fn splat(self, x: f32) -> float32x4_t {
+        unsafe { vdupq_n_f32(x) }
+    }
+
+    #[inline]
+    unsafe fn load_ptr(self, ptr: *const f32) -> float32x4_t {
+        unsafe { vld1q_f32(ptr) }
+    }
+
+    #[inline]
+    fn first_n_mask(self, n: usize) -> uint32x4_t {
+        let mask: [u32; 4] = std::array::from_fn(|i| if i < n { u32::MAX } else { 0 });
+        unsafe { vld1q_u32(mask.as_ptr()) }
+    }
+
+    #[inline]
+    fn select(
+        self,
+        x: float32x4_t,
+        y: float32x4_t,
+        mask: <float32x4_t as Simd>::Mask,
+    ) -> float32x4_t {
+        unsafe { vbslq_f32(mask, x, y) }
+    }
+
+    #[inline]
+    unsafe fn store_ptr(self, x: float32x4_t, ptr: *mut f32) {
+        unsafe { vst1q_f32(ptr, x) }
+    }
+}
+
+unsafe impl NumOps<f32> for ArmNeonIsa {
     #[inline]
     fn add(self, x: float32x4_t, y: float32x4_t) -> float32x4_t {
         unsafe { vaddq_f32(x, y) }
@@ -248,42 +296,6 @@ unsafe impl NumOps<f32> for ArmNeonIsa {
     }
 
     #[inline]
-    fn broadcast_lane<const LANE: i32>(self, x: float32x4_t) -> float32x4_t {
-        unsafe { vdupq_laneq_f32(x, LANE) }
-    }
-
-    #[inline]
-    fn splat(self, x: f32) -> float32x4_t {
-        unsafe { vdupq_n_f32(x) }
-    }
-
-    #[inline]
-    unsafe fn load_ptr(self, ptr: *const f32) -> float32x4_t {
-        unsafe { vld1q_f32(ptr) }
-    }
-
-    #[inline]
-    fn first_n_mask(self, n: usize) -> uint32x4_t {
-        let mask: [u32; 4] = std::array::from_fn(|i| if i < n { u32::MAX } else { 0 });
-        unsafe { vld1q_u32(mask.as_ptr()) }
-    }
-
-    #[inline]
-    fn select(
-        self,
-        x: float32x4_t,
-        y: float32x4_t,
-        mask: <float32x4_t as Simd>::Mask,
-    ) -> float32x4_t {
-        unsafe { vbslq_f32(mask, x, y) }
-    }
-
-    #[inline]
-    unsafe fn store_ptr(self, x: float32x4_t, ptr: *mut f32) {
-        unsafe { vst1q_f32(ptr, x) }
-    }
-
-    #[inline]
     fn sum(self, x: float32x4_t) -> f32 {
         unsafe { vaddvq_f32(x) }
     }
@@ -328,42 +340,12 @@ impl FloatOps<f32> for ArmNeonIsa {
     }
 }
 
-unsafe impl NumOps<i32> for ArmNeonIsa {
+unsafe impl BitOps<i32> for ArmNeonIsa {
     simd_ops_common!(int32x4_t, uint32x4_t);
-
-    #[inline]
-    fn add(self, x: int32x4_t, y: int32x4_t) -> int32x4_t {
-        unsafe { vaddq_s32(x, y) }
-    }
-
-    #[inline]
-    fn sub(self, x: int32x4_t, y: int32x4_t) -> int32x4_t {
-        unsafe { vsubq_s32(x, y) }
-    }
-
-    #[inline]
-    fn mul(self, x: int32x4_t, y: int32x4_t) -> int32x4_t {
-        unsafe { vmulq_s32(x, y) }
-    }
 
     #[inline]
     fn splat(self, x: i32) -> int32x4_t {
         unsafe { vdupq_n_s32(x) }
-    }
-
-    #[inline]
-    fn eq(self, x: int32x4_t, y: int32x4_t) -> uint32x4_t {
-        unsafe { vceqq_s32(x, y) }
-    }
-
-    #[inline]
-    fn ge(self, x: int32x4_t, y: int32x4_t) -> uint32x4_t {
-        unsafe { vcgeq_s32(x, y) }
-    }
-
-    #[inline]
-    fn gt(self, x: int32x4_t, y: int32x4_t) -> uint32x4_t {
-        unsafe { vcgtq_s32(x, y) }
     }
 
     #[inline]
@@ -385,6 +367,38 @@ unsafe impl NumOps<i32> for ArmNeonIsa {
     #[inline]
     unsafe fn store_ptr(self, x: int32x4_t, ptr: *mut i32) {
         unsafe { vst1q_s32(ptr, x) }
+    }
+}
+
+unsafe impl NumOps<i32> for ArmNeonIsa {
+    #[inline]
+    fn add(self, x: int32x4_t, y: int32x4_t) -> int32x4_t {
+        unsafe { vaddq_s32(x, y) }
+    }
+
+    #[inline]
+    fn sub(self, x: int32x4_t, y: int32x4_t) -> int32x4_t {
+        unsafe { vsubq_s32(x, y) }
+    }
+
+    #[inline]
+    fn mul(self, x: int32x4_t, y: int32x4_t) -> int32x4_t {
+        unsafe { vmulq_s32(x, y) }
+    }
+
+    #[inline]
+    fn eq(self, x: int32x4_t, y: int32x4_t) -> uint32x4_t {
+        unsafe { vceqq_s32(x, y) }
+    }
+
+    #[inline]
+    fn ge(self, x: int32x4_t, y: int32x4_t) -> uint32x4_t {
+        unsafe { vcgeq_s32(x, y) }
+    }
+
+    #[inline]
+    fn gt(self, x: int32x4_t, y: int32x4_t) -> uint32x4_t {
+        unsafe { vcgtq_s32(x, y) }
     }
 }
 
@@ -462,9 +476,37 @@ impl NarrowSaturate<i16, u8> for ArmNeonIsa {
     }
 }
 
-unsafe impl NumOps<i16> for ArmNeonIsa {
+unsafe impl BitOps<i16> for ArmNeonIsa {
     simd_ops_common!(int16x8_t, uint16x8_t);
 
+    #[inline]
+    fn splat(self, x: i16) -> int16x8_t {
+        unsafe { vdupq_n_s16(x) }
+    }
+
+    #[inline]
+    unsafe fn load_ptr(self, ptr: *const i16) -> int16x8_t {
+        unsafe { vld1q_s16(ptr) }
+    }
+
+    #[inline]
+    fn first_n_mask(self, n: usize) -> uint16x8_t {
+        let mask: [u16; 8] = std::array::from_fn(|i| if i < n { u16::MAX } else { 0 });
+        unsafe { vld1q_u16(mask.as_ptr()) }
+    }
+
+    #[inline]
+    fn select(self, x: int16x8_t, y: int16x8_t, mask: <int16x8_t as Simd>::Mask) -> int16x8_t {
+        unsafe { vbslq_s16(mask, x, y) }
+    }
+
+    #[inline]
+    unsafe fn store_ptr(self, x: int16x8_t, ptr: *mut i16) {
+        unsafe { vst1q_s16(ptr, x) }
+    }
+}
+
+unsafe impl NumOps<i16> for ArmNeonIsa {
     #[inline]
     fn add(self, x: int16x8_t, y: int16x8_t) -> int16x8_t {
         unsafe { vaddq_s16(x, y) }
@@ -478,11 +520,6 @@ unsafe impl NumOps<i16> for ArmNeonIsa {
     #[inline]
     fn mul(self, x: int16x8_t, y: int16x8_t) -> int16x8_t {
         unsafe { vmulq_s16(x, y) }
-    }
-
-    #[inline]
-    fn splat(self, x: i16) -> int16x8_t {
-        unsafe { vdupq_n_s16(x) }
     }
 
     #[inline]
@@ -509,27 +546,6 @@ unsafe impl NumOps<i16> for ArmNeonIsa {
     fn gt(self, x: int16x8_t, y: int16x8_t) -> uint16x8_t {
         unsafe { vcgtq_s16(x, y) }
     }
-
-    #[inline]
-    unsafe fn load_ptr(self, ptr: *const i16) -> int16x8_t {
-        unsafe { vld1q_s16(ptr) }
-    }
-
-    #[inline]
-    fn first_n_mask(self, n: usize) -> uint16x8_t {
-        let mask: [u16; 8] = std::array::from_fn(|i| if i < n { u16::MAX } else { 0 });
-        unsafe { vld1q_u16(mask.as_ptr()) }
-    }
-
-    #[inline]
-    fn select(self, x: int16x8_t, y: int16x8_t, mask: <int16x8_t as Simd>::Mask) -> int16x8_t {
-        unsafe { vbslq_s16(mask, x, y) }
-    }
-
-    #[inline]
-    unsafe fn store_ptr(self, x: int16x8_t, ptr: *mut i16) {
-        unsafe { vst1q_s16(ptr, x) }
-    }
 }
 
 impl IntOps<i16> for ArmNeonIsa {
@@ -555,12 +571,13 @@ impl Extend<i16> for ArmNeonIsa {
     type Output = int32x4_t;
 
     #[inline]
-    fn extend(self, x: int16x8_t) -> (int32x4_t, int32x4_t) {
-        unsafe {
-            let low = vmovl_s16(vget_low_s16(x));
-            let high = vmovl_high_s16(x);
-            (low, high)
-        }
+    fn extend_low(self, x: int16x8_t) -> int32x4_t {
+        unsafe { vmovl_s16(vget_low_s16(x)) }
+    }
+
+    #[inline]
+    fn extend_high(self, x: int16x8_t) -> int32x4_t {
+        unsafe { vmovl_high_s16(x) }
     }
 }
 
@@ -576,9 +593,37 @@ impl Interleave<i16> for ArmNeonIsa {
     }
 }
 
-unsafe impl NumOps<i8> for ArmNeonIsa {
+unsafe impl BitOps<i8> for ArmNeonIsa {
     simd_ops_common!(int8x16_t, uint8x16_t);
 
+    #[inline]
+    fn splat(self, x: i8) -> int8x16_t {
+        unsafe { vdupq_n_s8(x) }
+    }
+
+    #[inline]
+    unsafe fn load_ptr(self, ptr: *const i8) -> int8x16_t {
+        unsafe { vld1q_s8(ptr) }
+    }
+
+    #[inline]
+    fn first_n_mask(self, n: usize) -> uint8x16_t {
+        let mask: [u8; 16] = std::array::from_fn(|i| if i < n { u8::MAX } else { 0 });
+        unsafe { vld1q_u8(mask.as_ptr()) }
+    }
+
+    #[inline]
+    fn select(self, x: int8x16_t, y: int8x16_t, mask: <int8x16_t as Simd>::Mask) -> int8x16_t {
+        unsafe { vbslq_s8(mask, x, y) }
+    }
+
+    #[inline]
+    unsafe fn store_ptr(self, x: int8x16_t, ptr: *mut i8) {
+        unsafe { vst1q_s8(ptr, x) }
+    }
+}
+
+unsafe impl NumOps<i8> for ArmNeonIsa {
     #[inline]
     fn add(self, x: int8x16_t, y: int8x16_t) -> int8x16_t {
         unsafe { vaddq_s8(x, y) }
@@ -592,11 +637,6 @@ unsafe impl NumOps<i8> for ArmNeonIsa {
     #[inline]
     fn mul(self, x: int8x16_t, y: int8x16_t) -> int8x16_t {
         unsafe { vmulq_s8(x, y) }
-    }
-
-    #[inline]
-    fn splat(self, x: i8) -> int8x16_t {
-        unsafe { vdupq_n_s8(x) }
     }
 
     #[inline]
@@ -623,27 +663,6 @@ unsafe impl NumOps<i8> for ArmNeonIsa {
     fn gt(self, x: int8x16_t, y: int8x16_t) -> uint8x16_t {
         unsafe { vcgtq_s8(x, y) }
     }
-
-    #[inline]
-    unsafe fn load_ptr(self, ptr: *const i8) -> int8x16_t {
-        unsafe { vld1q_s8(ptr) }
-    }
-
-    #[inline]
-    fn first_n_mask(self, n: usize) -> uint8x16_t {
-        let mask: [u8; 16] = std::array::from_fn(|i| if i < n { u8::MAX } else { 0 });
-        unsafe { vld1q_u8(mask.as_ptr()) }
-    }
-
-    #[inline]
-    fn select(self, x: int8x16_t, y: int8x16_t, mask: <int8x16_t as Simd>::Mask) -> int8x16_t {
-        unsafe { vbslq_s8(mask, x, y) }
-    }
-
-    #[inline]
-    unsafe fn store_ptr(self, x: int8x16_t, ptr: *mut i8) {
-        unsafe { vst1q_s8(ptr, x) }
-    }
 }
 
 impl IntOps<i8> for ArmNeonIsa {
@@ -669,12 +688,13 @@ impl Extend<i8> for ArmNeonIsa {
     type Output = int16x8_t;
 
     #[inline]
-    fn extend(self, x: int8x16_t) -> (int16x8_t, int16x8_t) {
-        unsafe {
-            let low = vmovl_s8(vget_low_s8(x));
-            let high = vmovl_high_s8(x);
-            (low, high)
-        }
+    fn extend_low(self, x: int8x16_t) -> int16x8_t {
+        unsafe { vmovl_s8(vget_low_s8(x)) }
+    }
+
+    #[inline]
+    fn extend_high(self, x: int8x16_t) -> int16x8_t {
+        unsafe { vmovl_high_s8(x) }
     }
 }
 
@@ -690,9 +710,37 @@ impl Interleave<i8> for ArmNeonIsa {
     }
 }
 
-unsafe impl NumOps<u8> for ArmNeonIsa {
+unsafe impl BitOps<u8> for ArmNeonIsa {
     simd_ops_common!(uint8x16_t, uint8x16_t);
 
+    #[inline]
+    fn splat(self, x: u8) -> uint8x16_t {
+        unsafe { vdupq_n_u8(x) }
+    }
+
+    #[inline]
+    unsafe fn load_ptr(self, ptr: *const u8) -> uint8x16_t {
+        unsafe { vld1q_u8(ptr) }
+    }
+
+    #[inline]
+    fn first_n_mask(self, n: usize) -> uint8x16_t {
+        let mask: [u8; 16] = std::array::from_fn(|i| if i < n { u8::MAX } else { 0 });
+        unsafe { vld1q_u8(mask.as_ptr()) }
+    }
+
+    #[inline]
+    fn select(self, x: uint8x16_t, y: uint8x16_t, mask: <uint8x16_t as Simd>::Mask) -> uint8x16_t {
+        unsafe { vbslq_u8(mask, x, y) }
+    }
+
+    #[inline]
+    unsafe fn store_ptr(self, x: uint8x16_t, ptr: *mut u8) {
+        unsafe { vst1q_u8(ptr, x) }
+    }
+}
+
+unsafe impl NumOps<u8> for ArmNeonIsa {
     #[inline]
     fn add(self, x: uint8x16_t, y: uint8x16_t) -> uint8x16_t {
         unsafe { vaddq_u8(x, y) }
@@ -706,11 +754,6 @@ unsafe impl NumOps<u8> for ArmNeonIsa {
     #[inline]
     fn mul(self, x: uint8x16_t, y: uint8x16_t) -> uint8x16_t {
         unsafe { vmulq_u8(x, y) }
-    }
-
-    #[inline]
-    fn splat(self, x: u8) -> uint8x16_t {
-        unsafe { vdupq_n_u8(x) }
     }
 
     #[inline]
@@ -737,39 +780,19 @@ unsafe impl NumOps<u8> for ArmNeonIsa {
     fn gt(self, x: uint8x16_t, y: uint8x16_t) -> uint8x16_t {
         unsafe { vcgtq_u8(x, y) }
     }
-
-    #[inline]
-    unsafe fn load_ptr(self, ptr: *const u8) -> uint8x16_t {
-        unsafe { vld1q_u8(ptr) }
-    }
-
-    #[inline]
-    fn first_n_mask(self, n: usize) -> uint8x16_t {
-        let mask: [u8; 16] = std::array::from_fn(|i| if i < n { u8::MAX } else { 0 });
-        unsafe { vld1q_u8(mask.as_ptr()) }
-    }
-
-    #[inline]
-    fn select(self, x: uint8x16_t, y: uint8x16_t, mask: <uint8x16_t as Simd>::Mask) -> uint8x16_t {
-        unsafe { vbslq_u8(mask, x, y) }
-    }
-
-    #[inline]
-    unsafe fn store_ptr(self, x: uint8x16_t, ptr: *mut u8) {
-        unsafe { vst1q_u8(ptr, x) }
-    }
 }
 
 impl Extend<u8> for ArmNeonIsa {
     type Output = uint16x8_t;
 
     #[inline]
-    fn extend(self, x: uint8x16_t) -> (uint16x8_t, uint16x8_t) {
-        unsafe {
-            let low = vmovl_u8(vget_low_u8(x));
-            let high = vmovl_high_u8(x);
-            (low, high)
-        }
+    fn extend_low(self, x: uint8x16_t) -> uint16x8_t {
+        unsafe { vmovl_u8(vget_low_u8(x)) }
+    }
+
+    #[inline]
+    fn extend_high(self, x: uint8x16_t) -> uint16x8_t {
+        unsafe { vmovl_high_u8(x) }
     }
 }
 
@@ -797,9 +820,37 @@ impl Interleave<u8> for ArmNeonIsa {
     }
 }
 
-unsafe impl NumOps<u16> for ArmNeonIsa {
+unsafe impl BitOps<u16> for ArmNeonIsa {
     simd_ops_common!(uint16x8_t, uint16x8_t);
 
+    #[inline]
+    fn splat(self, x: u16) -> uint16x8_t {
+        unsafe { vdupq_n_u16(x) }
+    }
+
+    #[inline]
+    unsafe fn load_ptr(self, ptr: *const u16) -> uint16x8_t {
+        unsafe { vld1q_u16(ptr) }
+    }
+
+    #[inline]
+    fn first_n_mask(self, n: usize) -> uint16x8_t {
+        let mask: [u16; 8] = std::array::from_fn(|i| if i < n { u16::MAX } else { 0 });
+        unsafe { vld1q_u16(mask.as_ptr()) }
+    }
+
+    #[inline]
+    fn select(self, x: uint16x8_t, y: uint16x8_t, mask: <uint16x8_t as Simd>::Mask) -> uint16x8_t {
+        unsafe { vbslq_u16(mask, x, y) }
+    }
+
+    #[inline]
+    unsafe fn store_ptr(self, x: uint16x8_t, ptr: *mut u16) {
+        unsafe { vst1q_u16(ptr, x) }
+    }
+}
+
+unsafe impl NumOps<u16> for ArmNeonIsa {
     #[inline]
     fn add(self, x: uint16x8_t, y: uint16x8_t) -> uint16x8_t {
         unsafe { vaddq_u16(x, y) }
@@ -813,11 +864,6 @@ unsafe impl NumOps<u16> for ArmNeonIsa {
     #[inline]
     fn mul(self, x: uint16x8_t, y: uint16x8_t) -> uint16x8_t {
         unsafe { vmulq_u16(x, y) }
-    }
-
-    #[inline]
-    fn splat(self, x: u16) -> uint16x8_t {
-        unsafe { vdupq_n_u16(x) }
     }
 
     #[inline]
@@ -843,27 +889,6 @@ unsafe impl NumOps<u16> for ArmNeonIsa {
     #[inline]
     fn gt(self, x: uint16x8_t, y: uint16x8_t) -> uint16x8_t {
         unsafe { vcgtq_u16(x, y) }
-    }
-
-    #[inline]
-    unsafe fn load_ptr(self, ptr: *const u16) -> uint16x8_t {
-        unsafe { vld1q_u16(ptr) }
-    }
-
-    #[inline]
-    fn first_n_mask(self, n: usize) -> uint16x8_t {
-        let mask: [u16; 8] = std::array::from_fn(|i| if i < n { u16::MAX } else { 0 });
-        unsafe { vld1q_u16(mask.as_ptr()) }
-    }
-
-    #[inline]
-    fn select(self, x: uint16x8_t, y: uint16x8_t, mask: <uint16x8_t as Simd>::Mask) -> uint16x8_t {
-        unsafe { vbslq_u16(mask, x, y) }
-    }
-
-    #[inline]
-    unsafe fn store_ptr(self, x: uint16x8_t, ptr: *mut u16) {
-        unsafe { vst1q_u16(ptr, x) }
     }
 }
 
@@ -977,6 +1002,71 @@ macro_rules! simd_common {
     };
 }
 
+unsafe impl BitOps<f16> for ArmNeonIsa {
+    simd_ops_common!(float16x8_t, uint16x8_t);
+
+    #[inline]
+    fn splat(self, x: f16) -> float16x8_t {
+        unsafe { transmute::<uint16x8_t, float16x8_t>(vdupq_n_u16(x.to_bits())) }
+    }
+
+    #[inline]
+    unsafe fn load_ptr(self, ptr: *const f16) -> float16x8_t {
+        unsafe { transmute::<uint16x8_t, float16x8_t>(vld1q_u16(ptr as *const u16)) }
+    }
+
+    #[inline]
+    fn first_n_mask(self, n: usize) -> uint16x8_t {
+        let mask: [u16; 8] = std::array::from_fn(|i| if i < n { u16::MAX } else { 0 });
+        unsafe { vld1q_u16(mask.as_ptr()) }
+    }
+
+    #[inline]
+    fn select(
+        self,
+        x: float16x8_t,
+        y: float16x8_t,
+        mask: <float16x8_t as Simd>::Mask,
+    ) -> float16x8_t {
+        unsafe {
+            let x = transmute::<float16x8_t, uint16x8_t>(x);
+            let y = transmute::<float16x8_t, uint16x8_t>(y);
+            transmute::<uint16x8_t, float16x8_t>(vbslq_u16(mask, x, y))
+        }
+    }
+
+    #[inline]
+    unsafe fn store_ptr(self, x: float16x8_t, ptr: *mut f16) {
+        unsafe { vst1q_u16(ptr as *mut u16, transmute::<float16x8_t, uint16x8_t>(x)) }
+    }
+}
+
+impl Extend<f16> for ArmNeonIsa {
+    type Output = float32x4_t;
+
+    #[inline]
+    fn extend_low(self, x: float16x8_t) -> float32x4_t {
+        unsafe { vcvt_f32_f16(vget_low_f16(x)) }
+    }
+
+    #[inline]
+    fn extend_high(self, x: float16x8_t) -> float32x4_t {
+        unsafe { vcvt_high_f32_f16(x) }
+    }
+}
+
+impl NarrowSaturate<f32, f16> for ArmNeonIsa {
+    type Output = float16x8_t;
+
+    #[inline]
+    fn narrow_saturate(self, low: float32x4_t, high: float32x4_t) -> float16x8_t {
+        unsafe {
+            let low = vcvt_f16_f32(low);
+            vcvt_high_f16_f32(low, high)
+        }
+    }
+}
+
 macro_rules! impl_simd {
     ($simd:ident, $elem:ty, $len:expr, $mask:ty) => {
         impl Simd for $simd {
@@ -988,6 +1078,7 @@ macro_rules! impl_simd {
 }
 
 impl_simd!(float32x4_t, f32, 4, uint32x4_t);
+impl_simd!(float16x8_t, f16, 8, uint16x8_t);
 impl_simd!(int32x4_t, i32, 4, uint32x4_t);
 impl_simd!(int16x8_t, i16, 8, uint16x8_t);
 impl_simd!(int8x16_t, i8, 16, uint8x16_t);

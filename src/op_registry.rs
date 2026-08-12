@@ -113,7 +113,7 @@ pub enum ReadOpError {
 }
 
 impl ReadOpError {
-    fn attr_error(attr: impl AsRef<str>, error: impl AsRef<str>) -> Self {
+    pub(crate) fn attr_error(attr: impl AsRef<str>, error: impl AsRef<str>) -> Self {
         Self::AttrError {
             attr: attr.as_ref().to_string(),
             error: error.as_ref().to_string(),
@@ -234,6 +234,7 @@ pub mod op_types {
     declare_op!(ConvTranspose);
     declare_op!(Cos);
     declare_op!(CumSum);
+    declare_op!(DFT, feature = "fft");
     declare_op!(DequantizeLinear);
     declare_op!(DepthToSpace);
     declare_op!(Div);
@@ -272,6 +273,7 @@ pub mod op_types {
     declare_op!(Log);
     declare_op!(LogSoftmax);
     declare_op!(Loop);
+    declare_op!(LpNormalization);
     declare_op!(LSTM);
     declare_op!(MatMul);
     declare_op!(MatMulInteger);
@@ -281,6 +283,7 @@ pub mod op_types {
     declare_op!(Min);
     declare_op!(Mod);
     declare_op!(Mul);
+    declare_op!(Multinomial, feature = "random");
     declare_op!(Neg);
     declare_op!(NonMaxSuppression);
     declare_op!(NonZero);
@@ -298,6 +301,8 @@ pub mod op_types {
     declare_op!(Range);
     declare_op!(Reciprocal);
     declare_op!(ReduceL2);
+    declare_op!(ReduceLogSum);
+    declare_op!(ReduceLogSumExp);
     declare_op!(ReduceMax);
     declare_op!(ReduceMean);
     declare_op!(ReduceMin);
@@ -307,7 +312,10 @@ pub mod op_types {
     declare_op!(Relu);
     declare_op!(Reshape);
     declare_op!(Resize);
+    declare_op!(ReverseSequence);
+    declare_op!(RotaryEmbedding);
     declare_op!(Round);
+    declare_op!(Scatter);
     declare_op!(ScatterElements);
     declare_op!(ScatterND);
     declare_op!(SequenceAt);
@@ -338,6 +346,7 @@ pub mod op_types {
     declare_op!(Transpose);
     declare_op!(Trilu);
     declare_op!(Unsqueeze);
+    declare_op!(Upsample);
     declare_op!(Where);
     declare_op!(Xor);
 }

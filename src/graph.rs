@@ -16,7 +16,9 @@ use smallvec::SmallVec;
 
 use crate::buffer_pool::BufferPool;
 use crate::env::env_flag;
-use crate::operator::{InputList, OpRunContext, Operator, OutputList, PrepackedInput};
+use crate::operator::{
+    InPlaceInputs, InputList, OpRunContext, Operator, OutputList, PrepackedInput,
+};
 use crate::threading;
 use crate::timing::{Instant, ProfileFormat, Profiler, TimingFilter, TimingRecord, TimingSort};
 use crate::value::{Value, ValueMeta, ValueOrView, ValueType, ValueView};
@@ -296,6 +298,22 @@ impl Graph {
     /// This does not include transitive captures in subgraphs.
     pub fn captures(&self) -> &[NodeId] {
         &self.captures
+    }
+
+    /// Return the IDs of value nodes in this graph that are captured by name
+    /// by a nested subgraph (eg. the body of an `If` or `Loop` operator).
+    pub(crate) fn subgraph_capture_value_ids(&self) -> FxHashSet<NodeId> {
+        let mut ids = FxHashSet::default();
+        for node in self.nodes.values() {
+            if let Node::Operator(op) = node {
+                for name in op.capture_names() {
+                    if let Some(id) = self.get_node_id(name) {
+                        ids.insert(id);
+                    }
+                }
+            }
+        }
+        ids
     }
 
     /// Remove nodes from the graph.
@@ -613,6 +631,28 @@ impl Graph {
         self.nodes.get_mut(&id)
     }
 
+    /// Mark an operator output as unused.
+    ///
+    /// This allows the operator to skip computing the output when the graph is
+    /// run.
+    ///
+    /// Returns the ID of the value node which was previously produced at this
+    /// position, if any. Note this node is not automatically removed from the
+    /// graph.
+    pub fn clear_operator_output(&mut self, op_id: NodeId, index: usize) -> Option<NodeId> {
+        let Some(Node::Operator(op_node)) = self.get_node_mut(op_id) else {
+            panic!("operator node not found");
+        };
+        let output_id = op_node.clear_output(index)?;
+
+        if self.source_ids.get(&output_id) == Some(&op_id) {
+            self.source_ids.remove(&output_id);
+        }
+        self.clear_cached_plan();
+
+        Some(output_id)
+    }
+
     /// Replace an operator input with a different value or constant.
     pub fn replace_input(&mut self, op_id: NodeId, old_input_id: NodeId, new_input_id: NodeId) {
         let Some(Node::Operator(op_node)) = self.get_node_mut(op_id) else {
@@ -680,6 +720,74 @@ impl Graph {
         self.create_plan(inputs, outputs, opts)
     }
 
+    /// Check that supplied input values match the shape and dtype specified
+    /// in the graph's metadata for the input node.
+    ///
+    /// Symbolic dimensions in the expected shape can match any size.
+    fn validate_inputs(&self, inputs: &[(NodeId, ValueOrView)]) -> Result<(), RunError> {
+        let error = |node_id: NodeId, error: String| -> RunError {
+            RunErrorImpl::InvalidInput {
+                name: self.node_name(node_id),
+                error,
+            }
+            .into()
+        };
+
+        for (node_id, input) in inputs {
+            let Some(Node::Value(value_node)) = self.get_node(*node_id) else {
+                continue;
+            };
+            let value = input.as_view();
+
+            if let Some(expected_dtype) = value_node.dtype() {
+                let dtype = value.dtype();
+                if dtype != expected_dtype {
+                    return Err(error(
+                        *node_id,
+                        format!("expected type {} but got {}", expected_dtype, dtype),
+                    ));
+                }
+            }
+
+            // Shape metadata describes tensor inputs. Sequences don't have a
+            // shape of their own.
+            if matches!(value, ValueView::Sequence(_)) {
+                continue;
+            }
+
+            let Some(expected_shape) = value_node.shape() else {
+                continue;
+            };
+
+            let shape = value.shape();
+            if shape.len() != expected_shape.len() {
+                return Err(error(
+                    *node_id,
+                    format!(
+                        "expected tensor with {} dims but got {}",
+                        expected_shape.len(),
+                        shape.len()
+                    ),
+                ));
+            }
+            for (dim, (expected_size, size)) in expected_shape.iter().zip(shape.iter()).enumerate()
+            {
+                if let Dimension::Fixed(expected_size) = expected_size
+                    && expected_size != size
+                {
+                    return Err(error(
+                        *node_id,
+                        format!(
+                            "expected dim {} to have size {} but got {}",
+                            dim, expected_size, size
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Compute a set of output values given a set of inputs, using the
     /// processing steps and constant values defined by the graph.
     pub fn run(
@@ -689,6 +797,7 @@ impl Graph {
         weight_cache: Option<&WeightCache>,
         opts: Option<RunOptions>,
     ) -> Result<Vec<Value>, RunError> {
+        self.validate_inputs(&inputs)?;
         let input_ids: Vec<_> = inputs.iter().map(|(node_id, _)| *node_id).collect();
         let plan = self.get_cached_plan(&input_ids, outputs, false /* is_subgraph */)?;
         let opts = opts.unwrap_or_default();
@@ -877,36 +986,62 @@ impl Graph {
                 );
             };
 
-            // Choose the input that we'll try to modify in-place to avoid
-            // allocating a new buffer for the output. This will be passed as
-            // the first input to `Operator::run_in_place`.
+            // Choose the inputs that we'll try to modify in-place to avoid
+            // allocating new buffers for the outputs.
             //
-            // For non-commutative ops we have to use the first input. For
-            // commutative ops we can swap inputs around if that enables us to
-            // run an op in place.
-            let try_in_place_input_id = if op_node.operator().can_run_in_place() {
-                if op_node.operator().is_commutative() {
-                    // Pick the largest input by number of elements. This
-                    // assumes that commutative op outputs will have a shape
-                    // that matches their largest input (eg. consider a
-                    // binary op that broadcasts inputs to a common shape).
-                    op_node
-                        .input_ids()
-                        .iter()
-                        .max_by_key(|input_id| {
-                            input_id
-                                .and_then(|id| temp_values.get(id))
-                                .map(|val| val.len())
-                                .unwrap_or(0)
-                        })
-                        .copied()
-                        .flatten()
-                } else {
-                    op_node.input_ids().first().copied().flatten()
-                }
+            // For non-commutative ops we use the specific inputs which the
+            // operator reports it can modify. For commutative ops we can swap
+            // inputs around, so we pick the largest input.
+            let in_place_inputs = op_node.operator().in_place_inputs();
+            let in_place_candidates: SmallVec<[(usize, NodeId); 2]> = if in_place_inputs.is_empty()
+            {
+                SmallVec::new()
+            } else if op_node.operator().is_commutative() {
+                // Commutative ops declare a single in-place input, but any
+                // input can be used. Pick the largest by number of elements.
+                // This assumes that commutative op outputs will have a shape
+                // that matches their largest input (eg. consider a binary op
+                // that broadcasts inputs to a common shape).
+                op_node
+                    .input_ids()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(pos, id)| id.map(|id| (pos, id)))
+                    .max_by_key(|(_pos, id)| temp_values.get(*id).map(|val| val.len()).unwrap_or(0))
+                    .into_iter()
+                    .collect()
             } else {
-                None
+                in_place_inputs
+                    .iter()
+                    .filter_map(|index| {
+                        let pos = index as usize;
+                        op_node
+                            .input_ids()
+                            .get(pos)
+                            .copied()
+                            .flatten()
+                            .map(|id| (pos, id))
+                    })
+                    .collect()
             };
+
+            // Only run in-place if all of the in-place inputs are available to
+            // take as owned values. This simplifies the cases that
+            // `Operator::run_in_place` implementations have to handle.
+            let run_in_place = !in_place_candidates.is_empty()
+                && in_place_candidates.iter().all(|&(_pos, id)| {
+                    temp_value_refcount.count(id) == 1
+                        && (temp_values.get(id).is_some()
+                            || (self.captures.contains(&id)
+                                && self
+                                    .nodes
+                                    .get(&id)
+                                    .and_then(|n| n.name())
+                                    .and_then(|name| {
+                                        captures.as_ref().map(|c| c.can_take_input(name))
+                                    })
+                                    .unwrap_or(false)))
+                });
 
             // Take a value for passing to an operator as an owned value, if
             // it won't be needed by other operators in future.
@@ -925,15 +1060,14 @@ impl Graph {
                 }
             };
 
-            // If the operator can run in place, try to get the owned tensor to
-            // use as an output. This requires that the tensor is not a constant
-            // (eg. weights) and is not going to be used by other ops in future.
-            let in_place_input: Option<(NodeId, Value)> = if let Some(id) = try_in_place_input_id
-                && let Some(value) = take_value(id)
-            {
-                Some((id, value))
+            // Take the in-place inputs as owned values.
+            let in_place_taken: SmallVec<[(usize, NodeId, Value); 2]> = if run_in_place {
+                in_place_candidates
+                    .iter()
+                    .map(|&(pos, id)| (pos, id, take_value(id).expect("input is available")))
+                    .collect()
             } else {
-                None
+                SmallVec::new()
             };
 
             // Extract values used by the operator's subgraphs which can be
@@ -955,16 +1089,18 @@ impl Graph {
             // Collect all or remaining inputs for the operator
             let mut op_inputs: SmallVec<[Option<ValueView>; 4]> =
                 SmallVec::with_capacity(op_node.input_ids().len());
-            for node_id in op_node.input_ids().iter() {
-                if let Some(node_id) = node_id {
-                    if let Some((id, _value)) = &in_place_input
-                        && node_id == id
-                    {
-                        // This input is being passed separately as a mutable
-                        // value.
-                        continue;
-                    }
+            for (pos, node_id) in op_node.input_ids().iter().enumerate() {
+                if in_place_taken
+                    .iter()
+                    .any(|(taken_pos, ..)| *taken_pos == pos)
+                {
+                    // This input is being passed separately as a mutable value,
+                    // so leave a `None` placeholder in its position.
+                    op_inputs.push(None);
+                    continue;
+                }
 
+                if let Some(node_id) = node_id {
                     if let Some(value) = get_value_from_constant_or_input(*node_id) {
                         op_inputs.push(Some(value));
                     } else if let Some(value) = temp_values.get(*node_id) {
@@ -988,22 +1124,26 @@ impl Graph {
 
             // Collect input metadata if we'll need it for timing or logging.
             let input_meta = if opts.timing_by_shape || opts.verbose {
-                // Record the input value IDs and metadata together here because
-                // inputs may be reordered if the operator is commutative.
-                let mut meta: Vec<(Option<NodeId>, Option<ValueMeta>)> = Vec::new();
-                if let Some((id, value)) = &in_place_input {
-                    meta.push((Some(*id), Some(value.to_meta())));
-                }
-                for (id, input) in op_node
+                // `op_inputs` has a `None` placeholder at each in-place input's
+                // position, so fill in the metadata for those inputs separately.
+                op_node
                     .input_ids()
                     .iter()
                     .copied()
-                    .filter(|id| *id != in_place_input.as_ref().map(|(id, _value)| *id))
+                    .enumerate()
                     .zip(&op_inputs)
-                {
-                    meta.push((id, input.as_ref().map(|i| i.to_meta())))
-                }
-                meta
+                    .map(|((pos, id), input)| {
+                        let meta = if let Some((.., value)) = in_place_taken
+                            .iter()
+                            .find(|(taken_pos, ..)| *taken_pos == pos)
+                        {
+                            Some(value.to_meta())
+                        } else {
+                            input.as_ref().map(|i| i.to_meta())
+                        };
+                        (id, meta)
+                    })
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -1017,28 +1157,31 @@ impl Graph {
                     .flatten()
                     .and_then(|node_id| weight_cache.and_then(|wc| wc.get(node_id)))
             };
-            let inputs = InputList::from_optional(&op_inputs)
-                .with_prepacked(&get_prepacked)
-                .with_first_input_omitted(in_place_input.is_some());
-            let mut ctx = OpRunContext::new(pool, &inputs);
+            let inputs = InputList::from_optional(&op_inputs).with_prepacked(&get_prepacked);
+            let mut ctx = OpRunContext::new(pool, &inputs, op_node.output_mask());
             ctx.set_name(op_node.name());
-            ctx.set_num_outputs(op_node.output_ids().len() as u32);
 
-            let op_result = if let Some((_id, value)) = in_place_input {
-                let input_dtype = value.dtype();
-                let input_shape = value.shape();
+            let op_result = if !in_place_taken.is_empty() {
+                // Record the metadata of the in-place inputs before they are
+                // moved into the operator, for use in error messages.
+                let in_place_metas: SmallVec<[(usize, ValueMeta); 2]> = in_place_taken
+                    .iter()
+                    .map(|(pos, _id, value)| (*pos, value.to_meta()))
+                    .collect();
+                let in_place = InPlaceInputs::from_iter(
+                    in_place_taken
+                        .into_iter()
+                        .map(|(pos, _id, value)| (pos, value)),
+                );
                 op_node
                     .operator()
-                    .run_in_place(value, &ctx)
-                    .map(|out| [out].into())
+                    .run_in_place(in_place, &ctx)
                     .map_err(|e| {
-                        // The error here is currently missing information about operator inputs.
                         RunError::in_place_op_error(
                             op_node.name().unwrap_or_default(),
                             e,
                             &ctx,
-                            input_dtype,
-                            &input_shape,
+                            &in_place_metas,
                         )
                     })
             } else if let Some(subgraph_op) = subgraph_op {
@@ -1076,7 +1219,13 @@ impl Graph {
 
             // Extract outputs or fail if an error occurred.
             let outputs = op_result?;
-            let expected_num_outputs = op_node.output_ids().len();
+
+            // Get expected output count, ignoring trailing unused outputs.
+            let expected_num_outputs = op_node
+                .output_ids()
+                .iter()
+                .rposition(|id| id.is_some())
+                .map_or(0, |index| index + 1);
             if expected_num_outputs > outputs.len() {
                 return Err(RunErrorImpl::OutputMismatch {
                     name: op_node.name().unwrap_or_default().to_string(),
@@ -1094,7 +1243,7 @@ impl Graph {
                 op_node
                     .output_ids()
                     .iter()
-                    .zip(outputs.into_iter())
+                    .zip(outputs)
                     .filter_map(|(output_id, output)| output_id.map(|id| (id, output))),
             );
 
@@ -1217,6 +1366,7 @@ impl Graph {
         outputs: &[NodeId],
         opts: Option<RunOptions>,
     ) -> Result<Vec<(NodeId, Value)>, RunError> {
+        self.validate_inputs(&inputs)?;
         let input_ids: Vec<_> = inputs.iter().map(|(id, _)| id).copied().collect();
         let planner = Planner::with_graph(self);
         let plan = planner.create_plan(

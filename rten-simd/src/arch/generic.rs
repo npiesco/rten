@@ -1,9 +1,10 @@
 use std::array;
 use std::mem::transmute;
 
+use crate::f16;
 use crate::ops::{
-    Concat, Extend, FloatOps, IntOps, Interleave, MaskOps, NarrowSaturate, NumOps, SignedIntOps,
-    ToFloat,
+    BitOps, Concat, Extend, FloatOps, IntOps, Interleave, MaskOps, NarrowSaturate, NumOps,
+    SignedIntOps, ToFloat,
 };
 use crate::{Isa, Mask, Simd};
 
@@ -54,6 +55,7 @@ simd_type!(I8x16, i8, LEN_X32 * 4);
 simd_type!(U8x16, u8, LEN_X32 * 4);
 simd_type!(U16x8, u16, LEN_X32 * 2);
 simd_type!(U32x4, u32, LEN_X32);
+simd_type!(F16x8, f16, LEN_X32 * 2);
 
 // Define mask vector types. `Mn` is a mask for a vector with n-bit lanes.
 simd_type!(M32, i32, LEN_X32);
@@ -89,9 +91,17 @@ unsafe impl Isa for GenericIsa {
     type U8 = U8x16;
     type U16 = U16x8;
     type U32 = U32x4;
+    type F16 = F16x8;
     type Bits = I32x4;
 
-    fn f32(self) -> impl FloatOps<f32, Simd = Self::F32, Int = Self::I32> {
+    fn f32(
+        self,
+    ) -> impl FloatOps<f32, Simd = Self::F32, Int = Self::I32>
+    + NarrowSaturate<f32, f16, Output = Self::F16> {
+        self
+    }
+
+    fn f16(self) -> impl Extend<f16, Output = Self::F32, Simd = Self::F16> {
         self
     }
 
@@ -143,7 +153,7 @@ unsafe impl Isa for GenericIsa {
     }
 }
 
-macro_rules! simd_ops_common {
+macro_rules! bit_ops_common {
     ($simd:ident, $elem:ty, $len:expr, $mask:ident) => {
         #[inline]
         fn len(self) -> usize {
@@ -163,7 +173,7 @@ macro_rules! simd_ops_common {
             mask: <$simd as Simd>::Mask,
         ) -> $simd {
             let mask_array = mask.0;
-            let mut vec = <Self as NumOps<$elem>>::zero(self).0;
+            let mut vec = <Self as BitOps<$elem>>::zero(self).0;
             for i in 0..mask_array.len() {
                 if mask_array[i] != 0 {
                     vec[i] = *ptr.add(i);
@@ -181,13 +191,41 @@ macro_rules! simd_ops_common {
         ) {
             let mask_array = mask.0;
             let x_array = x.0;
-            for i in 0..<Self as NumOps<$elem>>::len(self) {
+            for i in 0..<Self as BitOps<$elem>>::len(self) {
                 if mask_array[i] != 0 {
                     *ptr.add(i) = x_array[i];
                 }
             }
         }
 
+        #[inline]
+        fn splat(self, x: $elem) -> $simd {
+            $simd([x; $len])
+        }
+
+        #[inline]
+        unsafe fn load_ptr(self, ptr: *const $elem) -> $simd {
+            let xs = array::from_fn(|i| *ptr.add(i));
+            $simd(xs)
+        }
+
+        #[inline]
+        fn select(self, x: $simd, y: $simd, mask: <$simd as Simd>::Mask) -> $simd {
+            let xs = array::from_fn(|i| if mask.0[i] != 0 { x.0[i] } else { y.0[i] });
+            $simd(xs)
+        }
+
+        #[inline]
+        unsafe fn store_ptr(self, x: $simd, ptr: *mut $elem) {
+            for i in 0..$len {
+                *ptr.add(i) = x.0[i];
+            }
+        }
+    };
+}
+
+macro_rules! num_ops_common {
+    ($simd:ident, $mask:ident) => {
         #[inline]
         fn add(self, x: $simd, y: $simd) -> $simd {
             x.map_with(y, |x, y| x + y)
@@ -233,30 +271,6 @@ macro_rules! simd_ops_common {
         fn max(self, x: $simd, y: $simd) -> $simd {
             x.map_with(y, |x, y| x.max(y))
         }
-
-        #[inline]
-        fn splat(self, x: $elem) -> $simd {
-            $simd([x; $len])
-        }
-
-        #[inline]
-        unsafe fn load_ptr(self, ptr: *const $elem) -> $simd {
-            let xs = array::from_fn(|i| *ptr.add(i));
-            $simd(xs)
-        }
-
-        #[inline]
-        fn select(self, x: $simd, y: $simd, mask: <$simd as Simd>::Mask) -> $simd {
-            let xs = array::from_fn(|i| if mask.0[i] != 0 { x.0[i] } else { y.0[i] });
-            $simd(xs)
-        }
-
-        #[inline]
-        unsafe fn store_ptr(self, x: $simd, ptr: *mut $elem) {
-            for i in 0..$len {
-                *ptr.add(i) = x.0[i];
-            }
-        }
     };
 }
 
@@ -284,10 +298,10 @@ macro_rules! simd_int_ops_common {
     };
 }
 
-unsafe impl NumOps<f32> for GenericIsa {
+unsafe impl BitOps<f32> for GenericIsa {
     type Simd = F32x4;
 
-    simd_ops_common!(F32x4, f32, 4, M32);
+    bit_ops_common!(F32x4, f32, 4, M32);
 
     #[inline]
     fn and(self, x: F32x4, y: F32x4) -> F32x4 {
@@ -308,6 +322,10 @@ unsafe impl NumOps<f32> for GenericIsa {
     fn xor(self, x: F32x4, y: F32x4) -> F32x4 {
         x.map_with(y, |x, y| f32::from_bits(x.to_bits() ^ y.to_bits()))
     }
+}
+
+unsafe impl NumOps<f32> for GenericIsa {
+    num_ops_common!(F32x4, M32);
 }
 
 impl FloatOps<f32> for GenericIsa {
@@ -346,11 +364,15 @@ impl FloatOps<f32> for GenericIsa {
 
 macro_rules! impl_simd_int_ops {
     ($simd:ident, $elem:ty, $len:expr, $mask:ident) => {
-        unsafe impl NumOps<$elem> for GenericIsa {
+        unsafe impl BitOps<$elem> for GenericIsa {
             type Simd = $simd;
 
-            simd_ops_common!($simd, $elem, $len, $mask);
+            bit_ops_common!($simd, $elem, $len, $mask);
             simd_int_ops_common!($simd);
+        }
+
+        unsafe impl NumOps<$elem> for GenericIsa {
+            num_ops_common!($simd, $mask);
         }
 
         impl IntOps<$elem> for GenericIsa {
@@ -389,11 +411,16 @@ macro_rules! impl_extend {
         impl Extend<$elem> for GenericIsa {
             type Output = $dst;
 
-            fn extend(self, x: $src) -> ($dst, $dst) {
+            fn extend_low(self, x: $src) -> $dst {
                 let extended = x.0.map(|x| x as <$dst as Simd>::Elem);
                 let low = array::from_fn(|i| extended[i]);
+                low.into()
+            }
+
+            fn extend_high(self, x: $src) -> $dst {
+                let extended = x.0.map(|x| x as <$dst as Simd>::Elem);
                 let high = array::from_fn(|i| extended[i + extended.len() / 2]);
-                (low.into(), high.into())
+                high.into()
             }
         }
     };
@@ -505,6 +532,62 @@ macro_rules! impl_narrow {
 impl_narrow!(I32x4, i32, I16x8, i16);
 impl_narrow!(I16x8, i16, U8x16, u8);
 
+unsafe impl BitOps<f16> for GenericIsa {
+    type Simd = F16x8;
+
+    bit_ops_common!(F16x8, f16, 8, M16);
+
+    #[inline]
+    fn and(self, x: F16x8, y: F16x8) -> F16x8 {
+        x.map_with(y, |x, y| f16::from_bits(x.to_bits() & y.to_bits()))
+    }
+
+    #[inline]
+    fn not(self, x: F16x8) -> F16x8 {
+        x.map(|x| f16::from_bits(!x.to_bits()))
+    }
+
+    #[inline]
+    fn or(self, x: F16x8, y: F16x8) -> F16x8 {
+        x.map_with(y, |x, y| f16::from_bits(x.to_bits() | y.to_bits()))
+    }
+
+    #[inline]
+    fn xor(self, x: F16x8, y: F16x8) -> F16x8 {
+        x.map_with(y, |x, y| f16::from_bits(x.to_bits() ^ y.to_bits()))
+    }
+}
+
+impl Extend<f16> for GenericIsa {
+    type Output = F32x4;
+
+    fn extend_low(self, x: F16x8) -> F32x4 {
+        let vals = x.0.map(|v| v.to_f32());
+        let low = array::from_fn(|i| vals[i]);
+        low.into()
+    }
+
+    fn extend_high(self, x: F16x8) -> F32x4 {
+        let vals = x.0.map(|v| v.to_f32());
+        let mid = vals.len() / 2;
+        let high = array::from_fn(|i| vals[i + mid]);
+        high.into()
+    }
+}
+
+impl NarrowSaturate<f32, f16> for GenericIsa {
+    type Output = F16x8;
+
+    fn narrow_saturate(self, low: F32x4, high: F32x4) -> F16x8 {
+        let mid = low.0.len();
+        let xs = array::from_fn(|i| {
+            let v = if i < mid { low.0[i] } else { high.0[i - mid] };
+            f16::from_f32(v)
+        });
+        F16x8(xs)
+    }
+}
+
 macro_rules! impl_mask {
     ($mask:ident, $len:expr) => {
         impl Mask for $mask {
@@ -570,6 +653,7 @@ macro_rules! impl_simd {
 }
 
 impl_simd!(F32x4, f32, M32, 4);
+impl_simd!(F16x8, f16, M16, 8);
 impl_simd!(I32x4, i32, M32, 4);
 impl_simd!(I16x8, i16, M16, 8);
 impl_simd!(I8x16, i8, M8, 16);

@@ -1,3 +1,4 @@
+use rten_base::bit_set::BitSet;
 use rten_shape_inference::ops as shape_ops;
 use rten_tensor::prelude::*;
 use rten_tensor::{NdTensorView, SliceItem, SliceRange, Tensor, TensorView};
@@ -7,8 +8,8 @@ use smallvec::SmallVec;
 use crate::buffer_pool::{AutoReturn, BufferPool};
 use crate::infer_shapes::InferShapes;
 use crate::operator::{
-    InputList, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
-    OutputTypeList, OutputTypesContext,
+    InPlaceInputs, InputList, IntoOpResult, OpError, OpRunContext, Operator, OutputList,
+    OutputType, OutputTypeList, OutputTypesContext,
 };
 use crate::ops::{map_value, map_value_view, resolve_axis};
 use crate::value::{Value, ValueView};
@@ -16,7 +17,7 @@ use crate::value::{Value, ValueView};
 macro_rules! check_input {
     ($cond:expr, $msg:literal) => {
         if !$cond {
-            return Err(OpError::InvalidValue($msg));
+            return Err(OpError::invalid_value($msg));
         }
     };
 }
@@ -141,17 +142,22 @@ impl Operator for Slice {
         result.into_op_result()
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let input = in_place.into_single();
         let other = ctx.inputs();
-        let starts = other.require_as(0)?;
-        let ends = other.require_as(1)?;
+        let starts = other.require_as(1)?;
+        let ends = other.require_as(2)?;
 
-        let axes = other.get_as(2)?;
-        let steps = other.get_as::<NdTensorView<i32, 1>>(3)?;
+        let axes = other.get_as(3)?;
+        let steps = other.get_as::<NdTensorView<i32, 1>>(4)?;
 
         // Fall back to copying if non-default steps are given.
         if let Some(steps) = steps
@@ -167,13 +173,13 @@ impl Operator for Slice {
             }
 
             let input_list = InputList::from(&inputs);
-            let ctx = OpRunContext::new(ctx.pool(), &input_list);
-            return self.run(&ctx).map(|mut outputs| outputs.remove(0));
+            let ctx = OpRunContext::new(ctx.pool(), &input_list, ctx.outputs());
+            return self.run(&ctx);
         }
 
         map_value!(input, output, {
             slice_in_place(&mut output, &starts, &ends, axes.as_ref())?;
-            Ok(output.into())
+            output.into_op_result()
         })
     }
 
@@ -601,7 +607,7 @@ mod tests {
                 Some(&case.steps.into()),
             )
             .err();
-            assert_eq!(err, Some(OpError::InvalidValue(case.expected)));
+            assert_eq!(err, Some(OpError::invalid_value(case.expected)));
         });
     }
 }

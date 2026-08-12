@@ -1,8 +1,9 @@
 use smallvec::SmallVec;
 use std::fmt::Debug;
-use std::iter::repeat;
+use std::iter::repeat_n;
 use std::mem::MaybeUninit;
 
+use rten_base::bit_set::BitSet;
 use rten_base::num::{AsBool, Identities, IsInt};
 use rten_shape_inference::ops as shape_ops;
 use rten_tensor::prelude::*;
@@ -12,8 +13,8 @@ use rten_tensor::{Tensor, TensorView, TensorViewMut};
 use crate::buffer_pool::{AutoReturn, BufferPool};
 use crate::infer_shapes::{BinaryOp, InferShapes};
 use crate::operator::{
-    IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
-    OutputTypesContext,
+    InPlaceInputs, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
+    OutputTypeList, OutputTypesContext,
 };
 use crate::ops::{map_value, map_value_view};
 use crate::value::{DataType, Value, ValueType, ValueView};
@@ -33,8 +34,8 @@ pub fn broadcast_shapes(a: &[usize], b: &[usize]) -> Option<SmallVec<[usize; 4]>
     let a_pad = b.len().saturating_sub(a.len());
     let b_pad = a.len().saturating_sub(b.len());
 
-    let a_iter = a.iter().copied().rev().chain(repeat(1).take(a_pad));
-    let b_iter = b.iter().copied().rev().chain(repeat(1).take(b_pad));
+    let a_iter = a.iter().copied().rev().chain(repeat_n(1, a_pad));
+    let b_iter = b.iter().copied().rev().chain(repeat_n(1, b_pad));
 
     let mut result = SmallVec::with_capacity(a.len().max(b.len()));
     for (a, b) in a_iter.zip(b_iter) {
@@ -56,7 +57,10 @@ pub fn broadcast_shapes(a: &[usize], b: &[usize]) -> Option<SmallVec<[usize; 4]>
 /// Return true if an elementwise binary operation can be performed in-place
 /// on `a` given `b` as the other argument.
 fn can_run_binary_op_in_place<L1: Layout, L2: Layout>(a: &L1, b: &L2) -> bool {
-    b.can_broadcast_to(a.shape().as_ref())
+    use rten_tensor::SizeArray;
+
+    let shape: SmallVec<[usize; 5]> = a.shape().iter().collect();
+    b.can_broadcast_to(&shape)
 }
 
 /// Check whether a tensor of shape `from_shape` can be broadcast to `to_shape`
@@ -255,8 +259,9 @@ pub fn binary_op<T: Copy, U: Copy, R>(
     b: TensorView<U>,
     op: &dyn BinaryKernel<T, U, R>,
 ) -> Result<Tensor<R>, OpError> {
-    let out_shape = broadcast_shapes(a.shape(), b.shape())
-        .ok_or(OpError::IncompatibleInputShapes("Cannot broadcast inputs"))?;
+    let out_shape = broadcast_shapes(a.shape(), b.shape()).ok_or(
+        OpError::incompatible_input_shapes("Cannot broadcast inputs"),
+    )?;
 
     // Fast path for when LHS and RHS are contiguous, and fast broadcasting is
     // possible.
@@ -431,19 +436,38 @@ macro_rules! run_typed_op {
     };
 }
 
+/// Helper used to call in-place ops which can be fallible or infallible.
+trait IntoUnitResult {
+    fn into_unit_result(self) -> Result<(), OpError>;
+}
+
+impl IntoUnitResult for () {
+    fn into_unit_result(self) -> Result<(), OpError> {
+        Ok(self)
+    }
+}
+
+impl IntoUnitResult for Result<(), OpError> {
+    fn into_unit_result(self) -> Result<(), OpError> {
+        self
+    }
+}
+
 /// Extract two input operands from `$input` and `$other` and invoke the
 /// appropriate instantiations of `$in_place_op_func` or `$op_func` depending
 /// on the tensor type.
 macro_rules! run_typed_op_in_place {
     ($pool:expr, $input:expr, $other: expr, $in_place_op_func:ident, $op_func:ident) => {{
         map_value!($input, a, [FloatTensor, Int32Tensor], {
-            let b = $other.require_as(0)?;
+            // The in-place input is passed separately, so the other operand is
+            // the sole remaining input.
+            let b = $other.require_first_present_as()?;
             if can_run_binary_op_in_place(&a, &b) {
-                $in_place_op_func(a.view_mut(), b);
-                Ok(a.into())
+                $in_place_op_func(a.view_mut(), b).into_unit_result()?;
+                a.into_op_result()
             } else {
                 let a = a.auto_return($pool);
-                $op_func($pool, a.view(), b.view()).map(|t| t.into())
+                $op_func($pool, a.view(), b.view()).into_op_result()
             }
         })
     }};
@@ -482,16 +506,30 @@ impl Operator for Add {
         run_typed_op!(ctx.pool(), ctx.inputs(), add)
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
     fn is_commutative(&self) -> bool {
         true
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
-        run_typed_op_in_place!(ctx.pool(), input, ctx.inputs(), add_in_place, add)
+    fn is_associative(&self) -> bool {
+        true
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        run_typed_op_in_place!(
+            ctx.pool(),
+            in_place.into_single(),
+            ctx.inputs(),
+            add_in_place,
+            add
+        )
     }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
@@ -560,6 +598,18 @@ logical_boolean_op!(And, and, |x, y| x && y);
 logical_boolean_op!(Or, or, |x, y| x || y);
 logical_boolean_op!(Xor, xor, |x, y| x ^ y);
 
+/// Check the RHS input of a Div / Mod op for zeros.
+///
+/// This is used to avoid a divide-by-zero panic for integer inputs. For float
+/// inputs zeros are allowed in the divisor and produce inf or NaN.
+fn check_nonzero<T: Default + PartialEq>(x: &TensorView<T>) -> Result<(), OpError> {
+    if x.iter().any(|x| *x == T::default()) {
+        Err(OpError::invalid_value("Divisor contains zero"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Perform elementwise division of two tensors.
 pub fn div<
     T: Copy
@@ -568,12 +618,16 @@ pub fn div<
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>
         + IsInt
-        + Identities,
+        + Identities
+        + PartialEq,
 >(
     pool: &BufferPool,
     a: TensorView<T>,
     b: TensorView<T>,
 ) -> Result<Tensor<T>, OpError> {
+    if T::is_int() {
+        check_nonzero(&b)?;
+    }
     match (T::is_int(), b.item()) {
         // Optimize division as multiplication-by-reciprocal.
         //
@@ -585,15 +639,26 @@ pub fn div<
 
 /// Perform in-place elementwise division of two tensors.
 pub fn div_in_place<
-    T: Copy + Debug + std::ops::Mul<Output = T> + std::ops::Div<Output = T> + IsInt + Identities,
+    T: Copy
+        + Debug
+        + Default
+        + PartialEq
+        + std::ops::Mul<Output = T>
+        + std::ops::Div<Output = T>
+        + IsInt
+        + Identities,
 >(
     a: TensorViewMut<T>,
     b: TensorView<T>,
-) {
+) -> Result<(), OpError> {
+    if T::is_int() {
+        check_nonzero(&b)?;
+    }
     match (T::is_int(), b.item()) {
         (false, Some(scalar)) => mul_in_place(a, Tensor::from_scalar(T::one() / *scalar).view()),
         _ => binary_op_in_place(a, b, &|x, y| x / y),
     }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -612,12 +677,22 @@ impl Operator for Div {
         run_typed_op!(ctx.pool(), ctx.inputs(), div)
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
-        run_typed_op_in_place!(ctx.pool(), input, ctx.inputs(), div_in_place, div)
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        run_typed_op_in_place!(
+            ctx.pool(),
+            in_place.into_single(),
+            ctx.inputs(),
+            div_in_place,
+            div
+        )
     }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
@@ -746,13 +821,22 @@ pub enum DivMode {
 
 /// Return the elementwise remainder of dividing `a / b`.
 pub fn mod_op<
-    T: Copy + Debug + Default + PartialOrd + std::ops::Add<Output = T> + std::ops::Rem<Output = T>,
+    T: Copy
+        + Debug
+        + Default
+        + PartialOrd
+        + std::ops::Add<Output = T>
+        + std::ops::Rem<Output = T>
+        + IsInt,
 >(
     pool: &BufferPool,
     a: TensorView<T>,
     b: TensorView<T>,
     mode: DivMode,
 ) -> Result<Tensor<T>, OpError> {
+    if T::is_int() {
+        check_nonzero(&b)?;
+    }
     binary_op(
         pool,
         a,
@@ -837,16 +921,30 @@ impl Operator for Mul {
         run_typed_op!(ctx.pool(), ctx.inputs(), mul)
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
     fn is_commutative(&self) -> bool {
         true
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
-        run_typed_op_in_place!(ctx.pool(), input, ctx.inputs(), mul_in_place, mul)
+    fn is_associative(&self) -> bool {
+        true
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        run_typed_op_in_place!(
+            ctx.pool(),
+            in_place.into_single(),
+            ctx.inputs(),
+            mul_in_place,
+            mul
+        )
     }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
@@ -962,7 +1060,7 @@ impl Pow {
             (ValueView::Int32Tensor(base), ValueView::Int32Tensor(exponent)) => {
                 pow(ctx.pool(), base, exponent).map(|t| t.into())
             }
-            _ => Err(OpError::UnsupportedValue(
+            _ => Err(OpError::unsupported_value(
                 "Unsupported base and exponent type combination",
             )),
         }
@@ -985,13 +1083,18 @@ impl Operator for Pow {
         self.eval(ctx, base, exponent).into_op_result()
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, base: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
-        let exponent = ctx.inputs().require(0)?;
-        if can_run_binary_op_in_place(&base, &exponent) {
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let base = in_place.into_single();
+        let exponent = ctx.inputs().require(1)?;
+        let result = if can_run_binary_op_in_place(&base, &exponent) {
             match (base, exponent) {
                 (Value::FloatTensor(mut base), ValueView::FloatTensor(exponent)) => {
                     pow_in_place(base.view_mut(), exponent);
@@ -1005,13 +1108,14 @@ impl Operator for Pow {
                     pow_in_place(base.view_mut(), exponent);
                     Ok(base.into())
                 }
-                _ => Err(OpError::UnsupportedValue(
+                _ => Err(OpError::unsupported_value(
                     "Unsupported base and exponent type combination",
                 )),
             }
         } else {
             self.eval(ctx, base.as_view(), exponent)
-        }
+        };
+        result.into_op_result()
     }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
@@ -1056,12 +1160,22 @@ impl Operator for Sub {
         run_typed_op!(ctx.pool(), ctx.inputs(), sub)
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
-        run_typed_op_in_place!(ctx.pool(), input, ctx.inputs(), sub_in_place, sub)
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        run_typed_op_in_place!(
+            ctx.pool(),
+            in_place.into_single(),
+            ctx.inputs(),
+            sub_in_place,
+            sub
+        )
     }
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
@@ -1079,10 +1193,12 @@ pub fn where_op<T: Copy>(
     x: TensorView<T>,
     y: TensorView<T>,
 ) -> Result<Tensor<T>, OpError> {
-    let broadcast_xy_shape = broadcast_shapes(x.shape(), y.shape())
-        .ok_or(OpError::IncompatibleInputShapes("Cannot broadcast inputs"))?;
-    let result_shape = broadcast_shapes(cond.shape(), &broadcast_xy_shape)
-        .ok_or(OpError::IncompatibleInputShapes("Cannot broadcast inputs"))?;
+    let broadcast_xy_shape = broadcast_shapes(x.shape(), y.shape()).ok_or(
+        OpError::incompatible_input_shapes("Cannot broadcast inputs"),
+    )?;
+    let result_shape = broadcast_shapes(cond.shape(), &broadcast_xy_shape).ok_or(
+        OpError::incompatible_input_shapes("Cannot broadcast inputs"),
+    )?;
 
     let out_len = result_shape.iter().product();
     let mut out_data = pool.alloc(out_len);
@@ -1171,7 +1287,7 @@ mod tests {
     use std::error::Error;
 
     use rten_tensor::prelude::*;
-    use rten_tensor::test_util::expect_equal;
+    use rten_tensor::test_util::{eq_with_nans, expect_equal};
     use rten_tensor::{Scalar, Tensor};
     use rten_testing::TestCases;
 
@@ -1182,7 +1298,7 @@ mod tests {
         where_op, xor,
     };
     use crate::buffer_pool::BufferPool;
-    use crate::operator::{InputList, OpError, OpRunContext, Operator, OperatorExt};
+    use crate::operator::{InputList, OpError, OpRunContext, Operator, OperatorExt, OutputMask};
     use crate::value::Value;
 
     #[test]
@@ -1323,16 +1439,20 @@ mod tests {
         // Run `Add` operator in place with inputs that support in-place addition.
         let op = Add {};
         let inputs: InputList = (&b).into();
-        let ctx = OpRunContext::new(&pool, &inputs);
-        let result = op.run_in_place(Value::FloatTensor(a_copy), &ctx).unwrap();
-        expect_equal(&result.as_tensor_view().unwrap(), &expected.view())?;
+        let ctx = OpRunContext::new(&pool, &inputs, OutputMask::all_used(1));
+        let result = op
+            .run_in_place((0, Value::FloatTensor(a_copy)).into(), &ctx)
+            .unwrap();
+        expect_equal(&result[0].as_tensor_view().unwrap(), &expected.view())?;
 
         // Run `Add` operator in-place with inputs that don't support in-place
         // addition. The operator should fall back to creating a new output tensor.
         let scalar = Tensor::from(1.0);
         let expected = Tensor::from_data(&[2, 2], vec![11., 21., 31., 41.]);
-        let result = op.run_in_place(Value::FloatTensor(scalar), &ctx).unwrap();
-        expect_equal(&result.as_tensor_view().unwrap(), &expected.view())?;
+        let result = op
+            .run_in_place((0, Value::FloatTensor(scalar)).into(), &ctx)
+            .unwrap();
+        expect_equal(&result[0].as_tensor_view().unwrap(), &expected.view())?;
 
         // In-place addition where the second input must be broadcast to the
         // shape of the first.
@@ -1367,7 +1487,9 @@ mod tests {
 
         assert_eq!(
             result.err(),
-            Some(OpError::IncompatibleInputShapes("Cannot broadcast inputs"))
+            Some(OpError::incompatible_input_shapes(
+                "Cannot broadcast inputs"
+            ))
         );
     }
 
@@ -1413,6 +1535,22 @@ mod tests {
         let result = div(&pool, a.view(), b.view()).unwrap();
         assert_eq!(&result, &expected);
 
+        // Zero in divisor
+        let a = Tensor::from([1, 2, 3, 4]);
+        let b = Tensor::from([1, 0, 1, 1]);
+        let result = div(&pool, a.view(), b.view());
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value("Divisor contains zero"))
+        );
+
+        // Zero in float divisor
+        let a = Tensor::from([1., 2., 3., 4.]);
+        let b = Tensor::from([1., 0., 1., 1.]);
+        let expected = Tensor::from([1., f32::INFINITY, 3., 4.]);
+        let result = div(&pool, a.view(), b.view()).unwrap();
+        assert_eq!(result, expected);
+
         Ok(())
     }
 
@@ -1422,29 +1560,45 @@ mod tests {
         let mut a = Tensor::from_data(&[2, 2], vec![10., 20., 30., 40.]);
         let b = Tensor::from_data(&[2, 2], vec![1., 2., 3., 4.]);
         let expected = Tensor::from_data(&[2, 2], vec![10., 10., 10., 10.]);
-        div_in_place(a.view_mut(), b.view());
+        div_in_place(a.view_mut(), b.view()).unwrap();
         expect_equal(&a, &expected)?;
 
         // Scalar b
         let mut a = Tensor::from_data(&[2, 2], vec![10., 20., 30., 40.]);
         let b = Tensor::from(10.);
         let expected = Tensor::from_data(&[2, 2], vec![1., 2., 3., 4.]);
-        div_in_place(a.view_mut(), b.view());
+        div_in_place(a.view_mut(), b.view()).unwrap();
         expect_equal(&a, &expected)?;
 
         // Non-scalar a and b ints
         let mut a = Tensor::from([1, 2, 3, 4]);
         let b = Tensor::from([2, 2, 2, 2]);
         let expected = Tensor::from([0, 1, 1, 2]);
-        div_in_place(a.view_mut(), b.view());
+        div_in_place(a.view_mut(), b.view()).unwrap();
         assert_eq!(&a, &expected);
 
         // Scalar b int
         let mut a = Tensor::from([1, 2, 3, 4]);
         let b = Tensor::from(2);
         let expected = Tensor::from([0, 1, 1, 2]);
-        div_in_place(a.view_mut(), b.view());
+        div_in_place(a.view_mut(), b.view()).unwrap();
         assert_eq!(&a, &expected);
+
+        // Zero in divisor
+        let mut a = Tensor::from([1, 2, 3, 4]);
+        let b = Tensor::from([1, 0, 1, 1]);
+        let result = div_in_place(a.view_mut(), b.view());
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value("Divisor contains zero"))
+        );
+
+        // Zero in float divisor
+        let mut a = Tensor::from([1., 2., 3., 4.]);
+        let b = Tensor::from([1., 0., 1., 1.]);
+        let expected = Tensor::from([1., f32::INFINITY, 3., 4.]);
+        div_in_place(a.view_mut(), b.view()).unwrap();
+        assert_eq!(a, expected);
 
         Ok(())
     }
@@ -1571,6 +1725,22 @@ mod tests {
         let expected = Tensor::from([1., -1., 1., -1.]);
         let result = mod_op(&pool, af.view(), bf.view(), DivMode::TruncDiv).unwrap();
         assert_eq!(&result, &expected);
+
+        // Zero in divisor
+        let a = Tensor::from([1, 2, 3, 4]);
+        let b = Tensor::from([1, 0, 1, 1]);
+        let result = mod_op(&pool, a.view(), b.view(), DivMode::FloorDiv);
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value("Divisor contains zero"))
+        );
+
+        // Zero in float divisor
+        let a = Tensor::from([1., 2., 3., 4.]);
+        let b = Tensor::from([1., 0., 1., 1.]);
+        let expected = Tensor::from([0.0, f32::NAN, 0.0, 0.0]);
+        let result = mod_op(&pool, a.view(), b.view(), DivMode::FloorDiv).unwrap();
+        assert!(eq_with_nans(result.view(), expected.view()));
     }
 
     #[test]
@@ -1862,14 +2032,18 @@ mod tests {
         let result = where_op(&pool, cond.view(), x.view(), y.view());
         assert_eq!(
             result.err(),
-            Some(OpError::IncompatibleInputShapes("Cannot broadcast inputs"))
+            Some(OpError::incompatible_input_shapes(
+                "Cannot broadcast inputs"
+            ))
         );
 
         // Failure to broadcast `y` to match `cond`
         let result = where_op(&pool, cond.view(), y.view(), x.view());
         assert_eq!(
             result.err(),
-            Some(OpError::IncompatibleInputShapes("Cannot broadcast inputs"))
+            Some(OpError::incompatible_input_shapes(
+                "Cannot broadcast inputs"
+            ))
         );
     }
 

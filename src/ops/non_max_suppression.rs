@@ -1,7 +1,9 @@
+use rten_shape_inference::ops as shape_ops;
 use rten_tensor::prelude::*;
 use rten_tensor::{NdTensor, NdTensorView};
 
 use crate::buffer_pool::BufferPool;
+use crate::infer_shapes::{InferShapes, impl_infer_shapes};
 use crate::operator::{
     IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
     OutputTypesContext,
@@ -77,13 +79,13 @@ pub fn non_max_suppression(
     let [scores_batch, n_classes, scores_n_boxes] = scores.shape();
 
     if n_coords != 4 {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "`boxes` last dimension should have size 4",
         ));
     }
 
     if batch != scores_batch || n_boxes != scores_n_boxes {
-        return Err(OpError::IncompatibleInputShapes(
+        return Err(OpError::incompatible_input_shapes(
             "`boxes` and `scores` have incompatible shapes",
         ));
     }
@@ -224,7 +226,13 @@ impl Operator for NonMaxSuppression {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::Fixed(ValueType::Tensor(DataType::Int32))].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(NonMaxSuppression, _op, shape_ops::NonMaxSuppression);
 
 #[cfg(test)]
 mod tests {
@@ -466,7 +474,7 @@ mod tests {
         let result = apply_nms(boxes.view(), scores.view());
         assert_eq!(
             result,
-            Err(OpError::IncompatibleInputShapes(
+            Err(OpError::incompatible_input_shapes(
                 "`boxes` and `scores` have incompatible shapes"
             ))
         );
@@ -476,7 +484,7 @@ mod tests {
         let result = apply_nms(boxes.view(), scores.view());
         assert_eq!(
             result,
-            Err(OpError::InvalidValue(
+            Err(OpError::invalid_value(
                 "`boxes` last dimension should have size 4"
             ))
         );

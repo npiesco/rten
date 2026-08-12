@@ -14,8 +14,8 @@ use crate::graph::{
 use crate::operator::Operator;
 use crate::ops::transform_inputs::TransformInputsBuilder;
 use crate::ops::{
-    AddSoftmax, Cast, ComputeShape, DynamicQuantizeLinear, FusedMatMul, Gelu,
-    GroupedQueryAttentionMatMul, LayerNormalization, MatMulIntegerToFloat, Mul, RMSNormalization,
+    AddSoftmax, Cast, ComputeShape, Conv, ConvInteger, ConvIntegerToFloat, FusedMatMul, Gelu,
+    GroupedQueryAttentionMatMul, LayerNormalization, MatMulIntegerToFloat, RMSNormalization,
     Reciprocal, ReduceMean, RepeatInterleave, Shape, Silu, Softmax, Swish, SymbolInfo, Transpose,
 };
 use crate::optimize::pattern_matcher::{Match, Pattern};
@@ -30,6 +30,15 @@ pub struct FusedOp {
 
     /// IDs of input value nodes.
     pub input_ids: Vec<Option<NodeId>>,
+
+    /// New constants to create and use as inputs to the fused operator.
+    ///
+    /// Each `(index, constant)` entry causes `constant` to be added to the
+    /// graph and its node ID placed at position `index` in [`input_ids`]. The
+    /// corresponding slot in [`input_ids`] should be `None`.
+    ///
+    /// [`input_ids`]: FusedOp::input_ids
+    pub new_constant_inputs: Vec<(usize, Constant)>,
 
     /// IDs of output value nodes.
     pub output_ids: Vec<Option<NodeId>>,
@@ -75,6 +84,7 @@ impl Fusion {
             name: name.map(|s| s.to_string()),
             fused_op,
             input_ids: input_ids.to_vec(),
+            new_constant_inputs: Vec::new(),
             output_ids: output_ids.to_vec(),
             unused_input_ids: unused_input_ids.to_vec(),
         })
@@ -404,13 +414,10 @@ impl PatternFusion for GeluFusion {
     }
 
     fn pattern(&self) -> Pattern {
-        // The expression for GELU is usually written as `x * 0.5 * (...)`
-        // instead of `x * (...) * 0.5`. Ideally our graph pattern matcher
-        // would be smart enough to let us write one pattern and have it match
-        // either structure. However it isn't. The pattern used matches PyTorch's
-        // `nn.GELU`.
         let x = Pattern::symbol("x");
-        x.clone() * (Pattern::unary_op("Erf", x.clone() / (2.0f32).sqrt()) + 1.0) * 0.5
+        let sqrt_2 = (2.0f32).sqrt();
+        let x_scaled = Pattern::any_of([x.clone() / sqrt_2, x.clone() * (1. / sqrt_2)].into());
+        x.clone() * (Pattern::unary_op("Erf", x_scaled) + 1.0) * 0.5
     }
 
     fn inputs(&self) -> &[&str] {
@@ -591,8 +598,8 @@ impl PatternFusion for SwishFusion {
 
     fn pattern(&self) -> Pattern {
         let x = Pattern::symbol("x");
-        let beta = Pattern::const_symbol("beta");
-        x.clone() * Pattern::unary_op("Sigmoid", beta * x.clone())
+        let alpha = Pattern::const_symbol("alpha");
+        x.clone() * Pattern::unary_op("Sigmoid", alpha * x.clone())
     }
 
     fn inputs(&self) -> &[&str] {
@@ -600,11 +607,11 @@ impl PatternFusion for SwishFusion {
     }
 
     fn maybe_fuse(&self, pat_match: &Match, g: &Graph) -> Result<Swish, FusionError> {
-        let beta_input = pat_match.node_id("beta").expect("missing symbol");
-        let beta = g
-            .get_scalar(beta_input)
-            .ok_or(FusionError::CheckFailed("beta not a scalar"))?;
-        Ok(Swish { beta })
+        let alpha_input = pat_match.node_id("alpha").expect("missing symbol");
+        let alpha = g
+            .get_scalar(alpha_input)
+            .ok_or(FusionError::CheckFailed("alpha not a scalar"))?;
+        Ok(Swish { alpha })
     }
 }
 
@@ -985,52 +992,68 @@ impl PatternFusion for MatMulIntegerToFloatFusion {
     }
 
     fn maybe_fuse(&self, pat_match: &Match, graph: &Graph) -> Result<Self::Operator, FusionError> {
-        let a = pat_match.node_id("a").unwrap();
-        let a_zero = pat_match.node_id("a_zero").unwrap();
-
-        // Check that the candidate inputs are all outputs from a
-        // DynamicQuantizeLinear node. This allows us to be sure that the
-        // inputs will have the expected shape.
-        let (a_src_id, quantize_op) = graph.get_source_node(a).ok_or(FusionError::NoMatch)?;
-        let (a_zero_src_id, _) = graph.get_source_node(a_zero).ok_or(FusionError::NoMatch)?;
-
-        let [
-            Some(quant_out_data),
-            Some(quant_out_scale),
-            Some(quant_out_zero),
-        ] = quantize_op.output_ids()
-        else {
-            return Err(FusionError::NoMatch);
-        };
-
-        // The data and zero point should come from the same DynamicQuantizeLinear op.
-        if a_src_id != a_zero_src_id
-            || quantize_op
-                .operator()
-                .downcast_ref::<DynamicQuantizeLinear>()
-                .is_none()
-            || a != *quant_out_data
-            || a_zero != *quant_out_zero
-        {
-            return Err(FusionError::NoMatch);
-        }
-
-        // The scale should come from `Mul(dyn_scale, const_scale)` where
-        // `dyn_scale` is the scale output of the DynamicQuantizeLinear op and
-        // `const_scale` is a vector.
         let scale = pat_match.node_id("scale").unwrap();
-        let (_, scale_src) = graph.get_source_node(scale).ok_or(FusionError::NoMatch)?;
-        let [Some(dyn_scale), Some(const_scale)] = scale_src.input_ids() else {
-            return Err(FusionError::NoMatch);
-        };
-        if scale_src.operator().downcast_ref::<Mul>().is_none()
-            || graph.get_rank(*const_scale) != Some(1)
-            || quant_out_scale != dyn_scale
-        {
+        let scale_shape = graph
+            .get_node(scale)
+            .ok_or(FusionError::NoMatch)?
+            .shape()
+            .ok_or(FusionError::CheckFailed("unknown scale shape"))?;
+
+        // Fusion supports scalar or vector scale which can be broadcast to
+        // MatMulInteger output shape.
+        if scale_shape.len() > 1 {
             return Err(FusionError::NoMatch);
         }
 
         Ok(MatMulIntegerToFloat::default())
+    }
+}
+
+pub struct ConvIntegerToFloatFusion {}
+
+impl PatternFusion for ConvIntegerToFloatFusion {
+    type Operator = ConvIntegerToFloat;
+
+    fn name(&self) -> &str {
+        "ConvIntegerToFloatFusion"
+    }
+
+    fn pattern(&self) -> Pattern {
+        let scale = Pattern::symbol("scale");
+        let x = Pattern::symbol("x");
+        let w = Pattern::symbol("w");
+        let x_zero = Pattern::symbol("x_zero");
+        let w_zero = Pattern::symbol("w_zero");
+
+        Pattern::unary_op(
+            "Cast",
+            Pattern::operator("ConvInteger", [x, w, x_zero, w_zero]).with_name("conv"),
+        ) * scale
+    }
+
+    fn inputs(&self) -> &[&str] {
+        &["x", "w", "x_zero", "w_zero", "scale"]
+    }
+
+    fn maybe_fuse(&self, pat_match: &Match, graph: &Graph) -> Result<Self::Operator, FusionError> {
+        let scale = pat_match.node_id("scale").unwrap();
+        let scale_shape = graph
+            .get_node(scale)
+            .ok_or(FusionError::NoMatch)?
+            .shape()
+            .ok_or(FusionError::CheckFailed("unknown scale shape"))?;
+
+        let is_scalar = matches!(scale_shape.as_ref(), [] | [Dimension::Fixed(1)]);
+        if !is_scalar {
+            return Err(FusionError::NoMatch);
+        }
+
+        let conv_id = pat_match.node_id("conv").unwrap();
+        let conv: &ConvInteger = graph
+            .get_operator(conv_id)
+            .ok_or(FusionError::CheckFailed("expected ConvInteger operator"))?;
+
+        Ok(ConvIntegerToFloat::new(conv.clone()))
     }
 }
 
@@ -1530,6 +1553,7 @@ impl FusionVisitor for ComputeShapeFusion {
                     Symbol {
                         name: name.to_string(),
                         positive: true,
+                        synthetic: false,
                     }
                     .into(),
                 ),
@@ -1665,6 +1689,105 @@ impl PatternFusion for GroupedQueryAttentionMatMulFusion {
         })
     }
 }
+
+/// Fuse `Add(Conv(X, W), bias)` into `Conv(X, W, bias)`.
+pub struct ConvAddFusion {}
+
+impl FusionVisitor for ConvAddFusion {
+    type State = ();
+
+    fn name(&self) -> &str {
+        "ConvAddFusion"
+    }
+
+    fn prepare(&self, _: &Graph) {}
+
+    fn maybe_fuse(
+        &self,
+        _state: &(),
+        graph: &Graph,
+        _op_node_id: NodeId,
+        op_node: &OperatorNode,
+    ) -> Result<Fusion, FusionError> {
+        // Match an `Add` with two inputs.
+        if op_node.operator().name() != "Add" {
+            return Err(FusionError::NoMatch);
+        }
+        let [Some(lhs), Some(rhs)] = op_node.input_ids() else {
+            return Err(FusionError::NoMatch);
+        };
+        let (lhs, rhs) = (*lhs, *rhs);
+
+        // One input must be the output of a `Conv`, the other the bias. `Add`
+        // is commutative, so try both orderings.
+        let is_conv = |id: NodeId| {
+            graph
+                .get_source_node(id)
+                .filter(|(_, conv_op)| conv_op.operator().downcast_ref::<Conv>().is_some())
+        };
+        let ((_, conv_op), bias_id) = if let Some(conv) = is_conv(lhs) {
+            (conv, rhs)
+        } else if let Some(conv) = is_conv(rhs) {
+            (conv, lhs)
+        } else {
+            return Err(FusionError::NoMatch);
+        };
+
+        // The `Conv` must not already have a bias input.
+        let (conv_input, conv_weight) = match conv_op.input_ids() {
+            [Some(input), Some(weight)] | [Some(input), Some(weight), None] => (*input, *weight),
+            _ => return Err(FusionError::CheckFailed("conv already has a bias")),
+        };
+
+        // Determine the `Conv`'s rank and output channel count from the weights,
+        // which have shape `[out_channels, in_channels / groups, ...kernel]`.
+        let weight_shape = graph
+            .get_node(conv_weight)
+            .and_then(|n| n.shape())
+            .ok_or(FusionError::CheckFailed("unknown conv weight shape"))?;
+        let out_channels = match weight_shape.first() {
+            Some(Dimension::Fixed(size)) => *size,
+            _ => return Err(FusionError::CheckFailed("unknown conv output channels")),
+        };
+        let conv_rank = weight_shape.len();
+
+        // Check bias is a constant with shape `[1, out_channels, ...]` that
+        // can be reshaped to `[out_channels]`.
+        let Some(Node::Constant(bias_const)) = graph.get_node(bias_id) else {
+            return Err(FusionError::NoMatch);
+        };
+        let bias_shape = bias_const.shape();
+        let is_per_channel_bias = bias_shape.len() == conv_rank
+            && bias_shape
+                .iter()
+                .enumerate()
+                .all(|(axis, &size)| size == if axis == 1 { out_channels } else { 1 });
+        if !is_per_channel_bias {
+            return Err(FusionError::CheckFailed("bias is not a per-channel bias"));
+        }
+        let Some(bias_view) = TypedConstant::<f32>::as_typed_view(bias_const) else {
+            return Err(FusionError::CheckFailed("bias is not an f32 constant"));
+        };
+
+        // Create the `[out_channels]` bias constant.
+        let bias_data: Vec<f32> = bias_view.iter().copied().collect();
+        let bias_const: Constant = ConstantNode::new(
+            None,
+            ConstantNodeData::Arc(ArcTensor::from_data(&[out_channels], Arc::new(bias_data))),
+        )
+        .into();
+
+        Ok(Fusion::Op(FusedOp {
+            name: op_node.name().map(|s| s.to_string()),
+            fused_op: conv_op.clone_operator(),
+            input_ids: vec![Some(conv_input), Some(conv_weight), None],
+            new_constant_inputs: vec![(2, bias_const)],
+            output_ids: op_node.output_ids().to_vec(),
+            unused_input_ids: Vec::new(),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Tests for fusions are currently defined in the main `optimize.rs` module.

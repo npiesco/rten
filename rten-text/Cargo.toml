@@ -1,6 +1,6 @@
 [package]
 name = "rten-text"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 authors = ["Robert Knight"]
 description = "Text tokenization and other ML pre/post-processing functions"
@@ -13,8 +13,8 @@ include = ["/src", "/README.md"]
 crate-type = ["lib"]
 
 [dependencies]
-fancy-regex = { version = "0.14.0", default-features = false, features = ["std", "unicode"] }
-rten-base = { path = "../rten-base", version = "0.24.0" }
+fancy-regex = { version = "0.18.0", default-features = false, features = ["std", "unicode"] }
+rten-base = { path = "../rten-base", version = "0.25.0" }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }
@@ -26,5 +26,4 @@ unicode-normalization = "0.1.22"
 rten-testing = { path = "../rten-testing" }
 
 [lints.clippy]
-manual_repeat_n = "allow"  # TODO - Address existing failures
 uninlined_format_args = "allow"

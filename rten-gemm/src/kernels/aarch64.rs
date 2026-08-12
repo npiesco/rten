@@ -2,7 +2,7 @@ use std::arch::aarch64::{int8x16_t, int32x4_t};
 use std::mem::MaybeUninit;
 use std::ops::Range;
 
-use rten_base::byte_cast::{cast_pod_slice, cast_uninit_pod_mut_slice};
+use rten_base::byte_cast::{cast_slice, cast_uninit_mut_slice};
 use rten_simd::isa::ArmNeonIsa;
 use rten_tensor::{Matrix, MatrixLayout};
 
@@ -74,7 +74,7 @@ unsafe impl Kernel<f32, f32, f32> for ArmNeonKernel {
         cols: Range<usize>,
         _quant: Option<QuantParams<f32>>,
     ) {
-        let out = cast_uninit_pod_mut_slice(out).expect("incorrect alignment for packing buffer");
+        let out = cast_uninit_mut_slice(out).expect("incorrect alignment for packing buffer");
         pack_a_block::<f32, { Self::MR }>(out, a, rows, cols);
     }
 
@@ -95,7 +95,7 @@ unsafe impl Kernel<f32, f32, f32> for ArmNeonKernel {
         cols: Range<usize>,
         _quant: Option<QuantParams<f32>>,
     ) {
-        let out = cast_uninit_pod_mut_slice(out).expect("incorrect alignment for packing buffer");
+        let out = cast_uninit_mut_slice(out).expect("incorrect alignment for packing buffer");
         pack_b_block::<f32, { Self::NR }>(out, b, rows, cols);
     }
 
@@ -110,7 +110,7 @@ unsafe impl Kernel<f32, f32, f32> for ArmNeonKernel {
         const NR_REGS: usize = ArmNeonKernel::NR / X32_LANES;
 
         // Safety: Arm Neon instructions are supported
-        let out = cast_uninit_pod_mut_slice(out).unwrap();
+        let out = cast_uninit_mut_slice(out).unwrap();
         image.pack_block::<_, NR_REGS>(self.isa, out, Self::NR, rows, cols);
     }
 
@@ -141,7 +141,7 @@ unsafe impl Kernel<f32, f32, f32> for ArmNeonKernel {
         const NR: usize = ArmNeonKernel::NR;
         const NR_REGS: usize = NR / X32_LANES;
 
-        let b = cast_pod_slice(b).unwrap();
+        let b = cast_slice(b).unwrap();
 
         let mut tmp_tile = TempTile::<f32, MR, NR>::new();
         let (dest_ptr, dest_row_stride, dest_beta) = if used_cols == NR {
@@ -229,7 +229,7 @@ macro_rules! impl_arm_int8_common {
             cols: Range<usize>,
             quant: Option<QuantParams<u8>>,
         ) {
-            let out = cast_uninit_pod_mut_slice(out).unwrap();
+            let out = cast_uninit_mut_slice(out).unwrap();
             packing::int8::pack_a::<{ Self::MR }, I8DOT_K_TILE>(
                 out,
                 a.slice((rows.clone(), cols)),
@@ -424,7 +424,7 @@ unsafe impl Kernel<u8, i8, i32> for ArmInt8MlalKernel {
         cols: Range<usize>,
         quant: Option<QuantParams<u8>>,
     ) {
-        let out = cast_uninit_pod_mut_slice(out).unwrap();
+        let out = cast_uninit_mut_slice(out).unwrap();
         packing::int8::pack_a::<{ Self::MR }, { Self::K_TILE }>(
             out,
             a.slice((rows.clone(), cols)),
@@ -491,7 +491,7 @@ unsafe impl Kernel<u8, i8, i32> for ArmInt8MlalKernel {
     ) {
         use rten_simd::{
             Isa, Simd,
-            ops::{Extend, NumOps},
+            ops::{BitOps, Extend},
         };
         use std::arch::aarch64::{vget_low_u16, vmlal_high_laneq_u16, vmlal_laneq_u16};
 
@@ -535,10 +535,12 @@ unsafe impl Kernel<u8, i8, i32> for ArmInt8MlalKernel {
 
         for k_block in 0..depth_blocks {
             let a_vec = u8_ops.load_ptr(a_data.as_ptr().add(k_block * u8_ops.len()));
-            let (a_lo, a_hi) = u8_ops.extend(a_vec);
+            let a_lo = u8_ops.extend_low(a_vec);
+            let a_hi = u8_ops.extend_high(a_vec);
 
             let b_vec = u8_ops.load_ptr(b.as_ptr().add(k_block * u8_ops.len()));
-            let (b_lo, b_hi) = u8_ops.extend(b_vec);
+            let b_lo = u8_ops.extend_low(b_vec);
+            let b_hi = u8_ops.extend_high(b_vec);
 
             // Compute first outer product update of this block.
             compute_row!(0, a_lo, b_lo);
@@ -581,10 +583,12 @@ unsafe impl Kernel<u8, i8, i32> for ArmInt8MlalKernel {
             });
 
             let a_vec = u8_ops.load_ptr(a_buf.as_ptr());
-            let (a_lo, _a_hi) = u8_ops.extend(a_vec);
+            let a_lo = u8_ops.extend_low(a_vec);
+            let _a_hi = u8_ops.extend_high(a_vec);
 
             let b_vec = u8_ops.load_ptr(b_buf.as_ptr());
-            let (b_lo, _b_hi) = u8_ops.extend(b_vec);
+            let b_lo = u8_ops.extend_low(b_vec);
+            let _b_hi = u8_ops.extend_high(b_vec);
 
             compute_row!(0, a_lo, b_lo);
             compute_row!(1, a_lo, b_lo);
@@ -824,7 +828,7 @@ unsafe impl Kernel<u8, i8, i32> for ArmInt8MMKernel {
         cols: Range<usize>,
         quant: Option<QuantParams<u8>>,
     ) {
-        let out = cast_uninit_pod_mut_slice(out).unwrap();
+        let out = cast_uninit_mut_slice(out).unwrap();
         packing::int8::pack_a::<{ Self::MR }, I8MM_K_TILE>(
             out,
             a.slice((rows.clone(), cols)),
@@ -896,7 +900,7 @@ unsafe impl Kernel<u8, i8, i32> for ArmInt8MMKernel {
     ) {
         use rten_simd::{
             Isa,
-            ops::{Concat, NumOps},
+            ops::{BitOps, Concat},
         };
 
         const MR: usize = ArmInt8MMKernel::MR;

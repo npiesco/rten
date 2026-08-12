@@ -1,16 +1,17 @@
 use std::mem::MaybeUninit;
 
+use rten_base::bit_set::BitSet;
 use rten_shape_inference::ops as shape_ops;
 use rten_tensor::prelude::*;
-use rten_tensor::{AssumeInit, NdTensorView, Tensor, TensorView};
+use rten_tensor::{AssumeInit, InitEmpty, NdTensorView, Tensor, TensorView};
 
 use smallvec::SmallVec;
 
 use crate::buffer_pool::{AutoReturn, BufferPool};
 use crate::infer_shapes::{InferShapes, impl_infer_shapes};
 use crate::operator::{
-    InputList, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
-    OutputTypeList, OutputTypesContext,
+    InPlaceInputs, InputList, IntoOpResult, OpError, OpRunContext, Operator, OutputList,
+    OutputType, OutputTypeList, OutputTypesContext,
 };
 use crate::ops::{map_value, map_value_view, resolve_axis};
 use crate::value::{TryFromValueError, Value, ValueView};
@@ -26,14 +27,14 @@ fn concatenated_shape<T: Copy>(
     for other in inputs {
         let other_shape = other.shape();
         if other_shape.len() != first_shape.len() {
-            return Err(OpError::IncompatibleInputShapes(
+            return Err(OpError::incompatible_input_shapes(
                 "Tensors must have the same number of dimensions",
             ));
         }
         for (d, (first_size, other_size)) in first_shape.iter().zip(other_shape.iter()).enumerate()
         {
             if d != axis && first_size != other_size {
-                return Err(OpError::IncompatibleInputShapes(
+                return Err(OpError::incompatible_input_shapes(
                     "Dimensions must be the same except for concat axis",
                 ));
             } else if d == axis {
@@ -126,7 +127,7 @@ impl Operator for Concat {
         })
     }
 
-    fn can_run_in_place(&self) -> bool {
+    fn in_place_inputs(&self) -> BitSet<u16> {
         // This operator can run in place in several cases:
         //
         // - There is only one input
@@ -136,13 +137,18 @@ impl Operator for Concat {
         //   spare capacity.
         // - Capacity was specifically reserved (via `Tensor::with_capacity`)
         //   by higher-level code which anticipated the concatenation.
-        true
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let input = in_place.into_single();
         map_value!(input, input, [FloatTensor, Int32Tensor], {
             let typed_inputs = typed_inputs(ctx.inputs(), input.view())?;
-            concat_in_place(ctx.pool(), input, &typed_inputs, self.axis).map(|t| t.into())
+            concat_in_place(ctx.pool(), input, &typed_inputs, self.axis).into_op_result()
         })
     }
 
@@ -236,7 +242,7 @@ pub fn tile<T: Copy>(
     repeats: NdTensorView<i32, 1>,
 ) -> Result<Tensor<T>, OpError> {
     if repeats.size(0) != input.ndim() || repeats.iter().any(|n| *n < 0) {
-        return Err(OpError::InvalidValue("invalid repeats"));
+        return Err(OpError::invalid_value("invalid repeats"));
     }
 
     let repeats: Vec<usize> = repeats.iter().map(|r| *r as usize).collect();
@@ -246,19 +252,20 @@ pub fn tile<T: Copy>(
         .zip(repeats.iter())
         .map(|(size, repeat)| size * repeat)
         .collect();
-    let mut output = Tensor::uninit_in(pool, &out_shape);
+    let output = Tensor::uninit_in(pool, &out_shape);
+    let mut output = match output.init_if_empty() {
+        InitEmpty::Empty(e) => return Ok(e),
+        InitEmpty::NotEmpty(ne) => ne,
+    };
 
-    if !output.is_empty() {
-        tile_inner(
-            input.to_contiguous_in(pool).auto_return(pool).data(),
-            output.data_mut().unwrap(),
-            input.shape(),
-            &repeats,
-        );
-    }
+    tile_inner(
+        input.to_contiguous_in(pool).auto_return(pool).data(),
+        output.data_mut().unwrap(),
+        input.shape(),
+        &repeats,
+    );
 
-    // Safety - `tile_inner` initialized all output elements, or the tensor
-    // is empty.
+    // Safety - `tile_inner` initialized all output elements.
     let output = unsafe { output.assume_init() };
 
     Ok(output)
@@ -286,27 +293,38 @@ impl Operator for Tile {
         })
     }
 
-    fn can_run_in_place(&self) -> bool {
+    fn in_place_inputs(&self) -> BitSet<u16> {
         // Tile can run in place if it is a noop, ie. all the repeats are 1.
-        true
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
-        let repeats: NdTensorView<i32, 1> = ctx.inputs().require_as(0)?;
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let input = in_place.into_single();
+        let repeats: NdTensorView<i32, 1> = ctx.inputs().require_as(1)?;
 
         if repeats.iter().all(|n| *n == 1) {
-            return Ok(input);
+            return input.into_op_result();
         }
 
         map_value!(input, input, [FloatTensor, Int32Tensor], {
-            tile(ctx.pool(), input.view(), repeats).map(|t| t.into())
+            tile(ctx.pool(), input.view(), repeats).into_op_result()
         })
     }
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(0)].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(Tile, _op, shape_ops::Tile);
 
 #[cfg(test)]
 mod tests {
@@ -406,7 +424,12 @@ mod tests {
         // Invalid `dim` attribute
         let input = from_slice(&[1, 2, 3]);
         let result = concat(&pool, &[input.view(), input.view()], 1);
-        assert_eq!(result.err(), Some(OpError::InvalidValue("Axis is invalid")));
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value(
+                "Axis 1 is out of range. Must be in [-1, 1)"
+            ))
+        );
 
         // Shape mismatch
         let a = Tensor::<f32>::zeros(&[1]);
@@ -414,7 +437,7 @@ mod tests {
         let result = concat(&pool, &[a.view(), b.view()], 0);
         assert_eq!(
             result.err(),
-            Some(OpError::IncompatibleInputShapes(
+            Some(OpError::incompatible_input_shapes(
                 "Tensors must have the same number of dimensions"
             ))
         );
@@ -425,7 +448,7 @@ mod tests {
         let result = concat(&pool, &[a.view(), b.view()], 0);
         assert_eq!(
             result.err(),
-            Some(OpError::IncompatibleInputShapes(
+            Some(OpError::incompatible_input_shapes(
                 "Dimensions must be the same except for concat axis"
             ))
         );
@@ -518,13 +541,13 @@ mod tests {
             Case {
                 input: Tensor::from([1, 2, 3]),
                 repeats: Tensor::from([1, 2]),
-                expected_error: OpError::InvalidValue("invalid repeats"),
+                expected_error: OpError::invalid_value("invalid repeats"),
             },
             // Negative repeats
             Case {
                 input: Tensor::from([1, 2, 3]),
                 repeats: Tensor::from([-1]),
-                expected_error: OpError::InvalidValue("invalid repeats"),
+                expected_error: OpError::invalid_value("invalid repeats"),
             },
         ];
 

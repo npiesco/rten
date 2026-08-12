@@ -2,10 +2,12 @@ use std::iter::Rev;
 use std::ops::Range;
 
 use rten_gemm::{GemmExecutor, GemmInputA, GemmInputB, GemmOptions};
+use rten_shape_inference::ops as shape_ops;
 use rten_tensor::prelude::*;
 use rten_tensor::{NdTensor, Tensor, TensorView};
 
 use crate::buffer_pool::{AutoReturn, BufferPool};
+use crate::infer_shapes::{InferShapes, impl_infer_shapes};
 use crate::operator::{
     IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
     OutputTypesContext, static_dims,
@@ -28,6 +30,15 @@ impl Direction {
         match self {
             Self::Forward | Self::Reverse => 1,
             Self::Bidirectional => 2,
+        }
+    }
+}
+
+impl From<Direction> for shape_ops::Direction {
+    fn from(direction: Direction) -> Self {
+        match direction {
+            Direction::Forward | Direction::Reverse => Self::Unidirectional,
+            Direction::Bidirectional => Self::Bidirectional,
         }
     }
 }
@@ -141,7 +152,7 @@ pub fn gru(
     // See note in https://pytorch.org/docs/stable/generated/torch.nn.GRU.html.
     if !linear_before_reset {
         // PyTorch and cuDNN
-        return Err(OpError::UnsupportedValue(
+        return Err(OpError::unsupported_value(
             "`linear_before_reset=0` is not supported",
         ));
     }
@@ -325,6 +336,10 @@ impl Operator for GRU {
         Some(6)
     }
 
+    fn max_outputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
         let inputs = ctx.inputs();
         let input = inputs.require_as(0)?;
@@ -353,7 +368,19 @@ impl Operator for GRU {
             OutputType::Fixed(ValueType::Tensor(DataType::Float)),
         ]))
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(
+    GRU,
+    op,
+    shape_ops::GRU {
+        direction: op.direction.into(),
+    }
+);
 
 /// Long Short-Term Memory operator.
 #[derive(Debug)]
@@ -406,7 +433,7 @@ pub fn lstm(
     let hidden_size = hidden_x4 / 4;
 
     if weights.size(1) % 4 != 0 {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "weights dim 1 must be 4 * hidden_size",
         ));
     }
@@ -415,7 +442,7 @@ pub fn lstm(
     if let Some(bias) = bias.as_ref()
         && bias.size(1) % 8 != 0
     {
-        return Err(OpError::InvalidValue("bias dim 1 must be 8 * hidden_size"));
+        return Err(OpError::invalid_value("bias dim 1 must be 8 * hidden_size"));
     }
 
     let initial_hidden = initial_hidden
@@ -578,6 +605,10 @@ impl Operator for LSTM {
         Some(7)
     }
 
+    fn max_outputs(&self) -> Option<usize> {
+        Some(3)
+    }
+
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
         let inputs = ctx.inputs();
         let input = inputs.require_as(0)?;
@@ -608,7 +639,19 @@ impl Operator for LSTM {
             OutputType::Fixed(ValueType::Tensor(DataType::Float)),
         ]))
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(
+    LSTM,
+    op,
+    shape_ops::LSTM {
+        direction: op.direction.into(),
+    }
+);
 
 #[cfg(test)]
 mod tests {

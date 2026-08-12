@@ -1,9 +1,11 @@
 use std::mem::MaybeUninit;
 
+use rten_shape_inference::ops as shape_ops;
 use rten_tensor::prelude::*;
 use rten_tensor::{NdTensorView, NdTensorViewMut, SliceItem, Tensor, TensorView};
 
 use crate::buffer_pool::BufferPool;
+use crate::infer_shapes::{InferShapes, impl_infer_shapes};
 use crate::operator::{
     IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
     OutputTypesContext,
@@ -19,6 +21,16 @@ pub enum PadMode {
     Wrap,
 }
 
+/// Number of elements a pad value adds to the start or end of an axis.
+fn pad_amount(pad: i32) -> usize {
+    pad.max(0) as usize
+}
+
+/// Number of elements a pad value removes from the start or end of an axis.
+fn crop_amount(pad: i32) -> usize {
+    pad.min(0).unsigned_abs() as usize
+}
+
 pub fn pad<T: Copy + Default + PartialEq>(
     pool: &BufferPool,
     input: TensorView<T>,
@@ -26,22 +38,40 @@ pub fn pad<T: Copy + Default + PartialEq>(
     mode: PadMode,
     const_val: T,
 ) -> Result<Tensor<T>, OpError> {
-    if padding.size(0) != input.ndim() * 2 {
-        return Err(OpError::InvalidValue(
+    let ndim = input.ndim();
+
+    if padding.size(0) != ndim * 2 {
+        return Err(OpError::invalid_value(
             "padding length should be 2 * input dims",
         ));
     }
-    if !padding.iter().all(|x| *x >= 0) {
-        return Err(OpError::InvalidValue("Pad only supports positive pads"));
-    }
+
+    // Handle negative padding by cropping the input. The positive padding
+    // is then applied to the cropped view.
+    let input = if padding.iter().any(|pad| *pad < 0) {
+        let mut crop_region = Vec::with_capacity(ndim);
+        for (i, size) in input.shape().iter().enumerate() {
+            let crop_start = crop_amount(padding[i]);
+            let crop_end = crop_amount(padding[[ndim + i]]);
+            if crop_start + crop_end > *size {
+                return Err(OpError::invalid_value(
+                    "Negative pads remove more elements than axis contains",
+                ));
+            }
+            crop_region.push((crop_start..size - crop_end).into());
+        }
+        input.slice(crop_region.as_slice())
+    } else {
+        input
+    };
 
     let out_shape: Vec<_> = input
         .shape()
         .iter()
         .enumerate()
         .map(|(i, size)| {
-            let start_pad = padding[i] as usize;
-            let end_pad = padding[[input.ndim() + i]] as usize;
+            let start_pad = pad_amount(padding[i]);
+            let end_pad = pad_amount(padding[[ndim + i]]);
             start_pad + size + end_pad
         })
         .collect();
@@ -58,7 +88,7 @@ pub fn pad<T: Copy + Default + PartialEq>(
                 .iter()
                 .enumerate()
                 .map(|(i, size)| {
-                    let start_pad = padding[i] as usize;
+                    let start_pad = pad_amount(padding[i]);
                     (start_pad..start_pad + size).into()
                 })
                 .collect();
@@ -82,24 +112,24 @@ pub fn pad<T: Copy + Default + PartialEq>(
             const PAD_DIMS: usize = 2;
             let batch_dims = input.ndim().saturating_sub(PAD_DIMS);
             if out_shape[..batch_dims] != input.shape()[..batch_dims] {
-                return Err(OpError::UnsupportedValue(
+                return Err(OpError::unsupported_value(
                     "Pad only supports non-constant padding of last 2 dims",
                 ));
             }
 
             if input.shape()[batch_dims..].contains(&0) {
-                return Err(OpError::InvalidValue(
+                return Err(OpError::invalid_value(
                     "Padded dimension for non-constant padding is empty",
                 ));
             }
 
             let pad_dims = input.ndim() - batch_dims;
             let (pad_top, pad_left) = if pad_dims == 1 {
-                (0, padding[[batch_dims]] as usize)
+                (0, pad_amount(padding[[batch_dims]]))
             } else {
                 (
-                    padding[[batch_dims]] as usize,
-                    padding[[batch_dims + 1]] as usize,
+                    pad_amount(padding[[batch_dims]]),
+                    pad_amount(padding[[batch_dims + 1]]),
                 )
             };
 
@@ -276,7 +306,7 @@ impl Operator for Pad {
         let axes: Option<NdTensorView<i32, 1>> = inputs.get_as(3)?;
 
         if axes.is_some() {
-            return Err(OpError::UnsupportedValue(
+            return Err(OpError::unsupported_value(
                 "Pad operator does not yet support `axes` input",
             ));
         }
@@ -290,7 +320,13 @@ impl Operator for Pad {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(0)].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(Pad, _op, shape_ops::Pad);
 
 #[cfg(test)]
 mod tests {
@@ -397,6 +433,43 @@ mod tests {
                     [0.0, 0.0, 4.5, 5.7],
                 ])),
             },
+            // Negative pad at one end and a positive pad at the other.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, 1, 0, -1].into(),
+                mode: PadMode::Constant,
+                expected: Ok(Tensor::from([[0., 1., 2., 3., 4.]])),
+            },
+            // Negative pads at both ends of an axis.
+            Case {
+                input: [1., 2., 3., 4., 5.].into(),
+                pads: [-1, -2].into(),
+                mode: PadMode::Constant,
+                expected: Ok(Tensor::from([2., 3.])),
+            },
+            // Crop the start of an axis and pad the end of it.
+            Case {
+                input: [1., 2., 3., 4., 5.].into(),
+                pads: [-2, 1].into(),
+                mode: PadMode::Constant,
+                expected: Ok(Tensor::from([3., 4., 5., 0.])),
+            },
+            // Crop away every element of an axis.
+            Case {
+                input: [1., 2., 3.].into(),
+                pads: [-1, -2].into(),
+                mode: PadMode::Constant,
+                expected: Ok(Tensor::zeros(&[0])),
+            },
+            // Crop more elements than the axis contains.
+            Case {
+                input: [[1., 2.], [3., 4.]].into(),
+                pads: [-3, 0, 0, 0].into(),
+                mode: PadMode::Constant,
+                expected: Err(OpError::invalid_value(
+                    "Negative pads remove more elements than axis contains",
+                )),
+            },
         ];
 
         test_pad_mode(&cases);
@@ -485,7 +558,7 @@ mod tests {
                 input: [[[1., 2., 3.]]].into(),
                 pads: [0, 0, 0, 2, 0, 0].into(),
                 mode: PadMode::Reflect,
-                expected: Err(OpError::UnsupportedValue(
+                expected: Err(OpError::unsupported_value(
                     "Pad only supports non-constant padding of last 2 dims",
                 )),
             },
@@ -494,9 +567,32 @@ mod tests {
                 input: Tensor::zeros(&[3, 0]),
                 pads: NdTensor::from([0, 2, 0, 0]),
                 mode: PadMode::Reflect,
-                expected: Err(OpError::InvalidValue(
+                expected: Err(OpError::invalid_value(
                     "Padded dimension for non-constant padding is empty",
                 )),
+            },
+            // Crop the start of an axis and reflect-pad the end.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, -2, 0, 2].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([[3., 4., 5., 4., 3.]])),
+            },
+            // Negative pads which empty an axis. No padding is applied, so the
+            // empty crop is returned rather than reflecting. ONNX Runtime and
+            // PyTorch disagree over whether this is an error.
+            Case {
+                input: [[1., 2., 3.]].into(),
+                pads: [0, -1, 0, -2].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::zeros(&[1, 0])),
+            },
+            // Crop both ends of an axis and then reflect-pad it.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, -1, 0, -1].into(),
+                mode: PadMode::Reflect,
+                expected: Ok(Tensor::from([[2., 3., 4.]])),
             },
         ];
 
@@ -521,6 +617,13 @@ mod tests {
                     [4.5, 4.5, 4.5, 5.7],
                 ])),
             },
+            // Crop the start of an axis and edge-pad the end.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, -2, 0, 2].into(),
+                mode: PadMode::Edge,
+                expected: Ok(Tensor::from([[3., 4., 5., 5., 5.]])),
+            },
         ];
 
         test_pad_mode(&cases);
@@ -542,6 +645,14 @@ mod tests {
                     [5.7, 4.5, 5.7, 4.5],
                     [1.2, 1.0, 1.2, 1.0],
                 ])),
+            },
+            // Crop the start of an axis and wrap-pad the end. The wrap uses the
+            // cropped axis, so it repeats 3 rather than continuing from 1.
+            Case {
+                input: [[1., 2., 3., 4., 5.]].into(),
+                pads: [0, -2, 0, 2].into(),
+                mode: PadMode::Wrap,
+                expected: Ok(Tensor::from([[3., 4., 5., 3., 4.]])),
             },
         ];
 
@@ -589,14 +700,16 @@ mod tests {
                 input: input.clone(),
                 pads: from_slice(&[1]),
                 const_val: None,
-                expected_error: OpError::InvalidValue("padding length should be 2 * input dims"),
+                expected_error: OpError::invalid_value("padding length should be 2 * input dims"),
             },
-            // Unsupported padding amounts.
+            // Negative pads which remove more elements than an axis contains.
             Case {
                 input: input.clone(),
-                pads: from_slice(&[1, 1, 1, -1]),
+                pads: from_slice(&[-3, 0, 0, 0]),
                 const_val: None,
-                expected_error: OpError::InvalidValue("Pad only supports positive pads"),
+                expected_error: OpError::invalid_value(
+                    "Negative pads remove more elements than axis contains",
+                ),
             },
             // Wrong constant value type.
             Case {

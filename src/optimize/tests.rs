@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use rten_base::byte_cast::cast_pod_slice;
+use rten_base::byte_cast::cast_slice;
 use rten_shape_inference::{SymExpr, Symbol};
 use rten_tensor::{NdTensor, Tensor};
 use rten_testing::TestCases;
@@ -15,10 +15,10 @@ use crate::graph::{
 };
 use crate::infer_shapes::InferShapeOptions;
 use crate::ops::{
-    Add, Cast, ComputeShape, DynamicQuantizeLinear, Erf, Expand, FusedMatMul, Gather, Gelu,
-    GroupedQueryAttentionMatMul, Identity, IsNaN, LayerNormalization, MatMul, MatMulInteger, Neg,
-    Pow, RMSNormalization, ReduceMean, RepeatInterleave, Reshape, Shape, Sigmoid, Slice, Softmax,
-    Sqrt, Swish, Tanh, Transpose, Unsqueeze, Where,
+    Add, Cast, ComputeShape, Conv, ConvInteger, DynamicQuantizeLinear, Erf, Expand, FusedMatMul,
+    Gather, Gelu, GroupedQueryAttentionMatMul, Identity, If, IsNaN, LayerNormalization, MatMul,
+    MatMulInteger, Neg, Padding, Pow, RMSNormalization, ReduceMean, RepeatInterleave, Reshape,
+    Shape, Sigmoid, Slice, Softmax, Split, Sqrt, Swish, Tanh, Transpose, Unsqueeze, Where,
 };
 use crate::value::{DataType, Value, ValueType};
 
@@ -27,12 +27,27 @@ fn optimize_graph(graph: Graph) -> Result<Graph, OptimizeError> {
     optimizer.optimize(graph, None, OptimizeOptions::default())
 }
 
+fn optimize_graph_infer_shapes(graph: Graph) -> Result<Graph, OptimizeError> {
+    let optimizer = GraphOptimizer::new();
+    optimizer.optimize(
+        graph,
+        None,
+        OptimizeOptions {
+            infer_shapes: Some(InferShapeOptions {
+                strict: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+}
+
 fn arc_tensor_view(val: f32) -> ArcTensorView<f32> {
     let const_data = Vec::from(val.to_le_bytes());
     let const_storage = Arc::new(ConstantStorage::Buffer(const_data));
     let slice = ArcSlice::new(
         const_storage.clone(),
-        cast_pod_slice(const_storage.data()).unwrap(),
+        cast_slice(const_storage.data()).unwrap(),
     )
     .unwrap();
     ArcTensorView::from_data(&[], slice)
@@ -341,8 +356,8 @@ fn test_fuse_silu() {
 fn test_fuse_swish() {
     let graph = {
         let x = Expr::value("x");
-        let beta = 1.7;
-        let expr = x.clone() * (x.clone() * beta).sigmoid();
+        let alpha = 1.7;
+        let expr = x.clone() * (x.clone() * alpha).sigmoid();
         expr.build_graph(["x"])
     };
 
@@ -350,7 +365,7 @@ fn test_fuse_swish() {
 
     let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
     let swish_op = op.operator().downcast_ref::<Swish>().unwrap();
-    assert_eq!(swish_op.beta, 1.7);
+    assert_eq!(swish_op.alpha, 1.7);
 }
 
 #[test]
@@ -367,6 +382,90 @@ fn test_fuse_matmul_add() {
 
     let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
     assert_eq!(op.operator().name(), "FusedMatMul");
+}
+
+#[test]
+fn test_fuse_conv_add() {
+    #[derive(Debug)]
+    struct Case {
+        // Number of spatial dimensions: 1 for a 1D conv (`[N, C, L]`), 2 for a
+        // 2D conv (`[N, C, H, W]`).
+        spatial_dims: usize,
+    }
+
+    let cases = [Case { spatial_dims: 1 }, Case { spatial_dims: 2 }];
+
+    cases.test_each(|&Case { spatial_dims }| {
+        let out_channels = 4;
+        let graph = {
+            let x = Expr::value("x");
+
+            // Weight shape is `[out_channels, in_channels, ...kernel]`.
+            let mut weight_shape = vec![out_channels, 3];
+            weight_shape.extend(std::iter::repeat_n(3, spatial_dims));
+            let weight = Expr::constant(Tensor::<f32>::zeros(&weight_shape));
+
+            let conv = x.apply(
+                Conv {
+                    groups: 1,
+                    dilations: vec![1; spatial_dims],
+                    padding: Padding::Same,
+                    strides: vec![1; spatial_dims],
+                },
+                &[weight],
+                &[OutputMeta::NoMeta],
+            );
+
+            // Per-channel bias broadcast over the conv output: `[1, C, 1, ...]`.
+            let mut bias_shape = vec![1, out_channels];
+            bias_shape.extend(std::iter::repeat_n(1, spatial_dims));
+            let bias = Tensor::<f32>::zeros(&bias_shape);
+
+            (conv + bias).build_graph(["x"])
+        };
+
+        let graph = optimize_graph(graph).unwrap();
+
+        let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
+        assert_eq!(op.operator().name(), "Conv");
+
+        // The fused Conv should have a 1D bias input of shape `[out_channels]`.
+        let bias_id = op.input_ids()[2].expect("conv should have a bias input");
+        let bias = graph
+            .get_node(bias_id)
+            .and_then(|n| n.as_constant())
+            .expect("bias should be a constant");
+        assert_eq!(bias.shape(), [out_channels]);
+    });
+}
+
+#[test]
+fn test_no_fuse_conv_add_non_channel_bias() {
+    // A value added to the Conv output which broadcasts over a non-channel
+    // axis (here the last/width axis, shape `[1, 1, 1, 4]`) is a valid add but
+    // not a per-channel bias, so it must not be fused into the Conv.
+    let graph = {
+        let x = Expr::value("x");
+        let weight = Expr::constant(Tensor::<f32>::zeros(&[4, 3, 3, 3]));
+        let conv = x.apply(
+            Conv {
+                groups: 1,
+                dilations: vec![1, 1],
+                padding: Padding::zero::<2>(),
+                strides: vec![1, 1],
+            },
+            &[weight],
+            &[OutputMeta::NoMeta],
+        );
+        // Non-1 dimension is at index 3, not the channel index (1).
+        let addend = Tensor::<f32>::zeros(&[1, 1, 1, 4]);
+        (conv + addend).build_graph(["x"])
+    };
+
+    let graph = optimize_graph(graph).unwrap();
+
+    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
+    assert_eq!(op.operator().name(), "Add");
 }
 
 #[test]
@@ -428,18 +527,58 @@ fn test_chained_fused_ops() {
 
 #[test]
 fn test_fuse_gelu() {
-    let graph = {
-        let x = Expr::value("x");
-        let sqrt_2 = (2.0f32).sqrt();
-        let expr = x.clone() * ((x / sqrt_2).erf() + 1.0) * 0.5;
-        expr.build_graph(["x"])
-    };
+    #[derive(Debug)]
+    struct Case {
+        build: fn(Expr) -> Expr,
+    }
 
-    let graph = optimize_graph(graph).unwrap();
+    // Test all bracketings of the GELU expression. The optimizer should fuse
+    // each form, regardless of how the chain of `Mul` ops is associated.
+    let cases = [
+        // PyTorch's `nn.GELU` form.
+        Case {
+            build: |x| x.clone() * ((x / (2.0f32).sqrt()).erf() + 1.0) * 0.5,
+        },
+        // Erf argument expressed as `x * 1/sqrt(2)` instead of `x / sqrt(2)`
+        Case {
+            build: |x| x.clone() * ((x * 1. / (2.0f32).sqrt()).erf() + 1.0) * 0.5,
+        },
+        // Scale-first form: `(x * 0.5) * (1 + erf(x / sqrt(2)))`
+        Case {
+            build: |x| x.clone() * 0.5 * ((x / (2.0f32).sqrt()).erf() + 1.0),
+        },
+        // Right-associated form: `x * ((1 + erf(x / sqrt(2))) * 0.5)`
+        Case {
+            build: |x| {
+                let half = Expr::constant(0.5);
+                x.clone() * (((x / (2.0f32).sqrt()).erf() + 1.0) * half)
+            },
+        },
+        // Right-associated, scale-first form: `x * (0.5 * (1 + erf(...)))`
+        Case {
+            build: |x| {
+                let half = Expr::constant(0.5);
+                x.clone() * (half * ((x / (2.0f32).sqrt()).erf() + 1.0))
+            },
+        },
+    ];
 
-    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
-    let gelu = op.operator().downcast_ref::<Gelu>().unwrap();
-    assert_eq!(gelu.approximate, false);
+    cases.test_each(|case| {
+        let graph = {
+            let x = Expr::value("x");
+            let expr = (case.build)(x);
+            expr.build_graph(["x"])
+        };
+
+        let graph = optimize_graph(graph).unwrap();
+
+        let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
+        let gelu = op
+            .operator()
+            .downcast_ref::<Gelu>()
+            .expect("expected fused Gelu op");
+        assert_eq!(gelu.approximate, false);
+    });
 }
 
 #[test]
@@ -749,6 +888,193 @@ fn test_eliminate_noop_cast() {
 }
 
 #[test]
+fn test_no_eliminate_value_captured_by_subgraph() {
+    let mut graph = Graph::new();
+    let input = graph.add_value(Some("x"), None, Some(ValueType::Tensor(DataType::Float)));
+    let cond = graph.add_value(Some("cond"), None, Some(ValueType::Tensor(DataType::Int32)));
+    graph.set_input_ids(&[input, cond]);
+
+    // No-op cast
+    let (_cast_op, _cast_out) = graph.add_simple_op(
+        "cast",
+        Cast {
+            to: DataType::Float,
+        },
+        &[input],
+    );
+
+    // Build then/else branches which each capture "cast_out" and return it.
+    let make_branch = || {
+        let mut sg = Graph::new();
+        let cap = sg.add_value(Some("cast_out"), None, None);
+        sg.set_captures(&[cap]);
+        sg.set_output_ids(&[cap]);
+        sg
+    };
+
+    let if_out = graph.add_value(Some("if_out"), None, None);
+    graph.add_op(
+        Some("If"),
+        Arc::new(If {
+            then_branch: make_branch(),
+            else_branch: make_branch(),
+        }),
+        &[Some(cond)],
+        &[Some(if_out)],
+    );
+    graph.set_output_ids(&[if_out]);
+
+    let graph = optimize_graph(graph).unwrap();
+
+    let cast_out = graph
+        .get_node_id("cast_out")
+        .expect("captured value should still exist");
+    let (_, op) = graph
+        .get_source_node(cast_out)
+        .expect("captured value should still have a producer");
+    assert_eq!(op.operator().name(), "Cast");
+}
+
+/// Create a graph containing a `DynamicQuantizeLinear` operator with three
+/// outputs, of which only those in `used_outputs` are graph outputs.
+fn quantize_graph(used_outputs: &[usize]) -> Graph {
+    let x = Expr::value("x");
+    let quant = x.apply(
+        DynamicQuantizeLinear {},
+        &[],
+        &[OutputMeta::NoMeta, OutputMeta::NoMeta, OutputMeta::NoMeta],
+    );
+    let outputs: Vec<_> = used_outputs.iter().map(|&i| quant.output(i)).collect();
+    Expr::make_graph([x], outputs)
+}
+
+/// Return the operator which produces the first output of `graph`.
+fn first_output_source(graph: &Graph) -> &OperatorNode {
+    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
+    op
+}
+
+#[test]
+fn test_remove_unused_outputs() {
+    let graph = quantize_graph(&[0]);
+
+    let unused_ids: Vec<NodeId> = first_output_source(&graph).output_ids()[1..]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(unused_ids.len(), 2);
+
+    let graph = optimize_graph(graph).unwrap();
+
+    let op = first_output_source(&graph);
+    assert_eq!(op.operator().name(), "DynamicQuantizeLinear");
+    assert_eq!(op.output_ids()[1..], [None, None]);
+
+    for id in unused_ids {
+        assert!(graph.get_node(id).is_none());
+    }
+}
+
+#[test]
+fn test_does_not_remove_output_used_as_graph_output() {
+    let graph = optimize_graph(quantize_graph(&[0, 2])).unwrap();
+
+    let op = first_output_source(&graph);
+    assert!(op.output_ids()[1].is_none());
+    assert_eq!(op.output_ids()[2], Some(graph.output_ids()[1]));
+}
+
+#[test]
+fn test_does_not_remove_output_used_by_operator() {
+    let x = Expr::value("x");
+    let quant = x.apply(
+        DynamicQuantizeLinear {},
+        &[],
+        &[OutputMeta::NoMeta, OutputMeta::NoMeta, OutputMeta::NoMeta],
+    );
+    let neg_scale = quant.output(1).unary(Neg {});
+    let graph = optimize_graph(Expr::make_graph([x], [quant.output(0), neg_scale])).unwrap();
+
+    let op = first_output_source(&graph);
+    let scale_id = op.output_ids()[1].expect("scale output should be preserved");
+    assert_eq!(
+        graph
+            .get_consuming_op(scale_id)
+            .map(|op| op.operator().name()),
+        Some("Neg")
+    );
+    assert!(op.output_ids()[2].is_none());
+}
+
+#[test]
+fn test_does_not_remove_output_captured_by_subgraph() {
+    let mut graph = Graph::new();
+    let input = graph.add_value(Some("x"), None, Some(ValueType::Tensor(DataType::Float)));
+    let cond = graph.add_value(Some("cond"), None, Some(ValueType::Tensor(DataType::Int32)));
+    graph.set_input_ids(&[input, cond]);
+
+    let quant_out = graph.add_value(Some("quant_out"), None, None);
+    let scale = graph.add_value(Some("scale"), None, None);
+    let zero_point = graph.add_value(Some("zero_point"), None, None);
+    graph.add_op(
+        Some("quant"),
+        Arc::new(DynamicQuantizeLinear {}),
+        &[Some(input)],
+        &[quant_out, scale, zero_point].map(Some),
+    );
+
+    // Build then/else branches which each capture "scale" and return it.
+    let make_branch = || {
+        let mut sg = Graph::new();
+        let cap = sg.add_value(Some("scale"), None, None);
+        sg.set_captures(&[cap]);
+        sg.set_output_ids(&[cap]);
+        sg
+    };
+
+    let if_out = graph.add_value(Some("if_out"), None, None);
+    graph.add_op(
+        Some("If"),
+        Arc::new(If {
+            then_branch: make_branch(),
+            else_branch: make_branch(),
+        }),
+        &[Some(cond)],
+        &[Some(if_out)],
+    );
+    graph.set_output_ids(&[quant_out, if_out]);
+
+    let graph = optimize_graph(graph).unwrap();
+
+    let op = first_output_source(&graph);
+    assert_eq!(op.output_ids()[1], Some(scale));
+    // Un-captured zero-point output should be removed.
+    assert!(op.output_ids()[2].is_none());
+}
+
+#[test]
+fn test_removing_unused_output_preserves_output_count() {
+    // When the optimizer removes unused operator outputs, it must preserve
+    // the length of the output list as this can affect the behavior of the
+    // `Split` operator.
+    let x = Expr::value("x");
+    let split = x.apply(
+        Split {
+            axis: 0,
+            num_outputs: None,
+        },
+        &[],
+        &[OutputMeta::NoMeta, OutputMeta::NoMeta, OutputMeta::NoMeta],
+    );
+    let graph = optimize_graph(Expr::make_graph([x.clone()], [split.output(0)])).unwrap();
+
+    let op = first_output_source(&graph);
+    assert_eq!(op.output_ids().len(), 3);
+    assert_eq!(op.output_ids()[1..], [None, None]);
+}
+
+#[test]
 fn test_fuse_matmulinteger_cast_scale() {
     let graph = {
         let x = Expr::value("x");
@@ -758,7 +1084,11 @@ fn test_fuse_matmulinteger_cast_scale() {
         let quant = x.apply(
             DynamicQuantizeLinear {},
             &[],
-            &[OutputMeta::NoMeta, OutputMeta::NoMeta, OutputMeta::NoMeta],
+            &[
+                OutputMeta::NoMeta,
+                OutputMeta::Meta((DataType::Float, vec![])),
+                OutputMeta::NoMeta,
+            ],
         );
         let quant_x = quant.output(0);
         let quant_scale = quant.output(1);
@@ -778,10 +1108,80 @@ fn test_fuse_matmulinteger_cast_scale() {
         expr.build_graph(["x"])
     };
 
-    let graph = optimize_graph(graph).unwrap();
+    let graph = optimize_graph_infer_shapes(graph).unwrap();
     let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
 
     assert_eq!(op.operator().name(), "MatMulIntegerToFloat");
+}
+
+#[test]
+fn test_fuse_convinteger_cast_scale() {
+    #[derive(Debug)]
+    struct Case {
+        scale: Tensor<f32>,
+        expected_op: &'static str,
+    }
+
+    let cases = [
+        // Scalar scale
+        Case {
+            scale: Tensor::from(0.1),
+            expected_op: "ConvIntegerToFloat",
+        },
+        // Unsupported scale shapes
+        Case {
+            scale: Tensor::from([0.1, 0.2, 0.3]),
+            expected_op: "Mul",
+        },
+        Case {
+            scale: Tensor::from_data(&[1, 1, 1, 1, 1], vec![0.1]),
+            expected_op: "Mul",
+        },
+    ];
+
+    cases.test_each(|case| {
+        let graph = {
+            let x = Expr::value("x");
+            let weights = Expr::constant(Tensor::<i8>::zeros(&[3, 2, 3, 3]));
+            let weights_zero = Expr::constant(Tensor::<i8>::zeros(&[3]));
+
+            let quant = x.apply(
+                DynamicQuantizeLinear {},
+                &[],
+                &[
+                    OutputMeta::NoMeta,
+                    OutputMeta::Meta((DataType::Float, vec![])),
+                    OutputMeta::NoMeta,
+                ],
+            );
+            let quant_x = quant.output(0);
+            let quant_scale = quant.output(1);
+            let quant_zero = quant.output(2);
+            let weight_scale = Expr::constant(case.scale.clone());
+
+            let expr = quant_x
+                .apply(
+                    ConvInteger {
+                        groups: 1,
+                        dilations: vec![1, 1],
+                        padding: Padding::zero::<2>(),
+                        strides: vec![1, 1],
+                    },
+                    &[weights, quant_zero, weights_zero],
+                    &[OutputMeta::NoMeta],
+                )
+                .unary(Cast {
+                    to: DataType::Float,
+                })
+                * (quant_scale * weight_scale);
+            expr.build_graph(["x"])
+        };
+
+        let graph = optimize_graph_infer_shapes(graph).unwrap();
+        let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
+
+        assert_eq!(op.operator().name(), case.expected_op);
+    })
 }
 
 #[test]
@@ -1058,7 +1458,8 @@ fn test_fuse_compute_shape() {
             SymExpr::Var(
                 Symbol {
                     name: "batch".into(),
-                    positive: true
+                    positive: true,
+                    synthetic: false,
                 }
                 .into()
             ),
@@ -1307,4 +1708,92 @@ fn test_shape_inference_replaces_values_with_constants() {
     // model inputs.
     let output = graph.get_node(graph.output_ids()[0]).unwrap();
     assert_eq!(output.as_constant().and_then(|c| c.as_scalar()), Some(64));
+}
+
+#[test]
+fn test_shape_inference_constants_preserve_value_type() {
+    let graph = {
+        let x = Expr::value_with_info(
+            "data",
+            ValueType::Tensor(DataType::Float),
+            &dims!("batch", 4),
+        );
+        let bias_src = Expr::constant(NdTensor::<f32, _>::full([4], 1.));
+        let bias = bias_src.unary(Identity {});
+        let out = x.binary(Add {}, bias);
+        out.build_graph(&["data"])
+    };
+
+    let optimizer = GraphOptimizer::new();
+    let graph = optimizer
+        .optimize(
+            graph,
+            None,
+            OptimizeOptions {
+                infer_shapes: Some(InferShapeOptions::default()),
+            },
+        )
+        .unwrap();
+
+    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
+    let bias = op
+        .input_ids()
+        .iter()
+        .flatten()
+        .find_map(|id| graph.get_node(*id).and_then(|node| node.as_constant()))
+        .expect("expected a constant operand");
+
+    // f32 element type should be preserved
+    assert_eq!(bias.as_vector(), Some([1., 1., 1., 1.].as_slice()));
+}
+
+#[test]
+fn test_shape_inference_constants_shared_by_values_with_different_types() {
+    // Create a graph with a `Shape` node whose output has the same value
+    // `[2, 3]` as a float tensor. Shape inference will produce a single
+    // constant for these, but since the value nodes have different types,
+    // one constant node per type must be created in the graph.
+    let graph = {
+        let x = Expr::value_with_info("data", ValueType::Tensor(DataType::Float), &dims!(2, 3));
+        let shape = x.unary(Shape {
+            start: None,
+            end: None,
+        });
+
+        let y = Expr::value_with_info(
+            "scaled",
+            ValueType::Tensor(DataType::Float),
+            &dims!("batch", 2),
+        );
+        let scale = Expr::constant(NdTensor::from([2., 3.])).unary(Identity {});
+        let scaled = y.binary(Add {}, scale);
+
+        Expr::make_graph([x, y], [shape, scaled])
+    };
+
+    let optimizer = GraphOptimizer::new();
+    let graph = optimizer
+        .optimize(
+            graph,
+            None,
+            OptimizeOptions {
+                infer_shapes: Some(InferShapeOptions::default()),
+            },
+        )
+        .unwrap();
+
+    let shape_out = graph.get_node(graph.output_ids()[0]).unwrap();
+    assert_eq!(
+        shape_out.as_constant().and_then(|c| c.as_vector()),
+        Some([2i32, 3].as_slice())
+    );
+
+    let (_, op) = graph.get_source_node(graph.output_ids()[1]).unwrap();
+    let scale = op
+        .input_ids()
+        .iter()
+        .flatten()
+        .find_map(|id| graph.get_node(*id).and_then(|node| node.as_constant()))
+        .expect("expected a constant operand");
+    assert_eq!(scale.as_vector(), Some([2f32, 3.].as_slice()));
 }

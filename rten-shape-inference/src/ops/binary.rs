@@ -1,4 +1,4 @@
-use crate::infer_shapes::{BinaryOp, InferShapes, InferShapesError};
+use crate::infer_shapes::{BinaryOp, InferShapes, InferShapesContext, InferShapesError};
 use crate::sym_expr::SymExpr;
 use crate::sym_gen::SymbolGen;
 use crate::sym_tensor::SymTensor;
@@ -44,13 +44,12 @@ fn symbolic_binary_op(
 /// This will attempt to evaluate the operation on values in the tensor,
 /// otherwise it will fall back to inferring just the shape.
 fn binary_op_infer_shapes(
-    inputs: &[SymTensor],
+    inputs: InferShapesContext,
     sym_gen: &mut SymbolGen,
     op: impl FnMut(&SymExpr, &SymExpr) -> Option<SymExpr>,
 ) -> Result<Vec<SymTensor>, InferShapesError> {
-    let [lhs, rhs] = inputs else {
-        return Err(InferShapesError::IncorrectInputCount);
-    };
+    let lhs = inputs.require(0)?;
+    let rhs = inputs.require(1)?;
 
     if let Some(result) = symbolic_binary_op(lhs, rhs, op) {
         return Ok([result].into());
@@ -67,7 +66,7 @@ pub struct Add;
 impl InferShapes for Add {
     fn infer_shapes(
         &self,
-        inputs: &[SymTensor],
+        inputs: InferShapesContext,
         sym_gen: &mut SymbolGen,
     ) -> Result<Vec<SymTensor>, InferShapesError> {
         let add = |x: &SymExpr, y: &SymExpr| {
@@ -88,7 +87,7 @@ pub struct Sub;
 impl InferShapes for Sub {
     fn infer_shapes(
         &self,
-        inputs: &[SymTensor],
+        inputs: InferShapesContext,
         sym_gen: &mut SymbolGen,
     ) -> Result<Vec<SymTensor>, InferShapesError> {
         let sub = |x: &SymExpr, y: &SymExpr| {
@@ -109,7 +108,7 @@ pub struct Div;
 impl InferShapes for Div {
     fn infer_shapes(
         &self,
-        inputs: &[SymTensor],
+        inputs: InferShapesContext,
         sym_gen: &mut SymbolGen,
     ) -> Result<Vec<SymTensor>, InferShapesError> {
         let div = |x: &SymExpr, y: &SymExpr| {
@@ -130,7 +129,7 @@ pub struct Equal;
 impl InferShapes for Equal {
     fn infer_shapes(
         &self,
-        inputs: &[SymTensor],
+        inputs: InferShapesContext,
         sym_gen: &mut SymbolGen,
     ) -> Result<Vec<SymTensor>, InferShapesError> {
         let eq = |x: &SymExpr, y: &SymExpr| {
@@ -162,7 +161,7 @@ pub struct Mul;
 impl InferShapes for Mul {
     fn infer_shapes(
         &self,
-        inputs: &[SymTensor],
+        inputs: InferShapesContext,
         sym_gen: &mut SymbolGen,
     ) -> Result<Vec<SymTensor>, InferShapesError> {
         let mul = |x: &SymExpr, y: &SymExpr| {
@@ -175,6 +174,68 @@ impl InferShapes for Mul {
     }
 }
 
+/// Where operator.
+///
+/// See <https://onnx.ai/onnx/operators/onnx__Where.html>.
+pub struct Where;
+
+impl InferShapes for Where {
+    fn infer_shapes(
+        &self,
+        inputs: InferShapesContext,
+        sym_gen: &mut SymbolGen,
+    ) -> Result<Vec<SymTensor>, InferShapesError> {
+        let cond = inputs.require(0)?;
+        let x = inputs.require(1)?;
+        let y = inputs.require(2)?;
+
+        if let Some(cond_vals) = cond.values()
+            && let Some(x_vals) = x.values()
+            && let Some(y_vals) = y.values()
+        {
+            let len = cond_vals.len().max(x_vals.len()).max(y_vals.len());
+
+            let cs = cond_vals.iter().cycle().take(len);
+            let xs = x_vals.iter().cycle().take(len);
+            let ys = y_vals.iter().cycle().take(len);
+
+            let vals: Option<Vec<SymExpr>> = cs
+                .zip(xs.zip(ys))
+                .map(|(cond, (x, y))| {
+                    let cond_bool = match cond {
+                        SymExpr::Value(v) => Some(*v == 1),
+                        SymExpr::Var(_)
+                        | SymExpr::Neg(_)
+                        | SymExpr::Add(..)
+                        | SymExpr::Sub(..)
+                        | SymExpr::Mul(..)
+                        | SymExpr::Div(..)
+                        | SymExpr::DivCeil(..)
+                        | SymExpr::Max(..)
+                        | SymExpr::Min(..)
+                        | SymExpr::Broadcast(..) => None,
+                    }?;
+                    if cond_bool {
+                        Some(x.clone())
+                    } else {
+                        Some(y.clone())
+                    }
+                })
+                .collect();
+            if let Some(vals) = vals {
+                return Ok([SymTensor::from_vec(vals)].into());
+            }
+        }
+
+        // Broadcast the first two inputs together, then broadcast the result
+        // against the last input.
+        let cond_x = BinaryOp
+            .infer_shapes([cond.clone(), x.clone()].into(), sym_gen)?
+            .remove(0);
+        BinaryOp.infer_shapes([cond_x, y.clone()].into(), sym_gen)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::infer_shapes::InferShapes;
@@ -182,7 +243,7 @@ mod tests {
     use crate::sym_gen::SymbolGen;
     use crate::sym_tensor::{SymTensor, sym_shape, sym_vec};
 
-    use super::{Add, Div, Equal, Mul, Sub};
+    use super::{Add, Div, Equal, Mul, Sub, Where};
 
     #[test]
     fn test_add() {
@@ -191,13 +252,13 @@ mod tests {
         // Symbolic scalar
         let a = SymTensor::from_scalar(6.into());
         let b = SymTensor::from_scalar(5.into());
-        let result = Add.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Add.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], SymTensor::from_scalar(11.into()));
 
         // Symbolic vector
         let a = sym_vec!(5, "foo");
         let b = sym_vec!(6, "bar");
-        let result = Add.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Add.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(
             result[0],
             sym_vec!(11, SymExpr::from("foo") + SymExpr::from("bar"))
@@ -206,7 +267,7 @@ mod tests {
         // Other shape
         let a = sym_shape!(5, "foo");
         let b = sym_shape!(1, "foo");
-        let result = Add.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Add.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], sym_shape!(5, "foo"));
     }
 
@@ -217,13 +278,13 @@ mod tests {
         // Symbolic scalar
         let a = SymTensor::from_scalar(6.into());
         let b = SymTensor::from_scalar(5.into());
-        let result = Sub.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Sub.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], SymTensor::from_scalar(1.into()));
 
         // Symbolic vector
         let a = sym_vec!(5, "foo");
         let b = sym_vec!(6, "bar");
-        let result = Sub.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Sub.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(
             result[0],
             sym_vec!(-1, SymExpr::from("foo") - SymExpr::from("bar"))
@@ -232,7 +293,7 @@ mod tests {
         // Other shape
         let a = sym_shape!(5, "foo");
         let b = sym_shape!(1, "foo");
-        let result = Sub.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Sub.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], sym_shape!(5, "foo"));
     }
 
@@ -243,13 +304,13 @@ mod tests {
         // Symbolic vector with fixed values.
         let a = sym_vec!(16);
         let b = sym_vec!(2);
-        let result = Div.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Div.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], sym_vec!(8));
 
         // Symbolic vector with symbolic values.
         let a = sym_vec!(16);
         let b = sym_vec!("foo");
-        let result = Div.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Div.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(
             result[0],
             sym_vec!(SymExpr::from(16) / SymExpr::from("foo"))
@@ -258,7 +319,7 @@ mod tests {
         // Other shape
         let a = sym_shape!(5, "foo");
         let b = sym_shape!(1, "foo");
-        let result = Div.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Div.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], sym_shape!(5, "foo"));
     }
 
@@ -269,14 +330,14 @@ mod tests {
         // Comparison of fixed values.
         let a = sym_vec!(4, 8, 12);
         let b = sym_vec!(4, 2, 12);
-        let result = Equal.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Equal.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], sym_vec!(1, 0, 1));
 
         // Comparison of negative values with symbols that are known to have
         // a value >= 0.
         let a = sym_vec!("foo", "bar");
         let b = sym_vec!(-1, -1);
-        let result = Equal.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Equal.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], sym_vec!(0, 0));
 
         // Comparison of positive values with symbols.
@@ -285,7 +346,7 @@ mod tests {
         // fall back to regular shape inference.
         let a = sym_vec!("foo", "bar");
         let b = sym_vec!(2, 3);
-        let result = Equal.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Equal.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], sym_shape!(2));
     }
 
@@ -296,13 +357,13 @@ mod tests {
         // Symbolic scalar
         let a = SymTensor::from_scalar(6.into());
         let b = SymTensor::from_scalar(5.into());
-        let result = Mul.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Mul.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], SymTensor::from_scalar(30.into()));
 
         // Symbolic vector
         let a = sym_vec!(5, "foo");
         let b = sym_vec!(6, "bar");
-        let result = Mul.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Mul.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(
             result[0],
             sym_vec!(30, SymExpr::from("foo") * SymExpr::from("bar"))
@@ -311,7 +372,32 @@ mod tests {
         // Other shape
         let a = sym_shape!(5, "foo");
         let b = sym_shape!(1, "foo");
-        let result = Mul.infer_shapes(&[a, b], &mut sym_gen).unwrap();
+        let result = Mul.infer_shapes([a, b].into(), &mut sym_gen).unwrap();
         assert_eq!(result[0], sym_shape!(5, "foo"));
+    }
+
+    #[test]
+    fn test_where() {
+        let mut sym_gen = SymbolGen::new();
+
+        // Where op with symbolic vectors.
+        let cond = sym_vec!(0, 1, 0, 1);
+        let x = sym_vec!(1, 2, 3, 4);
+        let y = sym_vec!("foo", "bar", "baz", "meep");
+        let result = Where
+            .infer_shapes([cond, x, y].into(), &mut sym_gen)
+            .unwrap();
+        assert_eq!(result[0], sym_vec!("foo", 2, "baz", 4));
+
+        // Where op with shapes.
+        //
+        // This broadcasts the three inputs together.
+        let cond = sym_shape!(1, 16, 1);
+        let x = sym_shape!(8, 16, 1);
+        let y = sym_shape!(1, 16, 24);
+        let result = Where
+            .infer_shapes([cond, x, y].into(), &mut sym_gen)
+            .unwrap();
+        assert_eq!(result[0], sym_shape!(8, 16, 24));
     }
 }

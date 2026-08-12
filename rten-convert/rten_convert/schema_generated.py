@@ -136,6 +136,22 @@ class OperatorType(object):
     PRelu = 126
     STFT = 127
     GlobalMaxPool = 128
+    ReduceL1 = 129
+    Acosh = 130
+    Asinh = 131
+    Atanh = 132
+    Cosh = 133
+    Sinh = 134
+    Multinomial = 135
+    ReverseSequence = 136
+    DFT = 137
+    Scatter = 138
+    Upsample = 139
+    RotaryEmbedding = 140
+    Attention = 141
+    LpNormalization = 142
+    ReduceLogSum = 143
+    ReduceLogSumExp = 144
 
 
 class RNNDirection(object):
@@ -231,6 +247,14 @@ class OperatorAttrs(object):
     SplitToSequenceAttrs = 52
     GridSampleAttrs = 53
     STFTAttrs = 54
+    MultinomialAttrs = 55
+    ReverseSequenceAttrs = 56
+    DFTAttrs = 57
+    UpsampleAttrs = 58
+    RotaryEmbeddingAttrs = 59
+    AttentionAttrs = 60
+    CumSumAttrs = 61
+    LpNormalizationAttrs = 62
 
 def OperatorAttrsCreator(unionType, table):
     from flatbuffers.table import Table
@@ -344,6 +368,22 @@ def OperatorAttrsCreator(unionType, table):
         return GridSampleAttrsT.InitFromBuf(table.Bytes, table.Pos)
     if unionType == OperatorAttrs.STFTAttrs:
         return STFTAttrsT.InitFromBuf(table.Bytes, table.Pos)
+    if unionType == OperatorAttrs.MultinomialAttrs:
+        return MultinomialAttrsT.InitFromBuf(table.Bytes, table.Pos)
+    if unionType == OperatorAttrs.ReverseSequenceAttrs:
+        return ReverseSequenceAttrsT.InitFromBuf(table.Bytes, table.Pos)
+    if unionType == OperatorAttrs.DFTAttrs:
+        return DFTAttrsT.InitFromBuf(table.Bytes, table.Pos)
+    if unionType == OperatorAttrs.UpsampleAttrs:
+        return UpsampleAttrsT.InitFromBuf(table.Bytes, table.Pos)
+    if unionType == OperatorAttrs.RotaryEmbeddingAttrs:
+        return RotaryEmbeddingAttrsT.InitFromBuf(table.Bytes, table.Pos)
+    if unionType == OperatorAttrs.AttentionAttrs:
+        return AttentionAttrsT.InitFromBuf(table.Bytes, table.Pos)
+    if unionType == OperatorAttrs.CumSumAttrs:
+        return CumSumAttrsT.InitFromBuf(table.Bytes, table.Pos)
+    if unionType == OperatorAttrs.LpNormalizationAttrs:
+        return LpNormalizationAttrsT.InitFromBuf(table.Bytes, table.Pos)
     return None
 
 
@@ -2182,8 +2222,35 @@ class ConvTransposeAttrs(object):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(12))
         return o == 0
 
+    # ConvTransposeAttrs
+    def Dilations(self, j):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(14))
+        if o != 0:
+            a = self._tab.Vector(o)
+            return self._tab.Get(flatbuffers.number_types.Uint32Flags, a + flatbuffers.number_types.UOffsetTFlags.py_type(j * 4))
+        return 0
+
+    # ConvTransposeAttrs
+    def DilationsAsNumpy(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(14))
+        if o != 0:
+            return self._tab.GetVectorAsNumpy(flatbuffers.number_types.Uint32Flags, o)
+        return 0
+
+    # ConvTransposeAttrs
+    def DilationsLength(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(14))
+        if o != 0:
+            return self._tab.VectorLen(o)
+        return 0
+
+    # ConvTransposeAttrs
+    def DilationsIsNone(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(14))
+        return o == 0
+
 def ConvTransposeAttrsStart(builder):
-    builder.StartObject(5)
+    builder.StartObject(6)
 
 def ConvTransposeAttrsAddStrides(builder, strides):
     builder.PrependUOffsetTRelativeSlot(0, flatbuffers.number_types.UOffsetTFlags.py_type(strides), 0)
@@ -2209,6 +2276,12 @@ def ConvTransposeAttrsAddOutputPadding(builder, outputPadding):
 def ConvTransposeAttrsStartOutputPaddingVector(builder, numElems):
     return builder.StartVector(4, numElems, 4)
 
+def ConvTransposeAttrsAddDilations(builder, dilations):
+    builder.PrependUOffsetTRelativeSlot(5, flatbuffers.number_types.UOffsetTFlags.py_type(dilations), 0)
+
+def ConvTransposeAttrsStartDilationsVector(builder, numElems):
+    return builder.StartVector(4, numElems, 4)
+
 def ConvTransposeAttrsEnd(builder):
     return builder.EndObject()
 
@@ -2228,12 +2301,14 @@ class ConvTransposeAttrsT(object):
         pads = None,
         groups = 1,
         outputPadding = None,
+        dilations = None,
     ):
         self.strides = strides  # type: Optional[List[int]]
         self.autoPad = autoPad  # type: int
         self.pads = pads  # type: Optional[List[int]]
         self.groups = groups  # type: int
         self.outputPadding = outputPadding  # type: Optional[List[int]]
+        self.dilations = dilations  # type: Optional[List[int]]
 
     @classmethod
     def InitFromBuf(cls, buf, pos):
@@ -2279,6 +2354,13 @@ class ConvTransposeAttrsT(object):
                     self.outputPadding.append(convTransposeAttrs.OutputPadding(i))
             else:
                 self.outputPadding = convTransposeAttrs.OutputPaddingAsNumpy()
+        if not convTransposeAttrs.DilationsIsNone():
+            if np is None:
+                self.dilations = []
+                for i in range(convTransposeAttrs.DilationsLength()):
+                    self.dilations.append(convTransposeAttrs.Dilations(i))
+            else:
+                self.dilations = convTransposeAttrs.DilationsAsNumpy()
 
     # ConvTransposeAttrsT
     def Pack(self, builder):
@@ -2306,6 +2388,14 @@ class ConvTransposeAttrsT(object):
                 for i in reversed(range(len(self.outputPadding))):
                     builder.PrependUint32(self.outputPadding[i])
                 outputPadding = builder.EndVector()
+        if self.dilations is not None:
+            if np is not None and type(self.dilations) is np.ndarray:
+                dilations = builder.CreateNumpyVector(self.dilations)
+            else:
+                ConvTransposeAttrsStartDilationsVector(builder, len(self.dilations))
+                for i in reversed(range(len(self.dilations))):
+                    builder.PrependUint32(self.dilations[i])
+                dilations = builder.EndVector()
         ConvTransposeAttrsStart(builder)
         if self.strides is not None:
             ConvTransposeAttrsAddStrides(builder, strides)
@@ -2315,8 +2405,104 @@ class ConvTransposeAttrsT(object):
         ConvTransposeAttrsAddGroups(builder, self.groups)
         if self.outputPadding is not None:
             ConvTransposeAttrsAddOutputPadding(builder, outputPadding)
+        if self.dilations is not None:
+            ConvTransposeAttrsAddDilations(builder, dilations)
         convTransposeAttrs = ConvTransposeAttrsEnd(builder)
         return convTransposeAttrs
+
+
+class CumSumAttrs(object):
+    __slots__ = ['_tab']
+
+    @classmethod
+    def GetRootAs(cls, buf, offset=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, offset)
+        x = CumSumAttrs()
+        x.Init(buf, n + offset)
+        return x
+
+    @classmethod
+    def GetRootAsCumSumAttrs(cls, buf, offset=0):
+        """This method is deprecated. Please switch to GetRootAs."""
+        return cls.GetRootAs(buf, offset)
+    @classmethod
+    def CumSumAttrsBufferHasIdentifier(cls, buf, offset, size_prefixed=False):
+        return flatbuffers.util.BufferHasIdentifier(buf, offset, b"\x52\x54\x45\x4E", size_prefixed=size_prefixed)
+
+    # CumSumAttrs
+    def Init(self, buf, pos):
+        self._tab = flatbuffers.table.Table(buf, pos)
+
+    # CumSumAttrs
+    def Exclusive(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            return bool(self._tab.Get(flatbuffers.number_types.BoolFlags, o + self._tab.Pos))
+        return False
+
+    # CumSumAttrs
+    def Reverse(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
+        if o != 0:
+            return bool(self._tab.Get(flatbuffers.number_types.BoolFlags, o + self._tab.Pos))
+        return False
+
+def CumSumAttrsStart(builder):
+    builder.StartObject(2)
+
+def CumSumAttrsAddExclusive(builder, exclusive):
+    builder.PrependBoolSlot(0, exclusive, 0)
+
+def CumSumAttrsAddReverse(builder, reverse):
+    builder.PrependBoolSlot(1, reverse, 0)
+
+def CumSumAttrsEnd(builder):
+    return builder.EndObject()
+
+
+
+class CumSumAttrsT(object):
+
+    # CumSumAttrsT
+    def __init__(
+        self,
+        exclusive = False,
+        reverse = False,
+    ):
+        self.exclusive = exclusive  # type: bool
+        self.reverse = reverse  # type: bool
+
+    @classmethod
+    def InitFromBuf(cls, buf, pos):
+        cumSumAttrs = CumSumAttrs()
+        cumSumAttrs.Init(buf, pos)
+        return cls.InitFromObj(cumSumAttrs)
+
+    @classmethod
+    def InitFromPackedBuf(cls, buf, pos=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, pos)
+        return cls.InitFromBuf(buf, pos+n)
+
+    @classmethod
+    def InitFromObj(cls, cumSumAttrs):
+        x = CumSumAttrsT()
+        x._UnPack(cumSumAttrs)
+        return x
+
+    # CumSumAttrsT
+    def _UnPack(self, cumSumAttrs):
+        if cumSumAttrs is None:
+            return
+        self.exclusive = cumSumAttrs.Exclusive()
+        self.reverse = cumSumAttrs.Reverse()
+
+    # CumSumAttrsT
+    def Pack(self, builder):
+        CumSumAttrsStart(builder)
+        CumSumAttrsAddExclusive(builder, self.exclusive)
+        CumSumAttrsAddReverse(builder, self.reverse)
+        cumSumAttrs = CumSumAttrsEnd(builder)
+        return cumSumAttrs
 
 
 class DequantizeLinearAttrs(object):
@@ -2734,6 +2920,100 @@ class LayerNormalizationAttrsT(object):
         LayerNormalizationAttrsAddEpsilon(builder, self.epsilon)
         layerNormalizationAttrs = LayerNormalizationAttrsEnd(builder)
         return layerNormalizationAttrs
+
+
+class LpNormalizationAttrs(object):
+    __slots__ = ['_tab']
+
+    @classmethod
+    def GetRootAs(cls, buf, offset=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, offset)
+        x = LpNormalizationAttrs()
+        x.Init(buf, n + offset)
+        return x
+
+    @classmethod
+    def GetRootAsLpNormalizationAttrs(cls, buf, offset=0):
+        """This method is deprecated. Please switch to GetRootAs."""
+        return cls.GetRootAs(buf, offset)
+    @classmethod
+    def LpNormalizationAttrsBufferHasIdentifier(cls, buf, offset, size_prefixed=False):
+        return flatbuffers.util.BufferHasIdentifier(buf, offset, b"\x52\x54\x45\x4E", size_prefixed=size_prefixed)
+
+    # LpNormalizationAttrs
+    def Init(self, buf, pos):
+        self._tab = flatbuffers.table.Table(buf, pos)
+
+    # LpNormalizationAttrs
+    def Axis(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Int32Flags, o + self._tab.Pos)
+        return -1
+
+    # LpNormalizationAttrs
+    def P(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint32Flags, o + self._tab.Pos)
+        return 2
+
+def LpNormalizationAttrsStart(builder):
+    builder.StartObject(2)
+
+def LpNormalizationAttrsAddAxis(builder, axis):
+    builder.PrependInt32Slot(0, axis, -1)
+
+def LpNormalizationAttrsAddP(builder, p):
+    builder.PrependUint32Slot(1, p, 2)
+
+def LpNormalizationAttrsEnd(builder):
+    return builder.EndObject()
+
+
+
+class LpNormalizationAttrsT(object):
+
+    # LpNormalizationAttrsT
+    def __init__(
+        self,
+        axis = -1,
+        p = 2,
+    ):
+        self.axis = axis  # type: int
+        self.p = p  # type: int
+
+    @classmethod
+    def InitFromBuf(cls, buf, pos):
+        lpNormalizationAttrs = LpNormalizationAttrs()
+        lpNormalizationAttrs.Init(buf, pos)
+        return cls.InitFromObj(lpNormalizationAttrs)
+
+    @classmethod
+    def InitFromPackedBuf(cls, buf, pos=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, pos)
+        return cls.InitFromBuf(buf, pos+n)
+
+    @classmethod
+    def InitFromObj(cls, lpNormalizationAttrs):
+        x = LpNormalizationAttrsT()
+        x._UnPack(lpNormalizationAttrs)
+        return x
+
+    # LpNormalizationAttrsT
+    def _UnPack(self, lpNormalizationAttrs):
+        if lpNormalizationAttrs is None:
+            return
+        self.axis = lpNormalizationAttrs.Axis()
+        self.p = lpNormalizationAttrs.P()
+
+    # LpNormalizationAttrsT
+    def Pack(self, builder):
+        LpNormalizationAttrsStart(builder)
+        LpNormalizationAttrsAddAxis(builder, self.axis)
+        LpNormalizationAttrsAddP(builder, self.p)
+        lpNormalizationAttrs = LpNormalizationAttrsEnd(builder)
+        return lpNormalizationAttrs
 
 
 class LoopAttrs(object):
@@ -4089,6 +4369,104 @@ class ModAttrsT(object):
         ModAttrsAddFmod(builder, self.fmod)
         modAttrs = ModAttrsEnd(builder)
         return modAttrs
+
+
+class MultinomialAttrs(object):
+    __slots__ = ['_tab']
+
+    @classmethod
+    def GetRootAs(cls, buf, offset=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, offset)
+        x = MultinomialAttrs()
+        x.Init(buf, n + offset)
+        return x
+
+    @classmethod
+    def GetRootAsMultinomialAttrs(cls, buf, offset=0):
+        """This method is deprecated. Please switch to GetRootAs."""
+        return cls.GetRootAs(buf, offset)
+    @classmethod
+    def MultinomialAttrsBufferHasIdentifier(cls, buf, offset, size_prefixed=False):
+        return flatbuffers.util.BufferHasIdentifier(buf, offset, b"\x52\x54\x45\x4E", size_prefixed=size_prefixed)
+
+    # MultinomialAttrs
+    def Init(self, buf, pos):
+        self._tab = flatbuffers.table.Table(buf, pos)
+
+    # MultinomialAttrs
+    def SampleSize(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Int32Flags, o + self._tab.Pos)
+        return 0
+
+    # MultinomialAttrs
+    def Seed(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Float32Flags, o + self._tab.Pos)
+        return None
+
+def MultinomialAttrsStart(builder):
+    builder.StartObject(2)
+
+def MultinomialAttrsAddSampleSize(builder, sampleSize):
+    builder.PrependInt32Slot(0, sampleSize, 0)
+
+def MultinomialAttrsAddSeed(builder, seed):
+    builder.PrependFloat32Slot(1, seed, None)
+
+def MultinomialAttrsEnd(builder):
+    return builder.EndObject()
+
+
+try:
+    from typing import Optional
+except:
+    pass
+
+class MultinomialAttrsT(object):
+
+    # MultinomialAttrsT
+    def __init__(
+        self,
+        sampleSize = 0,
+        seed = None,
+    ):
+        self.sampleSize = sampleSize  # type: int
+        self.seed = seed  # type: Optional[float]
+
+    @classmethod
+    def InitFromBuf(cls, buf, pos):
+        multinomialAttrs = MultinomialAttrs()
+        multinomialAttrs.Init(buf, pos)
+        return cls.InitFromObj(multinomialAttrs)
+
+    @classmethod
+    def InitFromPackedBuf(cls, buf, pos=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, pos)
+        return cls.InitFromBuf(buf, pos+n)
+
+    @classmethod
+    def InitFromObj(cls, multinomialAttrs):
+        x = MultinomialAttrsT()
+        x._UnPack(multinomialAttrs)
+        return x
+
+    # MultinomialAttrsT
+    def _UnPack(self, multinomialAttrs):
+        if multinomialAttrs is None:
+            return
+        self.sampleSize = multinomialAttrs.SampleSize()
+        self.seed = multinomialAttrs.Seed()
+
+    # MultinomialAttrsT
+    def Pack(self, builder):
+        MultinomialAttrsStart(builder)
+        MultinomialAttrsAddSampleSize(builder, self.sampleSize)
+        MultinomialAttrsAddSeed(builder, self.seed)
+        multinomialAttrs = MultinomialAttrsEnd(builder)
+        return multinomialAttrs
 
 
 class NonMaxSuppressionAttrs(object):
@@ -5493,6 +5871,334 @@ class ScatterNDAttrsT(object):
         return scatterNdattrs
 
 
+class UpsampleAttrs(object):
+    __slots__ = ['_tab']
+
+    @classmethod
+    def GetRootAs(cls, buf, offset=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, offset)
+        x = UpsampleAttrs()
+        x.Init(buf, n + offset)
+        return x
+
+    @classmethod
+    def GetRootAsUpsampleAttrs(cls, buf, offset=0):
+        """This method is deprecated. Please switch to GetRootAs."""
+        return cls.GetRootAs(buf, offset)
+    @classmethod
+    def UpsampleAttrsBufferHasIdentifier(cls, buf, offset, size_prefixed=False):
+        return flatbuffers.util.BufferHasIdentifier(buf, offset, b"\x52\x54\x45\x4E", size_prefixed=size_prefixed)
+
+    # UpsampleAttrs
+    def Init(self, buf, pos):
+        self._tab = flatbuffers.table.Table(buf, pos)
+
+    # UpsampleAttrs
+    def Mode(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint8Flags, o + self._tab.Pos)
+        return 0
+
+def UpsampleAttrsStart(builder):
+    builder.StartObject(1)
+
+def UpsampleAttrsAddMode(builder, mode):
+    builder.PrependUint8Slot(0, mode, 0)
+
+def UpsampleAttrsEnd(builder):
+    return builder.EndObject()
+
+
+
+class UpsampleAttrsT(object):
+
+    # UpsampleAttrsT
+    def __init__(
+        self,
+        mode = 0,
+    ):
+        self.mode = mode  # type: int
+
+    @classmethod
+    def InitFromBuf(cls, buf, pos):
+        upsampleAttrs = UpsampleAttrs()
+        upsampleAttrs.Init(buf, pos)
+        return cls.InitFromObj(upsampleAttrs)
+
+    @classmethod
+    def InitFromPackedBuf(cls, buf, pos=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, pos)
+        return cls.InitFromBuf(buf, pos+n)
+
+    @classmethod
+    def InitFromObj(cls, upsampleAttrs):
+        x = UpsampleAttrsT()
+        x._UnPack(upsampleAttrs)
+        return x
+
+    # UpsampleAttrsT
+    def _UnPack(self, upsampleAttrs):
+        if upsampleAttrs is None:
+            return
+        self.mode = upsampleAttrs.Mode()
+
+    # UpsampleAttrsT
+    def Pack(self, builder):
+        UpsampleAttrsStart(builder)
+        UpsampleAttrsAddMode(builder, self.mode)
+        upsampleAttrs = UpsampleAttrsEnd(builder)
+        return upsampleAttrs
+
+
+class RotaryEmbeddingAttrs(object):
+    __slots__ = ['_tab']
+
+    @classmethod
+    def GetRootAs(cls, buf, offset=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, offset)
+        x = RotaryEmbeddingAttrs()
+        x.Init(buf, n + offset)
+        return x
+
+    @classmethod
+    def GetRootAsRotaryEmbeddingAttrs(cls, buf, offset=0):
+        """This method is deprecated. Please switch to GetRootAs."""
+        return cls.GetRootAs(buf, offset)
+    @classmethod
+    def RotaryEmbeddingAttrsBufferHasIdentifier(cls, buf, offset, size_prefixed=False):
+        return flatbuffers.util.BufferHasIdentifier(buf, offset, b"\x52\x54\x45\x4E", size_prefixed=size_prefixed)
+
+    # RotaryEmbeddingAttrs
+    def Init(self, buf, pos):
+        self._tab = flatbuffers.table.Table(buf, pos)
+
+    # RotaryEmbeddingAttrs
+    def Interleaved(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            return bool(self._tab.Get(flatbuffers.number_types.BoolFlags, o + self._tab.Pos))
+        return False
+
+    # RotaryEmbeddingAttrs
+    def NumHeads(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint32Flags, o + self._tab.Pos)
+        return 0
+
+    # RotaryEmbeddingAttrs
+    def RotaryEmbeddingDim(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(8))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint32Flags, o + self._tab.Pos)
+        return 0
+
+def RotaryEmbeddingAttrsStart(builder):
+    builder.StartObject(3)
+
+def RotaryEmbeddingAttrsAddInterleaved(builder, interleaved):
+    builder.PrependBoolSlot(0, interleaved, 0)
+
+def RotaryEmbeddingAttrsAddNumHeads(builder, numHeads):
+    builder.PrependUint32Slot(1, numHeads, 0)
+
+def RotaryEmbeddingAttrsAddRotaryEmbeddingDim(builder, rotaryEmbeddingDim):
+    builder.PrependUint32Slot(2, rotaryEmbeddingDim, 0)
+
+def RotaryEmbeddingAttrsEnd(builder):
+    return builder.EndObject()
+
+
+
+class RotaryEmbeddingAttrsT(object):
+
+    # RotaryEmbeddingAttrsT
+    def __init__(
+        self,
+        interleaved = False,
+        numHeads = 0,
+        rotaryEmbeddingDim = 0,
+    ):
+        self.interleaved = interleaved  # type: bool
+        self.numHeads = numHeads  # type: int
+        self.rotaryEmbeddingDim = rotaryEmbeddingDim  # type: int
+
+    @classmethod
+    def InitFromBuf(cls, buf, pos):
+        rotaryEmbeddingAttrs = RotaryEmbeddingAttrs()
+        rotaryEmbeddingAttrs.Init(buf, pos)
+        return cls.InitFromObj(rotaryEmbeddingAttrs)
+
+    @classmethod
+    def InitFromPackedBuf(cls, buf, pos=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, pos)
+        return cls.InitFromBuf(buf, pos+n)
+
+    @classmethod
+    def InitFromObj(cls, rotaryEmbeddingAttrs):
+        x = RotaryEmbeddingAttrsT()
+        x._UnPack(rotaryEmbeddingAttrs)
+        return x
+
+    # RotaryEmbeddingAttrsT
+    def _UnPack(self, rotaryEmbeddingAttrs):
+        if rotaryEmbeddingAttrs is None:
+            return
+        self.interleaved = rotaryEmbeddingAttrs.Interleaved()
+        self.numHeads = rotaryEmbeddingAttrs.NumHeads()
+        self.rotaryEmbeddingDim = rotaryEmbeddingAttrs.RotaryEmbeddingDim()
+
+    # RotaryEmbeddingAttrsT
+    def Pack(self, builder):
+        RotaryEmbeddingAttrsStart(builder)
+        RotaryEmbeddingAttrsAddInterleaved(builder, self.interleaved)
+        RotaryEmbeddingAttrsAddNumHeads(builder, self.numHeads)
+        RotaryEmbeddingAttrsAddRotaryEmbeddingDim(builder, self.rotaryEmbeddingDim)
+        rotaryEmbeddingAttrs = RotaryEmbeddingAttrsEnd(builder)
+        return rotaryEmbeddingAttrs
+
+
+class AttentionAttrs(object):
+    __slots__ = ['_tab']
+
+    @classmethod
+    def GetRootAs(cls, buf, offset=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, offset)
+        x = AttentionAttrs()
+        x.Init(buf, n + offset)
+        return x
+
+    @classmethod
+    def GetRootAsAttentionAttrs(cls, buf, offset=0):
+        """This method is deprecated. Please switch to GetRootAs."""
+        return cls.GetRootAs(buf, offset)
+    @classmethod
+    def AttentionAttrsBufferHasIdentifier(cls, buf, offset, size_prefixed=False):
+        return flatbuffers.util.BufferHasIdentifier(buf, offset, b"\x52\x54\x45\x4E", size_prefixed=size_prefixed)
+
+    # AttentionAttrs
+    def Init(self, buf, pos):
+        self._tab = flatbuffers.table.Table(buf, pos)
+
+    # AttentionAttrs
+    def IsCausal(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            return bool(self._tab.Get(flatbuffers.number_types.BoolFlags, o + self._tab.Pos))
+        return False
+
+    # AttentionAttrs
+    def QNumHeads(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint32Flags, o + self._tab.Pos)
+        return None
+
+    # AttentionAttrs
+    def KvNumHeads(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(8))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint32Flags, o + self._tab.Pos)
+        return None
+
+    # AttentionAttrs
+    def Scale(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(10))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Float32Flags, o + self._tab.Pos)
+        return None
+
+    # AttentionAttrs
+    def Softcap(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(12))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Float32Flags, o + self._tab.Pos)
+        return 0.0
+
+def AttentionAttrsStart(builder):
+    builder.StartObject(5)
+
+def AttentionAttrsAddIsCausal(builder, isCausal):
+    builder.PrependBoolSlot(0, isCausal, 0)
+
+def AttentionAttrsAddQNumHeads(builder, qNumHeads):
+    builder.PrependUint32Slot(1, qNumHeads, None)
+
+def AttentionAttrsAddKvNumHeads(builder, kvNumHeads):
+    builder.PrependUint32Slot(2, kvNumHeads, None)
+
+def AttentionAttrsAddScale(builder, scale):
+    builder.PrependFloat32Slot(3, scale, None)
+
+def AttentionAttrsAddSoftcap(builder, softcap):
+    builder.PrependFloat32Slot(4, softcap, 0.0)
+
+def AttentionAttrsEnd(builder):
+    return builder.EndObject()
+
+
+try:
+    from typing import Optional
+except:
+    pass
+
+class AttentionAttrsT(object):
+
+    # AttentionAttrsT
+    def __init__(
+        self,
+        isCausal = False,
+        qNumHeads = None,
+        kvNumHeads = None,
+        scale = None,
+        softcap = 0.0,
+    ):
+        self.isCausal = isCausal  # type: bool
+        self.qNumHeads = qNumHeads  # type: Optional[int]
+        self.kvNumHeads = kvNumHeads  # type: Optional[int]
+        self.scale = scale  # type: Optional[float]
+        self.softcap = softcap  # type: float
+
+    @classmethod
+    def InitFromBuf(cls, buf, pos):
+        attentionAttrs = AttentionAttrs()
+        attentionAttrs.Init(buf, pos)
+        return cls.InitFromObj(attentionAttrs)
+
+    @classmethod
+    def InitFromPackedBuf(cls, buf, pos=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, pos)
+        return cls.InitFromBuf(buf, pos+n)
+
+    @classmethod
+    def InitFromObj(cls, attentionAttrs):
+        x = AttentionAttrsT()
+        x._UnPack(attentionAttrs)
+        return x
+
+    # AttentionAttrsT
+    def _UnPack(self, attentionAttrs):
+        if attentionAttrs is None:
+            return
+        self.isCausal = attentionAttrs.IsCausal()
+        self.qNumHeads = attentionAttrs.QNumHeads()
+        self.kvNumHeads = attentionAttrs.KvNumHeads()
+        self.scale = attentionAttrs.Scale()
+        self.softcap = attentionAttrs.Softcap()
+
+    # AttentionAttrsT
+    def Pack(self, builder):
+        AttentionAttrsStart(builder)
+        AttentionAttrsAddIsCausal(builder, self.isCausal)
+        AttentionAttrsAddQNumHeads(builder, self.qNumHeads)
+        AttentionAttrsAddKvNumHeads(builder, self.kvNumHeads)
+        AttentionAttrsAddScale(builder, self.scale)
+        AttentionAttrsAddSoftcap(builder, self.softcap)
+        attentionAttrs = AttentionAttrsEnd(builder)
+        return attentionAttrs
+
+
 class SequenceEmptyAttrs(object):
     __slots__ = ['_tab']
 
@@ -6027,6 +6733,194 @@ class STFTAttrsT(object):
         return stftattrs
 
 
+class ReverseSequenceAttrs(object):
+    __slots__ = ['_tab']
+
+    @classmethod
+    def GetRootAs(cls, buf, offset=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, offset)
+        x = ReverseSequenceAttrs()
+        x.Init(buf, n + offset)
+        return x
+
+    @classmethod
+    def GetRootAsReverseSequenceAttrs(cls, buf, offset=0):
+        """This method is deprecated. Please switch to GetRootAs."""
+        return cls.GetRootAs(buf, offset)
+    @classmethod
+    def ReverseSequenceAttrsBufferHasIdentifier(cls, buf, offset, size_prefixed=False):
+        return flatbuffers.util.BufferHasIdentifier(buf, offset, b"\x52\x54\x45\x4E", size_prefixed=size_prefixed)
+
+    # ReverseSequenceAttrs
+    def Init(self, buf, pos):
+        self._tab = flatbuffers.table.Table(buf, pos)
+
+    # ReverseSequenceAttrs
+    def BatchAxis(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Int32Flags, o + self._tab.Pos)
+        return 1
+
+    # ReverseSequenceAttrs
+    def TimeAxis(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Int32Flags, o + self._tab.Pos)
+        return 0
+
+def ReverseSequenceAttrsStart(builder):
+    builder.StartObject(2)
+
+def ReverseSequenceAttrsAddBatchAxis(builder, batchAxis):
+    builder.PrependInt32Slot(0, batchAxis, 1)
+
+def ReverseSequenceAttrsAddTimeAxis(builder, timeAxis):
+    builder.PrependInt32Slot(1, timeAxis, 0)
+
+def ReverseSequenceAttrsEnd(builder):
+    return builder.EndObject()
+
+
+
+class ReverseSequenceAttrsT(object):
+
+    # ReverseSequenceAttrsT
+    def __init__(
+        self,
+        batchAxis = 1,
+        timeAxis = 0,
+    ):
+        self.batchAxis = batchAxis  # type: int
+        self.timeAxis = timeAxis  # type: int
+
+    @classmethod
+    def InitFromBuf(cls, buf, pos):
+        reverseSequenceAttrs = ReverseSequenceAttrs()
+        reverseSequenceAttrs.Init(buf, pos)
+        return cls.InitFromObj(reverseSequenceAttrs)
+
+    @classmethod
+    def InitFromPackedBuf(cls, buf, pos=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, pos)
+        return cls.InitFromBuf(buf, pos+n)
+
+    @classmethod
+    def InitFromObj(cls, reverseSequenceAttrs):
+        x = ReverseSequenceAttrsT()
+        x._UnPack(reverseSequenceAttrs)
+        return x
+
+    # ReverseSequenceAttrsT
+    def _UnPack(self, reverseSequenceAttrs):
+        if reverseSequenceAttrs is None:
+            return
+        self.batchAxis = reverseSequenceAttrs.BatchAxis()
+        self.timeAxis = reverseSequenceAttrs.TimeAxis()
+
+    # ReverseSequenceAttrsT
+    def Pack(self, builder):
+        ReverseSequenceAttrsStart(builder)
+        ReverseSequenceAttrsAddBatchAxis(builder, self.batchAxis)
+        ReverseSequenceAttrsAddTimeAxis(builder, self.timeAxis)
+        reverseSequenceAttrs = ReverseSequenceAttrsEnd(builder)
+        return reverseSequenceAttrs
+
+
+class DFTAttrs(object):
+    __slots__ = ['_tab']
+
+    @classmethod
+    def GetRootAs(cls, buf, offset=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, offset)
+        x = DFTAttrs()
+        x.Init(buf, n + offset)
+        return x
+
+    @classmethod
+    def GetRootAsDFTAttrs(cls, buf, offset=0):
+        """This method is deprecated. Please switch to GetRootAs."""
+        return cls.GetRootAs(buf, offset)
+    @classmethod
+    def DFTAttrsBufferHasIdentifier(cls, buf, offset, size_prefixed=False):
+        return flatbuffers.util.BufferHasIdentifier(buf, offset, b"\x52\x54\x45\x4E", size_prefixed=size_prefixed)
+
+    # DFTAttrs
+    def Init(self, buf, pos):
+        self._tab = flatbuffers.table.Table(buf, pos)
+
+    # DFTAttrs
+    def Inverse(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            return bool(self._tab.Get(flatbuffers.number_types.BoolFlags, o + self._tab.Pos))
+        return False
+
+    # DFTAttrs
+    def Onesided(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
+        if o != 0:
+            return bool(self._tab.Get(flatbuffers.number_types.BoolFlags, o + self._tab.Pos))
+        return False
+
+def DFTAttrsStart(builder):
+    builder.StartObject(2)
+
+def DFTAttrsAddInverse(builder, inverse):
+    builder.PrependBoolSlot(0, inverse, 0)
+
+def DFTAttrsAddOnesided(builder, onesided):
+    builder.PrependBoolSlot(1, onesided, 0)
+
+def DFTAttrsEnd(builder):
+    return builder.EndObject()
+
+
+
+class DFTAttrsT(object):
+
+    # DFTAttrsT
+    def __init__(
+        self,
+        inverse = False,
+        onesided = False,
+    ):
+        self.inverse = inverse  # type: bool
+        self.onesided = onesided  # type: bool
+
+    @classmethod
+    def InitFromBuf(cls, buf, pos):
+        dftattrs = DFTAttrs()
+        dftattrs.Init(buf, pos)
+        return cls.InitFromObj(dftattrs)
+
+    @classmethod
+    def InitFromPackedBuf(cls, buf, pos=0):
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, pos)
+        return cls.InitFromBuf(buf, pos+n)
+
+    @classmethod
+    def InitFromObj(cls, dftattrs):
+        x = DFTAttrsT()
+        x._UnPack(dftattrs)
+        return x
+
+    # DFTAttrsT
+    def _UnPack(self, dftattrs):
+        if dftattrs is None:
+            return
+        self.inverse = dftattrs.Inverse()
+        self.onesided = dftattrs.Onesided()
+
+    # DFTAttrsT
+    def Pack(self, builder):
+        DFTAttrsStart(builder)
+        DFTAttrsAddInverse(builder, self.inverse)
+        DFTAttrsAddOnesided(builder, self.onesided)
+        dftattrs = DFTAttrsEnd(builder)
+        return dftattrs
+
+
 class TopKAttrs(object):
     __slots__ = ['_tab']
 
@@ -6483,7 +7377,7 @@ class OperatorNodeT(object):
     ):
         self.type = type  # type: int
         self.attrsType = attrsType  # type: int
-        self.attrs = attrs  # type: Union[None, 'ArgMaxAttrsT', 'AveragePoolAttrsT', 'BatchNormalizationAttrsT', 'CastAttrsT', 'ConcatAttrsT', 'ConstantOfShapeAttrsT', 'ConvAttrsT', 'ConvTransposeAttrsT', 'FlattenAttrsT', 'GatherAttrsT', 'GemmAttrsT', 'GRUAttrsT', 'LeakyReluAttrsT', 'LSTMAttrsT', 'MaxPoolAttrsT', 'ReduceMeanAttrsT', 'ReshapeAttrsT', 'ResizeAttrsT', 'SplitAttrsT', 'SoftmaxAttrsT', 'TransposeAttrsT', 'ModAttrsT', 'ScatterElementsAttrsT', 'OneHotAttrsT', 'TopKAttrsT', 'HardSigmoidAttrsT', 'TriluAttrsT', 'ScatterNDAttrsT', 'NonMaxSuppressionAttrsT', 'LayerNormalizationAttrsT', 'RandomUniformAttrsT', 'EluAttrsT', 'RandomUniformLikeAttrsT', 'RandomNormalAttrsT', 'RandomNormalLikeAttrsT', 'GatherNDAttrsT', 'GeluAttrsT', 'EinsumAttrsT', 'IfAttrsT', 'PadAttrsT', 'DequantizeLinearAttrsT', 'QuantizeLinearAttrsT', 'DepthToSpaceAttrsT', 'CastLikeAttrsT', 'ShapeAttrsT', 'DropoutAttrsT', 'EyeLikeAttrsT', 'IsInfAttrsT', 'LoopAttrsT', 'SequenceEmptyAttrsT', 'ConcatFromSequenceAttrsT', 'SplitToSequenceAttrsT', 'GridSampleAttrsT', 'STFTAttrsT']
+        self.attrs = attrs  # type: Union[None, 'ArgMaxAttrsT', 'AveragePoolAttrsT', 'BatchNormalizationAttrsT', 'CastAttrsT', 'ConcatAttrsT', 'ConstantOfShapeAttrsT', 'ConvAttrsT', 'ConvTransposeAttrsT', 'FlattenAttrsT', 'GatherAttrsT', 'GemmAttrsT', 'GRUAttrsT', 'LeakyReluAttrsT', 'LSTMAttrsT', 'MaxPoolAttrsT', 'ReduceMeanAttrsT', 'ReshapeAttrsT', 'ResizeAttrsT', 'SplitAttrsT', 'SoftmaxAttrsT', 'TransposeAttrsT', 'ModAttrsT', 'ScatterElementsAttrsT', 'OneHotAttrsT', 'TopKAttrsT', 'HardSigmoidAttrsT', 'TriluAttrsT', 'ScatterNDAttrsT', 'NonMaxSuppressionAttrsT', 'LayerNormalizationAttrsT', 'RandomUniformAttrsT', 'EluAttrsT', 'RandomUniformLikeAttrsT', 'RandomNormalAttrsT', 'RandomNormalLikeAttrsT', 'GatherNDAttrsT', 'GeluAttrsT', 'EinsumAttrsT', 'IfAttrsT', 'PadAttrsT', 'DequantizeLinearAttrsT', 'QuantizeLinearAttrsT', 'DepthToSpaceAttrsT', 'CastLikeAttrsT', 'ShapeAttrsT', 'DropoutAttrsT', 'EyeLikeAttrsT', 'IsInfAttrsT', 'LoopAttrsT', 'SequenceEmptyAttrsT', 'ConcatFromSequenceAttrsT', 'SplitToSequenceAttrsT', 'GridSampleAttrsT', 'STFTAttrsT', 'MultinomialAttrsT', 'ReverseSequenceAttrsT', 'DFTAttrsT', 'UpsampleAttrsT', 'RotaryEmbeddingAttrsT', 'AttentionAttrsT', 'CumSumAttrsT', 'LpNormalizationAttrsT']
         self.inputs = inputs  # type: Optional[List[int]]
         self.outputs = outputs  # type: Optional[List[int]]
 

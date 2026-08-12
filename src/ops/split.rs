@@ -49,17 +49,17 @@ pub fn split<T: Copy>(
     let outputs = match split {
         SplitSizes::Size(size) => {
             if size < 1 {
-                return Err(OpError::InvalidValue("Split size must be >= 1"));
+                return Err(OpError::invalid_value("Split size must be >= 1"));
             }
             split_with_chunk_size(size as usize)
         }
         SplitSizes::Sizes(split) => {
             if split.iter().any(|size| *size < 0) {
-                return Err(OpError::InvalidValue("Split sizes must be >= 0"));
+                return Err(OpError::invalid_value("Split sizes must be >= 0"));
             }
             let split_sum = split.iter().sum::<i32>() as usize;
             if split_sum != input.size(axis) {
-                return Err(OpError::InvalidValue(
+                return Err(OpError::invalid_value(
                     "Split sizes do not sum to dimension size",
                 ));
             }
@@ -78,10 +78,10 @@ pub fn split<T: Copy>(
         SplitSizes::NumSplits(n_splits) => {
             let n_splits = n_splits.as_usize();
             if n_splits == 0 {
-                return Err(OpError::InvalidValue("num_outputs must be > 0"));
+                return Err(OpError::invalid_value("num_outputs must be > 0"));
             }
             if n_splits > axis_size {
-                return Err(OpError::InvalidValue("num_outputs exceeds dim size"));
+                return Err(OpError::invalid_value("num_outputs exceeds dim size"));
             }
             split_with_chunk_size(axis_size.div_ceil(n_splits))
         }
@@ -105,27 +105,28 @@ impl Operator for Split {
         Some(2)
     }
 
+    fn max_outputs(&self) -> Option<usize> {
+        None
+    }
+
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
         let input = ctx.inputs().require(0)?;
 
         // In Split v18+, the operator should specify either a vector of split
         // sizes or a count of outputs to produce. Older versions of the Split
         // operator could omit both of these, in which case the number of
-        // outputs was determined by looking at the operator node's number of
-        // outputs.
+        // outputs is determined by the number of outputs the node has in the
+        // graph.
         //
         // See https://github.com/robertknight/rten/issues/689.
         let splits = ctx.inputs().get_as(1)?;
-        let num_outputs = self.num_outputs.or(ctx.num_outputs());
-
         let split_sizes = if let Some(splits) = splits {
             SplitSizes::Sizes(splits)
-        } else if let Some(num_outputs) = num_outputs {
-            SplitSizes::NumSplits(num_outputs)
         } else {
-            return Err(OpError::InvalidValue(
-                "Either `num_outputs` or `splits` must be set",
-            ));
+            SplitSizes::NumSplits(
+                self.num_outputs
+                    .unwrap_or_else(|| ctx.outputs().len() as u32),
+            )
         };
 
         map_value_view!(input, x, {
@@ -162,7 +163,7 @@ mod tests {
     use rten_testing::TestCases;
 
     use crate::buffer_pool::BufferPool;
-    use crate::operator::{InputList, OpError, OpRunContext, Operator};
+    use crate::operator::{InputList, OpError, OpRunContext, Operator, OutputMask};
 
     use super::{Split, SplitSizes, split};
 
@@ -245,10 +246,11 @@ mod tests {
                 case.splits.as_ref().map(|s| s.view().into()),
             ]);
             let pool = BufferPool::new();
-            let mut ctx = OpRunContext::new(&pool, &inputs);
-            if let Some(n_outputs) = case.graph_outputs {
-                ctx.set_num_outputs(n_outputs);
-            }
+            let output_mask = case
+                .graph_outputs
+                .map(|n| OutputMask::all_used(n as usize))
+                .unwrap_or_default();
+            let ctx = OpRunContext::new(&pool, &inputs, output_mask);
             let results = split_op.run(&ctx).unwrap();
             let results: Vec<Tensor> = results.into_iter().map(|o| o.try_into().unwrap()).collect();
 
@@ -278,27 +280,27 @@ mod tests {
             Case {
                 axis: 2,
                 splits: [1, 1].as_slice().into(),
-                expected: OpError::InvalidValue("Axis is invalid"),
+                expected: OpError::invalid_value("Axis 2 is out of range. Must be in [-2, 2)"),
             },
             Case {
                 axis: 1,
                 splits: [1, 2].as_slice().into(),
-                expected: OpError::InvalidValue("Split sizes do not sum to dimension size"),
+                expected: OpError::invalid_value("Split sizes do not sum to dimension size"),
             },
             Case {
                 axis: 1,
                 splits: [1, -2].as_slice().into(),
-                expected: OpError::InvalidValue("Split sizes must be >= 0"),
+                expected: OpError::invalid_value("Split sizes must be >= 0"),
             },
             Case {
                 axis: 1,
                 splits: SplitSizes::NumSplits(0),
-                expected: OpError::InvalidValue("num_outputs must be > 0"),
+                expected: OpError::invalid_value("num_outputs must be > 0"),
             },
             Case {
                 axis: 1,
                 splits: SplitSizes::NumSplits(3),
-                expected: OpError::InvalidValue("num_outputs exceeds dim size"),
+                expected: OpError::invalid_value("num_outputs exceeds dim size"),
             },
         ];
 

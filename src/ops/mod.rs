@@ -27,6 +27,7 @@ mod conv;
 mod conv_transpose;
 mod convert;
 mod einsum;
+mod embedding;
 mod gather;
 mod generate;
 mod grid_sample;
@@ -48,6 +49,7 @@ mod random;
 mod reduce;
 mod resize;
 mod rnn;
+mod scatter;
 mod sequence;
 mod slice;
 mod split;
@@ -61,13 +63,13 @@ pub(crate) mod transform_inputs;
 // Operator structs. These are re-exported for internal use by the model loader
 // and tests.
 #[cfg(feature = "fft")]
-pub(crate) use fft::STFT;
+pub(crate) use fft::{DFT, STFT};
 #[cfg(feature = "random")]
 pub(crate) use random::{
-    Dropout, RandomNormal, RandomNormalLike, RandomUniform, RandomUniformLike,
+    Dropout, Multinomial, RandomNormal, RandomNormalLike, RandomUniform, RandomUniformLike,
 };
 pub(crate) use {
-    attention::{AddSoftmax, GroupedQueryAttentionMatMul, RepeatInterleave},
+    attention::{AddSoftmax, Attention, GroupedQueryAttentionMatMul, RepeatInterleave},
     binary_elementwise::{
         Add, And, Div, Equal, Greater, GreaterOrEqual, Less, LessOrEqual, Mod, Mul, Or, Pow, Sub,
         Where, Xor,
@@ -75,32 +77,32 @@ pub(crate) use {
     compute_shape::{ComputeShape, SymbolInfo},
     concat::{Concat, Tile},
     control_flow::{If, Loop},
-    conv::{Conv, ConvInteger},
+    conv::{Conv, ConvInteger, ConvIntegerToFloat},
     conv_transpose::ConvTranspose,
     convert::{Cast, CastLike},
     einsum::Einsum,
-    gather::{Gather, GatherElements, GatherND, ScatterElements, ScatterND, ScatterReduction},
+    embedding::RotaryEmbedding,
+    gather::{Gather, GatherElements, GatherND, ReverseSequence},
     generate::{ConstantOfShape, EyeLike, OneHot, Range},
     grid_sample::GridSample,
     identity::Identity,
     layout::{DepthToSpace, Expand, Flatten, Reshape, Shape, Size, Squeeze, Transpose, Unsqueeze},
-    matmul::{
-        AccuracyLevel, FusedMatMul, Gemm, MatMul, MatMulInteger, MatMulIntegerToFloat, MatMulNBits,
-    },
+    matmul::{FusedMatMul, Gemm, MatMul, MatMulInteger, MatMulIntegerToFloat},
     non_max_suppression::NonMaxSuppression,
     norm::{
-        BatchNormalization, InstanceNormalization, LayerNormalization, LogSoftmax,
+        BatchNormalization, InstanceNormalization, LayerNormalization, LogSoftmax, LpNormalization,
         RMSNormalization, Softmax,
     },
     pad::Pad,
     pooling::{AveragePool, GlobalAveragePool, GlobalMaxPool, MaxPool},
     quantize::{DequantizeLinear, DynamicQuantizeLinear, QuantizeLinear},
     reduce::{
-        ArgMax, ArgMin, CumSum, NonZero, ReduceL2, ReduceMax, ReduceMean, ReduceMin, ReduceProd,
-        ReduceSum, ReduceSumSquare, TopK,
+        ArgMax, ArgMin, CumSum, NonZero, ReduceL1, ReduceL2, ReduceLogSum, ReduceLogSumExp,
+        ReduceMax, ReduceMean, ReduceMin, ReduceProd, ReduceSum, ReduceSumSquare, TopK,
     },
-    resize::Resize,
+    resize::{Resize, Upsample},
     rnn::{GRU, LSTM},
+    scatter::{Scatter, ScatterElements, ScatterND, ScatterReduction},
     sequence::{
         ConcatFromSequence, SequenceAt, SequenceConstruct, SequenceEmpty, SequenceErase,
         SequenceInsert, SequenceLength, SplitToSequence,
@@ -109,11 +111,26 @@ pub(crate) use {
     split::Split,
     trilu::Trilu,
     unary_elementwise::{
-        Abs, Acos, Asin, Atan, Ceil, Clip, Cos, Elu, Erf, Exp, Floor, Gelu, HardSigmoid, HardSwish,
-        IsInf, IsNaN, LeakyRelu, Log, Neg, Not, PRelu, Reciprocal, Relu, Round, Sigmoid, Sign,
-        Silu, Sin, Softplus, Sqrt, Swish, Tan, Tanh,
+        Abs, Acos, Acosh, Asin, Asinh, Atan, Atanh, Ceil, Clip, Cos, Cosh, Elu, Erf, Exp, Floor,
+        Gelu, HardSigmoid, HardSwish, IsInf, IsNaN, LeakyRelu, Log, Neg, Not, PRelu, Reciprocal,
+        Relu, Round, Sigmoid, Sign, Silu, Sin, Sinh, Softplus, Sqrt, Swish, Tan, Tanh,
     },
     variadic_elementwise::{Max, Mean, Min, Sum},
+};
+
+// Non-standard "contrib" operators in the `com.microsoft` namespace which
+// are supported.
+//
+// See https://onnxruntime.ai/docs/reference/operators/ContribOperators.html.
+#[cfg(feature = "contrib")]
+pub(crate) use {
+    attention::{GroupQueryAttention, MultiHeadAttention},
+    embedding::RotaryEmbeddingMicrosoft,
+    matmul::{AccuracyLevel, MatMulNBits},
+    norm::{
+        SimplifiedLayerNormalization, SkipLayerNormalization, SkipSimplifiedLayerNormalization,
+    },
+    unary_elementwise::{BiasGelu, FastGelu, GeluMicrosoft, QuickGelu},
 };
 
 // Operators as functions. These are exported for use by pre/post-processing
@@ -130,25 +147,26 @@ pub use concat::{concat, tile};
 pub use conv::{conv, conv_integer};
 pub use conv_transpose::conv_transpose;
 pub use einsum::einsum;
-pub use gather::{gather, gather_elements, gather_nd, scatter_elements, scatter_nd};
+pub use gather::{gather, gather_elements, gather_nd};
 pub use generate::{constant_of_shape, onehot, range};
 pub use layout::{DepthToSpaceMode, depth_to_space, expand, flatten, reshape, squeeze};
 pub use matmul::{gemm, matmul};
 pub use non_max_suppression::{BoxOrder, non_max_suppression};
 pub use norm::{
-    batch_norm, instance_normalization, layer_normalization, log_softmax, rms_normalization,
-    softmax,
+    batch_norm, instance_normalization, layer_normalization, log_softmax, lp_normalization,
+    rms_normalization, softmax,
 };
 pub use pad::{PadMode, pad};
 pub use pooling::{average_pool, global_average_pool, max_pool};
 pub use quantize::{dequantize_linear, dynamic_quantize_linear, quantize_linear};
+pub use scatter::{scatter_elements, scatter_nd};
 
 #[cfg(feature = "fft")]
-pub use fft::stft;
+pub use fft::{dft, stft};
 
 pub use reduce::{
-    arg_max, arg_min, cum_sum, nonzero, reduce_l2, reduce_max, reduce_mean, reduce_min,
-    reduce_prod, reduce_sum, reduce_sum_square, topk,
+    arg_max, arg_min, cum_sum, nonzero, reduce_l1, reduce_l2, reduce_log_sum, reduce_log_sum_exp,
+    reduce_max, reduce_mean, reduce_min, reduce_prod, reduce_sum, reduce_sum_square, topk,
 };
 pub use resize::{CoordTransformMode, NearestMode, ResizeMode, ResizeTarget, resize, resize_image};
 pub use rnn::{Direction, gru, lstm};
@@ -188,7 +206,7 @@ impl Padding {
             Padding::Same => Ok(Padding::Same),
             Padding::Fixed(pads) => match pads.as_slice() {
                 &[pad_start, pad_end] => Ok([0, pad_start, 0, pad_end].into()),
-                _ => Err(OpError::InvalidValue("expected 2 pad values")),
+                _ => Err(OpError::invalid_value("expected 2 pad values")),
             },
         }
     }
@@ -224,18 +242,42 @@ fn resolve_index(len: usize, index: isize) -> Option<usize> {
     }
 }
 
+/// Create an error for an index which is out of range.
+fn invalid_index_err(index: i32, size: usize) -> OpError {
+    OpError::invalid_value(format!(
+        "Index {} is out of range. Must be in [{}, {})",
+        index,
+        -(size as isize),
+        size
+    ))
+}
+
+/// Resolve a signed index to a positive index in `[0, size)`.
+fn try_resolve_index(size: usize, index: i32) -> Result<usize, OpError> {
+    resolve_index(size, index as isize).ok_or_else(|| invalid_index_err(index, size))
+}
+
 /// Resolve an axis given as a value in `[-ndim, ndim-1]` to the zero-based
 /// dimension of a tensor with `ndim` dimensions.
 ///
 /// Negative axis values count backwards from the last dimension.
 fn resolve_axis(ndim: usize, axis: isize) -> Result<usize, OpError> {
-    resolve_index(ndim, axis).ok_or(OpError::InvalidValue("Axis is invalid"))
+    resolve_index(ndim, axis).ok_or_else(|| {
+        OpError::invalid_value(format!(
+            "Axis {} is out of range. Must be in [{}, {})",
+            axis,
+            -(ndim as isize),
+            ndim
+        ))
+    })
 }
 
 /// Resolve a sequence of axes values in `[-ndim, ndim-1]` to zero-based dimension
 /// indexes in a tensor with `ndim` dimensions.
 ///
 /// Negative axis values count backwards from the last dimension.
+///
+/// Returns the unique axes in ascending order.
 pub fn resolve_axes<'a, I: ExactSizeIterator<Item = &'a i32>>(
     ndim: usize,
     axes: I,
@@ -245,6 +287,8 @@ pub fn resolve_axes<'a, I: ExactSizeIterator<Item = &'a i32>>(
         let resolved = resolve_axis(ndim, *axis as isize)?;
         resolved_axes.push(resolved);
     }
+    resolved_axes.sort();
+    resolved_axes.dedup();
     Ok(resolved_axes)
 }
 
@@ -362,7 +406,7 @@ use map_value;
 macro_rules! check_value {
     ($condition:expr, $err_variant:ident, $err_msg:expr) => {
         if !$condition {
-            return Err(OpError::$err_variant($err_msg));
+            return Err(OpError::$err_variant($err_msg.into()));
         }
     };
 }
@@ -374,6 +418,8 @@ mod tests {
     use rten_tensor::NdTensor;
     use rten_tensor::prelude::*;
     use rten_tensor::test_util::{ExpectEqualError, expect_equal_with_tolerance};
+
+    use super::resolve_axes;
 
     /// Compare two f32 tensors with a higher absolute tolerance (1e-4) than
     /// the default (1e-5).
@@ -410,5 +456,23 @@ mod tests {
                 std::array::from_fn(|d| if d < new_dims { 1 } else { shape[d - new_dims] });
             self.into_shape(new_shape)
         }
+    }
+
+    #[test]
+    fn test_resolve_axes() {
+        let axes = resolve_axes(3, [0, 1, 2].iter()).unwrap();
+        assert_eq!(axes.as_slice(), [0, 1, 2]);
+
+        // Negative axes are resolved.
+        let axes = resolve_axes(3, [-1, -2, -3].iter()).unwrap();
+        assert_eq!(axes.as_slice(), [0, 1, 2]);
+
+        // Returned axes are sorted in ascending order.
+        let axes = resolve_axes(3, [-3, -2, -1].iter()).unwrap();
+        assert_eq!(axes.as_slice(), [0, 1, 2]);
+
+        // Only unique axes are returned.
+        let axes = resolve_axes(3, [1, -2].iter()).unwrap();
+        assert_eq!(axes.as_slice(), [1]);
     }
 }

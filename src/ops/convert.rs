@@ -1,14 +1,17 @@
-use rten_base::byte_cast::{Pod, cast_pod_vec};
+use rten_base::bit_set::BitSet;
+use rten_base::byte_cast::{FromByteArray, cast_vec};
 use rten_base::num;
 
 use rten_tensor::Tensor;
 use rten_tensor::prelude::*;
 
 use crate::buffer_pool::BufferPool;
-use crate::infer_shapes::{InferShapes, InferShapesError, SymTensor, SymbolGen, UnaryOp};
+use crate::infer_shapes::{
+    InferShapes, InferShapesContext, InferShapesError, SymTensor, SymbolGen, UnaryOp,
+};
 use crate::operator::{
-    IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
-    OutputTypesContext,
+    InPlaceInputs, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
+    OutputTypeList, OutputTypesContext,
 };
 use crate::value::{DataType, Value, ValueType, ValueView};
 
@@ -63,15 +66,15 @@ fn cast(pool: &BufferPool, input: ValueView, dtype: DataType) -> Result<Value, O
 /// Both T and U must have the same size.
 fn cast_tensor<T, U>(mut data: Tensor<T>) -> Tensor<U>
 where
-    T: Pod + num::Cast<U>,
-    U: Pod<Bytes = T::Bytes>,
+    T: FromByteArray + num::Cast<U>,
+    U: FromByteArray<Bytes = T::Bytes>,
 {
     // Cast elements from type T to U in place.
     data.apply(|x| num::Cast::<U>::cast(*x).cast_bytes());
 
     // Extract the converted data and transmute from T to U.
     let shape = data.shape().to_vec();
-    let data = cast_pod_vec::<T, U>(data.into_data()).unwrap();
+    let data = cast_vec::<T, U>(data.into_data()).unwrap();
     Tensor::from_data(&shape, data)
 }
 
@@ -121,19 +124,24 @@ impl Operator for Cast {
         cast(ctx.pool(), input, self.to).into_op_result()
     }
 
-    fn can_run_in_place(&self) -> bool {
+    fn in_place_inputs(&self) -> BitSet<u16> {
         // Cast can run in place if the input's dtype already matches `self.to`
         // or both dtypes have the same element size.
-        true
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let input = in_place.into_single();
         match cast_in_place(input, self.to) {
-            Ok(output) => Ok(output),
+            Ok(output) => output.into_op_result(),
             Err(input) => {
                 let converted = cast(ctx.pool(), input.as_view(), self.to)?;
                 input.add_to_pool(ctx.pool());
-                Ok(converted)
+                converted.into_op_result()
             }
         }
     }
@@ -150,12 +158,10 @@ impl Operator for Cast {
 impl InferShapes for Cast {
     fn infer_shapes(
         &self,
-        inputs: &[SymTensor],
+        inputs: InferShapesContext,
         _sym_gen: &mut SymbolGen,
     ) -> Result<Vec<SymTensor>, InferShapesError> {
-        let Some(data) = inputs.first() else {
-            return Err(InferShapesError::IncorrectInputCount);
-        };
+        let data = inputs.require(0)?;
 
         // If this is a no-op cast from int to int, preserve symbolic values.
         // Otherwise preserve just the shape like a generic unary operator.
@@ -186,21 +192,29 @@ impl Operator for CastLike {
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
         let target_type = ctx.inputs().require(1)?;
         let ValueType::Tensor(to) = target_type.dtype() else {
-            return Err(OpError::InvalidValue("expected target_type to be a tensor"));
+            return Err(OpError::invalid_value(
+                "expected target_type to be a tensor",
+            ));
         };
         Cast { to }.run(ctx)
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
-        let target_type = ctx.inputs().require(0)?;
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let target_type = ctx.inputs().require(1)?;
         let ValueType::Tensor(to) = target_type.dtype() else {
-            return Err(OpError::InvalidValue("expected target_type to be a tensor"));
+            return Err(OpError::invalid_value(
+                "expected target_type to be a tensor",
+            ));
         };
-        Cast { to }.run_in_place(input, ctx)
+        Cast { to }.run_in_place(in_place, ctx)
     }
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {

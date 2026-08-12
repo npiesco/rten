@@ -2,17 +2,20 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
+use rten_base::bit_set::BitSet;
 use rten_base::iter::range_chunks;
 use rten_parallel::par_iter::ParIter;
+use rten_shape_inference::ops as shape_ops;
 use rten_tensor::prelude::*;
-use rten_tensor::{NdTensor, NdTensorView, NdTensorViewMut, Tensor, TensorView};
+use rten_tensor::{InitEmpty, NdTensor, NdTensorView, NdTensorViewMut, Tensor, TensorView};
 
 use crate::buffer_pool::{AutoReturn, BufferPool};
+use crate::infer_shapes::{InferShapes, impl_infer_shapes};
 use crate::operator::{
-    InputList, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
-    OutputTypeList, OutputTypesContext, static_dims,
+    InPlaceInputs, InputList, IntoOpResult, OpError, OpRunContext, Operator, OutputList,
+    OutputType, OutputTypeList, OutputTypesContext, static_dims,
 };
-use crate::value::{TryFromValueError, Value, ValueView};
+use crate::value::{TryFromValueError, ValueView};
 
 /// Specifies an output size for a resize operation.
 pub enum ResizeTarget<'a> {
@@ -102,19 +105,18 @@ fn lerp(a: f32, b: f32, weight: f32) -> f32 {
 
 /// Resize a group of channels in a CHW tensor using nearest neighbor resizing.
 ///
-/// This initializes all elements of `output`.
+/// `inv_scale` contains the `[y, x]` scale factors mapping output coords to
+/// input coords. This initializes all elements of `output`.
 fn nearest_resize(
     input: NdTensorView<f32, 3>,
     mut output: NdTensorViewMut<MaybeUninit<f32>, 3>,
+    inv_scale: [f32; 2],
     mode: NearestMode,
     coord_mode: CoordTransformMode,
 ) {
     let [chans, rows, cols] = output.shape();
     let [_, in_rows, in_cols] = input.shape();
-
-    // Scale factors to map output coords to input coords.
-    let inv_scale_y = in_rows as f32 / rows as f32;
-    let inv_scale_x = in_cols as f32 / cols as f32;
+    let [inv_scale_y, inv_scale_x] = inv_scale;
 
     let round_coord = |coord: f32| match mode {
         NearestMode::Ceil => coord.ceil() as usize,
@@ -160,18 +162,17 @@ fn nearest_resize(
 
 /// Resize a group of channels in a CHW tensor using bilinear resizing.
 ///
-/// This initializes all elements of `output`.
+/// `inv_scale` contains the `[y, x]` scale factors mapping output coords to
+/// input coords. This initializes all elements of `output`.
 fn bilinear_resize(
     input: NdTensorView<f32, 3>,
     mut output: NdTensorViewMut<MaybeUninit<f32>, 3>,
+    inv_scale: [f32; 2],
     coord_mode: CoordTransformMode,
 ) {
     let [chans, rows, cols] = output.shape();
     let [_, in_rows, in_cols] = input.shape();
-
-    // Scale factors to map output coords to input coords.
-    let inv_scale_y = in_rows as f32 / rows as f32;
-    let inv_scale_x = in_cols as f32 / cols as f32;
+    let [inv_scale_y, inv_scale_x] = inv_scale;
 
     let n_init = AtomicUsize::new(0);
 
@@ -258,28 +259,52 @@ pub fn resize_image(input: TensorView, size: [usize; 2]) -> Result<Tensor, OpErr
     )
 }
 
-/// Resolve the target output size, specified as either as scale factors or
-/// fixed sizes, into a fixed size.
-fn calc_output_size(input_shape: &[usize], target: ResizeTarget) -> Result<Vec<usize>, OpError> {
-    let sizes: NdTensor<i32, 1> = match target {
-        ResizeTarget::Scales(scales) => input_shape
-            .iter()
-            .zip(scales.iter())
-            .map(|(&in_size, scale)| ((in_size as f32) * scale).floor() as i32)
-            .collect(),
-        ResizeTarget::Sizes(sizes) => sizes.to_tensor(),
-    };
+/// Output size and scale factor for each axis of a resize operation.
+struct ResizeGeometry {
+    /// Size of each axis in the output.
+    sizes: Vec<usize>,
 
-    if sizes.len() != input_shape.len() {
-        return Err(OpError::IncompatibleInputShapes(
+    /// `1. / scale` for each axis.
+    inv_scales: Vec<f32>,
+}
+
+/// Resolve the target output size, specified as either as scale factors or
+/// fixed sizes, into a fixed size and scale factor.
+fn calc_output_size(
+    input_shape: &[usize],
+    target: ResizeTarget,
+) -> Result<ResizeGeometry, OpError> {
+    let target_len = match &target {
+        ResizeTarget::Scales(scales) => scales.size(0),
+        ResizeTarget::Sizes(sizes) => sizes.size(0),
+    };
+    if target_len != input_shape.len() {
+        return Err(OpError::incompatible_input_shapes(
             "scales/sizes length should equal input rank",
         ));
     }
+
+    let (sizes, inv_scales): (Vec<i32>, Vec<f32>) = match target {
+        ResizeTarget::Scales(scales) => input_shape
+            .iter()
+            .zip(scales.iter())
+            .map(|(&in_size, scale)| (((in_size as f32) * scale).floor() as i32, 1. / scale))
+            .unzip(),
+        ResizeTarget::Sizes(sizes) => input_shape
+            .iter()
+            .zip(sizes.iter())
+            .map(|(&in_size, &out_size)| (out_size, in_size as f32 / out_size as f32))
+            .unzip(),
+    };
+
     if sizes.iter().any(|size| *size < 0) {
-        return Err(OpError::InvalidValue("scales/sizes must be positive"));
+        return Err(OpError::invalid_value("scales/sizes must be positive"));
     }
 
-    Ok(sizes.into_data().into_iter().map(|x| x as usize).collect())
+    Ok(ResizeGeometry {
+        sizes: sizes.into_iter().map(|x| x as usize).collect(),
+        inv_scales,
+    })
 }
 
 /// Compute the target output size from the `scales` and `sizes` inputs to a
@@ -309,18 +334,34 @@ struct ResizeOptions {
 fn resize_impl(
     pool: &BufferPool,
     input: TensorView,
-    output_size: &[usize],
+    geometry: &ResizeGeometry,
     opts: ResizeOptions,
 ) -> Result<Tensor, OpError> {
-    match (input.shape(), output_size) {
+    let ResizeGeometry {
+        sizes: output_size,
+        inv_scales,
+    } = geometry;
+
+    // Scale factors for the two axes that `resize_4d` resizes. Axes that the
+    // input is expanded along are not resized, so their scale is 1.
+    let scales =
+        |y: Option<usize>, x: usize| [y.map(|axis| inv_scales[axis]).unwrap_or(1.), inv_scales[x]];
+
+    match (input.shape(), output_size.as_slice()) {
         // ND with nothing resized, so we can just copy the input.
         (in_shape, out_shape) if in_shape == out_shape => Ok(input.to_tensor_in(pool)),
         // 4D - NHWC
         (&[in_n, in_c, _in_h, _in_w], &[out_n, out_c, out_h, out_w])
             if in_n == out_n && in_c == out_c =>
         {
-            resize_4d(pool, input.nd_view(), [out_n, out_c, out_h, out_w], opts)
-                .map(|y| y.into_dyn())
+            resize_4d(
+                pool,
+                input.nd_view(),
+                [out_n, out_c, out_h, out_w],
+                scales(Some(2), 3),
+                opts,
+            )
+            .map(|y| y.into_dyn())
         }
         // 3D - NCW
         (&[in_n, in_c, in_w], &[out_n, out_c, out_w]) if in_n == out_n && in_c == out_c => {
@@ -328,45 +369,53 @@ fn resize_impl(
                 pool,
                 input.reshaped([in_n, in_c, 1, in_w]).view(),
                 [out_n, out_c, 1, out_w],
+                scales(None, 2),
                 opts,
             )
-            .map(|y| y.into_shape(output_size))
+            .map(|y| y.into_shape(output_size.as_slice()))
         }
         // 3D - NHW
         (&[in_n, in_h, in_w], &[out_n, out_h, out_w]) if in_n == out_n => resize_4d(
             pool,
             input.reshaped([in_n, 1, in_h, in_w]).view(),
             [out_n, 1, out_h, out_w],
+            scales(Some(1), 2),
             opts,
         )
-        .map(|y| y.into_shape(output_size)),
+        .map(|y| y.into_shape(output_size.as_slice())),
         // 2D - HW
         (&[in_h, in_w], &[out_h, out_w]) => resize_4d(
             pool,
             input.reshaped([1, 1, in_h, in_w]).view(),
             [1, 1, out_h, out_w],
+            scales(Some(0), 1),
             opts,
         )
-        .map(|y| y.into_shape(output_size)),
+        .map(|y| y.into_shape(output_size.as_slice())),
         // 1D - W
         (&[in_w], &[out_w]) => resize_4d(
             pool,
             input.reshaped([1, 1, 1, in_w]).view(),
             [1, 1, 1, out_w],
+            scales(None, 0),
             opts,
         )
-        .map(|y| y.into_shape(output_size)),
-        _ => Err(OpError::UnsupportedValue(
+        .map(|y| y.into_shape(output_size.as_slice())),
+        _ => Err(OpError::unsupported_value(
             "Only 1D to 4D inputs are supported with up to two resized dimensions",
         )),
     }
 }
 
 /// Resize an NCHW tensor.
+///
+/// `inv_scale` contains the `[y, x]` scale factors mapping output coords to
+/// input coords.
 fn resize_4d(
     pool: &BufferPool,
     input: NdTensorView<f32, 4>,
     output_size: [usize; 4],
+    inv_scale: [f32; 2],
     opts: ResizeOptions,
 ) -> Result<NdTensor<f32, 4>, OpError> {
     let ResizeOptions {
@@ -377,13 +426,11 @@ fn resize_4d(
 
     let [batch, _chans, _height, _width] = input.shape();
 
-    let mut output = NdTensor::uninit_in(pool, output_size);
-
-    if output.is_empty() {
-        // Safety: Empty output is already initialized.
-        let output = unsafe { output.assume_init() };
-        return Ok(output);
-    }
+    let output = NdTensor::uninit_in(pool, output_size);
+    let mut output = match output.init_if_empty() {
+        InitEmpty::Empty(e) => return Ok(e),
+        InitEmpty::NotEmpty(ne) => ne,
+    };
 
     let n_init = AtomicUsize::new(0);
     for n in 0..batch {
@@ -398,10 +445,16 @@ fn resize_4d(
             .for_each(|(mut out_chans, in_chans)| {
                 match mode {
                     ResizeMode::Nearest => {
-                        nearest_resize(in_chans, out_chans.view_mut(), nearest_mode, coord_mode);
+                        nearest_resize(
+                            in_chans,
+                            out_chans.view_mut(),
+                            inv_scale,
+                            nearest_mode,
+                            coord_mode,
+                        );
                     }
                     ResizeMode::Linear => {
-                        bilinear_resize(in_chans, out_chans.view_mut(), coord_mode);
+                        bilinear_resize(in_chans, out_chans.view_mut(), inv_scale, coord_mode);
                     }
                 };
                 n_init.fetch_add(out_chans.len(), Ordering::SeqCst);
@@ -422,11 +475,11 @@ pub fn resize(
     coord_mode: CoordTransformMode,
     nearest_mode: NearestMode,
 ) -> Result<Tensor, OpError> {
-    let sizes = calc_output_size(input.shape(), target)?;
+    let geometry = calc_output_size(input.shape(), target)?;
     resize_impl(
         pool,
         input,
-        &sizes,
+        &geometry,
         ResizeOptions {
             mode,
             coord_mode,
@@ -510,38 +563,95 @@ impl Operator for Resize {
         Some([OutputType::CopyFromInput(0)].into())
     }
 
-    fn can_run_in_place(&self) -> bool {
-        // Resize can run in place if the computed output size is the same
-        // as the input size. In that case the in-place operation is a noop.
-        true
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        // Resize can run in place if the computed output size is the same
+        // as the input size. In that case the in-place operation is a noop.
+        BitSet::from_indices([0])
+    }
+
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
         // See note in `run` about the `roi` input.
 
+        let input = in_place.into_single();
         let other = ctx.inputs();
-        let target = target_from_scale_size_inputs(other, 1)?;
-        let output_size = calc_output_size(&input.shape(), target)?;
+        let target = target_from_scale_size_inputs(other, 2)?;
+        let geometry = calc_output_size(&input.shape(), target)?;
 
         // If this is a no-op resize, just return the input.
-        if input.shape().as_slice() == output_size {
-            return Ok(input);
+        if input.shape().as_slice() == geometry.sizes {
+            return input.into_op_result();
         }
 
         let input = Tensor::<f32>::try_from(input)?.auto_return(ctx.pool());
         resize_impl(
             ctx.pool(),
             input.view(),
-            &output_size,
+            &geometry,
             ResizeOptions {
                 mode: self.mode,
                 coord_mode: self.coord_mode,
                 nearest_mode: self.nearest_mode,
             },
         )
-        .map(|t| t.into())
+        .into_op_result()
     }
 }
+
+impl_infer_shapes!(Resize, _op, shape_ops::Resize);
+
+/// Upsample operator.
+///
+/// This is a deprecated operator that has been replaced by [`Resize`]. It is
+/// supported for compatibility with older ONNX models. See
+/// <https://onnx.ai/onnx/operators/onnx__Upsample.html>.
+#[derive(Debug)]
+pub struct Upsample {
+    pub mode: ResizeMode,
+}
+
+impl Operator for Upsample {
+    fn name(&self) -> &str {
+        "Upsample"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let inputs = ctx.inputs();
+        let input = inputs.require_as(0)?;
+        let scales: NdTensorView<f32, 1> = inputs.require_as(1)?;
+
+        resize(
+            ctx.pool(),
+            input,
+            ResizeTarget::Scales(scales),
+            self.mode,
+            CoordTransformMode::Asymmetric,
+            NearestMode::Floor,
+        )
+        .into_op_result()
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+}
+
+impl_infer_shapes!(Upsample, _op, shape_ops::Upsample);
 
 #[cfg(test)]
 mod tests {
@@ -551,9 +661,12 @@ mod tests {
     use rten_testing::TestCases;
 
     use crate::buffer_pool::BufferPool;
-    use crate::operator::{InputList, OpError, OpRunContext, Operator};
+    use crate::operator::OperatorExt;
+    use crate::operator::{InputList, OpError, OpRunContext, Operator, OutputMask};
     use crate::ops::tests::expect_eq_1e4;
-    use crate::ops::{CoordTransformMode, NearestMode, Resize, ResizeMode, ResizeTarget, resize};
+    use crate::ops::{
+        CoordTransformMode, NearestMode, Resize, ResizeMode, ResizeTarget, Upsample, resize,
+    };
 
     // Reference values for these tests can be computed with either OpenCV
     // (`cv2.resize`) or PyTorch (`torch.nn.functional.interpolate`).
@@ -846,6 +959,59 @@ mod tests {
     }
 
     #[test]
+    fn test_resize_non_integer_scale() {
+        #[derive(Debug)]
+        struct Case {
+            mode: ResizeMode,
+            expected: Tensor,
+        }
+
+        let image = NdTensor::from([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]])
+            .into_shape([1, 1, 3, 3]);
+        let scales = [1., 1., 1.5, 1.5];
+
+        // Reference values generated with ONNX Runtime. These also match
+        // `torch.nn.functional.interpolate` with `recompute_scale_factor=False`.
+        let cases = [
+            Case {
+                mode: ResizeMode::Linear,
+                expected: Tensor::from([
+                    [0.1, 0.15, 0.2167, 0.2833],
+                    [0.25, 0.3, 0.3667, 0.4333],
+                    [0.45, 0.5, 0.5667, 0.6333],
+                    [0.65, 0.7, 0.7667, 0.8333],
+                ])
+                .into_shape([1, 1, 4, 4].as_slice()),
+            },
+            Case {
+                mode: ResizeMode::Nearest,
+                expected: Tensor::from([
+                    [0.1, 0.1, 0.2, 0.2],
+                    [0.1, 0.1, 0.2, 0.2],
+                    [0.4, 0.4, 0.5, 0.5],
+                    [0.4, 0.4, 0.5, 0.5],
+                ])
+                .into_shape([1, 1, 4, 4].as_slice()),
+            },
+        ];
+
+        cases.test_each(|case| {
+            let pool = BufferPool::new();
+            let result = resize(
+                &pool,
+                image.as_dyn(),
+                ResizeTarget::Scales(scales.as_slice().into()),
+                case.mode,
+                CoordTransformMode::HalfPixel,
+                NearestMode::Floor,
+            )
+            .unwrap();
+
+            expect_eq_1e4(&result, &case.expected).unwrap();
+        })
+    }
+
+    #[test]
     fn test_resize_scales_sizes() {
         #[derive(Debug)]
         enum CaseOutput {
@@ -910,7 +1076,7 @@ mod tests {
                 image: Tensor::from_data(&[1, 1, 1, 1], vec![1.]),
                 scales: Some(Tensor::from([1., 1., 1.])),
                 sizes: None,
-                expected: CaseOutput::Error(OpError::IncompatibleInputShapes(
+                expected: CaseOutput::Error(OpError::incompatible_input_shapes(
                     "scales/sizes length should equal input rank",
                 )),
             },
@@ -918,13 +1084,15 @@ mod tests {
                 image: Tensor::from_data(&[1, 1, 1, 1], vec![1.]),
                 scales: Some(Tensor::from([1., 1., -1., 1.])),
                 sizes: None,
-                expected: CaseOutput::Error(OpError::InvalidValue("scales/sizes must be positive")),
+                expected: CaseOutput::Error(OpError::invalid_value(
+                    "scales/sizes must be positive",
+                )),
             },
             Case {
                 image: Tensor::from_data(&[1, 1, 2, 2], vec![0.2, 0.7, 0.3, 0.8]),
                 scales: Some(Tensor::from_data(&[1, 1, 2, 2], vec![1., 1., 3., 3.])),
                 sizes: None,
-                expected: CaseOutput::Error(OpError::InvalidValue("scales must have 1 dims")),
+                expected: CaseOutput::Error(OpError::invalid_value("scales must have 1 dims")),
             },
             // Values for scales/sizes and input shapes which are legal according to the spec,
             // but not currently supported in our implementation.
@@ -932,7 +1100,7 @@ mod tests {
                 image: Tensor::from_data(&[1, 1, 2, 2], vec![0.2, 0.7, 0.3, 0.8]),
                 scales: Some(Tensor::from([2., 1., 3., 3.])),
                 sizes: None,
-                expected: CaseOutput::Error(OpError::UnsupportedValue(
+                expected: CaseOutput::Error(OpError::unsupported_value(
                     "Only 1D to 4D inputs are supported with up to two resized dimensions",
                 )),
             },
@@ -986,7 +1154,7 @@ mod tests {
                 case.sizes.as_ref().map(|t| t.into()),
             ];
             let inputs = InputList::from_optional(&inputs);
-            let ctx = OpRunContext::new(&pool, &inputs);
+            let ctx = OpRunContext::new(&pool, &inputs, OutputMask::all_used(1));
             let result = op.run(&ctx);
             match (&case.expected, result) {
                 (CaseOutput::Shape(shape), Ok(out)) => {
@@ -1002,6 +1170,53 @@ mod tests {
                     panic!("Expected error but got output");
                 }
             }
+        })
+    }
+
+    #[test]
+    fn test_upsample() {
+        #[derive(Debug)]
+        struct Case {
+            mode: ResizeMode,
+            scales: Tensor,
+            expected: Tensor,
+        }
+
+        let image = Tensor::from_data(&[1, 1, 2, 2], vec![0.2, 0.7, 0.3, 0.8]);
+
+        let cases = [
+            // Nearest resize
+            Case {
+                mode: ResizeMode::Nearest,
+                scales: Tensor::from([1., 1., 2., 2.]),
+                expected: Tensor::from([
+                    [0.2, 0.2, 0.7, 0.7],
+                    [0.2, 0.2, 0.7, 0.7],
+                    [0.3, 0.3, 0.8, 0.8],
+                    [0.3, 0.3, 0.8, 0.8],
+                ])
+                .with_new_axis(0) // C
+                .with_new_axis(0), // N
+            },
+            // Bilinear resize
+            Case {
+                mode: ResizeMode::Linear,
+                scales: Tensor::from([1., 1., 2., 2.]),
+                expected: Tensor::from([
+                    [0.2, 0.45, 0.7, 0.7],
+                    [0.25, 0.5, 0.75, 0.75],
+                    [0.3, 0.55, 0.8, 0.8],
+                    [0.3, 0.55, 0.8, 0.8],
+                ])
+                .with_new_axis(0) // C
+                .with_new_axis(0), // N
+            },
+        ];
+
+        cases.test_each(|case| {
+            let op = Upsample { mode: case.mode };
+            let result: Tensor = op.run_simple((&image, &case.scales)).unwrap();
+            expect_eq_1e4(&result, &case.expected).unwrap();
         })
     }
 }

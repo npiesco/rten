@@ -187,7 +187,7 @@
 //! ```
 //! use std::iter::Sum;
 //! use rten_simd::{Isa, Simd, SimdIterable, SimdOp};
-//! use rten_simd::ops::{GetNumOps, NumOps};
+//! use rten_simd::ops::{BitOps, GetNumOps, NumOps};
 //!
 //! struct SimdSum<'a, T>(&'a [T]);
 //!
@@ -213,6 +213,7 @@
 mod arch;
 mod dispatch;
 mod elem;
+pub mod float16;
 pub mod functional;
 pub mod isa_detection;
 mod iter;
@@ -246,6 +247,7 @@ pub mod isa {
 
 pub use dispatch::{SimdOp, SimdUnaryOp};
 pub use elem::Elem;
+pub use float16::f16;
 pub use iter::{Iter, SimdIterable};
 pub use ops::Isa;
 pub use simd::{Mask, Simd};

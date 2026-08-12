@@ -7,13 +7,14 @@ use std::fmt;
 use rten_base::num::AsUsize;
 
 use crate::env::env_flag;
+use crate::graph;
 use crate::graph::{Dimension, Graph, Node, NodeId, RunError, TypedConstant};
 use crate::operator::{OutputType, OutputTypesContext};
 use crate::value::ValueType;
 
 pub use rten_shape_inference::{
-    BinaryOp, Constant, InferShapes, InferShapesError, ReductionOp, SymExpr, SymTensor, Symbol,
-    SymbolGen, UnaryOp,
+    BinaryOp, Constant, InferShapes, InferShapesContext, InferShapesError, ReductionOp, SymExpr,
+    SymTensor, Symbol, SymbolGen, UnaryOp,
 };
 
 /// Impl [`InferShapes`] for a type by delegating to another type which
@@ -26,7 +27,7 @@ macro_rules! impl_infer_shapes {
         impl rten_shape_inference::InferShapes for $op {
             fn infer_shapes(
                 &self,
-                inputs: &[rten_shape_inference::SymTensor],
+                inputs: rten_shape_inference::InferShapesContext,
                 sym_gen: &mut rten_shape_inference::SymbolGen,
             ) -> Result<
                 Vec<rten_shape_inference::SymTensor>,
@@ -50,8 +51,8 @@ pub struct OpInfo {
 
 /// Errors that prevent shape inference from finishing.
 ///
-/// Shape inference can still complete if errors only happen for certain nodes.
-/// In that case the shapes or types will be treated as unknown.
+/// Depending on the settings that shape inference is run with, shape inference
+/// may attempt to keep going after an error is encountered or may abort.
 #[derive(Debug)]
 pub enum InferError {
     /// Failed to generate the sequence of operators to run shape inference on.
@@ -61,7 +62,18 @@ pub enum InferError {
     /// Shape inference is not implemented for an operator.
     UnsupportedOperator(OpInfo),
     /// Shape inference failed for an operator.
+    ///
+    /// Shape inference can fail if the inputs to an operator are incorrect
+    /// (wrong count, wrong rank, incompatible).
     ShapeInferenceFailed(OpInfo),
+    /// Shape inference was incomplete for an operator.
+    ///
+    /// _Incomplete_ shape inference means that shape inference successfully
+    /// ran, but at least one output has a dimension of unknown size.
+    ShapeInferenceIncomplete(OpInfo),
+    /// Shape inference produced a symbolic expression that exceeds the
+    /// complexity limit.
+    ShapeTooComplex(OpInfo),
 }
 
 impl fmt::Display for InferError {
@@ -83,6 +95,16 @@ impl fmt::Display for InferError {
             Self::ShapeInferenceFailed(op_info) => write!(
                 f,
                 "shape inference failed for {} op \"{}\"",
+                op_info.op_type, op_info.name
+            ),
+            Self::ShapeInferenceIncomplete(op_info) => write!(
+                f,
+                "shape inference incomplete for {} op \"{}\"",
+                op_info.op_type, op_info.name
+            ),
+            Self::ShapeTooComplex(op_info) => write!(
+                f,
+                "shape too complex for {} op \"{}\"",
                 op_info.op_type, op_info.name
             ),
         }
@@ -111,7 +133,7 @@ pub struct InferResult {
     pub types: HashMap<NodeId, ValueType>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InferShapeOptions {
     /// Enable strict shape inference mode.
     ///
@@ -120,6 +142,21 @@ pub struct InferShapeOptions {
     /// is best-effort and will continue with remaining operators in the event
     /// of an error.
     pub strict: bool,
+
+    /// Upper limit on the maximum complexity of symbolic expressions that
+    /// shape inference may produce.
+    ///
+    /// The value is the maximum depth of any expression tree.
+    pub max_complexity: u32,
+}
+
+impl Default for InferShapeOptions {
+    fn default() -> Self {
+        InferShapeOptions {
+            strict: false,
+            max_complexity: 10,
+        }
+    }
 }
 
 /// Infer the shapes and types of operator outputs in a graph.
@@ -156,7 +193,7 @@ pub fn infer_shapes(graph: &Graph, opts: InferShapeOptions) -> Result<InferResul
     let debug = env_flag("RTEN_INFER_SHAPES_DEBUG", false);
 
     // Temp buffer for shape inference operands.
-    let mut input_shapes: Vec<SymTensor> = Vec::new();
+    let mut input_shapes: Vec<Option<SymTensor>> = Vec::new();
 
     for op_id in ops {
         let Some(Node::Operator(op)) = graph.get_node(op_id) else {
@@ -217,15 +254,14 @@ pub fn infer_shapes(graph: &Graph, opts: InferShapeOptions) -> Result<InferResul
         if let Some(infer) = op.operator().as_infer_shapes() {
             input_shapes.clear();
             input_shapes.extend(op.input_ids().iter().map(|input_id| {
-                input_id
-                    .and_then(|id| {
-                        let node = graph.get_node(id)?;
-                        Some(sym_tensor_from_input(id, node, &values))
-                    })
-                    .unwrap_or_else(|| SymTensor::unknown("missing input"))
+                input_id.and_then(|id| {
+                    let node = graph.get_node(id)?;
+                    Some(sym_tensor_from_input(id, node, &values))
+                })
             }));
 
-            let out_shapes = infer.infer_shapes(&input_shapes, &mut symbol_gen);
+            let out_shapes =
+                infer.infer_shapes(InferShapesContext::new(&input_shapes), &mut symbol_gen);
 
             if debug {
                 println!(
@@ -244,9 +280,37 @@ pub fn infer_shapes(graph: &Graph, opts: InferShapeOptions) -> Result<InferResul
                             continue;
                         };
 
-                        // Fail inference if any output has unknown shape.
-                        if opts.strict && out_shape.ndim().is_none() {
-                            return Err(InferError::ShapeInferenceFailed(op_info()));
+                        // Fail inference if any output dimension has an unknown shape.
+                        if opts.strict {
+                            let has_unknown = if let Some(mut out_shape) = out_shape.shape() {
+                                out_shape.any(|dims| {
+                                    dims.iter().any(|expr| match expr {
+                                        // If we encounter a synthetic variable, this means that
+                                        // the size of a dimension could not be computed.
+                                        SymExpr::Var(symbol) => symbol.synthetic,
+                                        _ => false,
+                                    })
+                                })
+                            } else {
+                                // Output rank is unknown.
+                                true
+                            };
+
+                            if has_unknown {
+                                return Err(InferError::ShapeInferenceIncomplete(op_info()));
+                            }
+                        }
+
+                        // Handle excessively complex symbolic expressions in the shape.
+                        //
+                        // We do this to avoid building up excessively complex expressions on which
+                        // operations such as simplification become very slow. See
+                        // https://github.com/robertknight/rten/issues/1298.
+                        let mut out_shape = out_shape;
+                        let had_complex = out_shape
+                            .replace_complex_expressions(opts.max_complexity, &mut symbol_gen);
+                        if opts.strict && had_complex {
+                            return Err(InferError::ShapeTooComplex(op_info()));
                         }
 
                         values.insert(*out_id, out_shape.simplify());
@@ -316,6 +380,57 @@ pub fn infer_shapes(graph: &Graph, opts: InferShapeOptions) -> Result<InferResul
     })
 }
 
+/// Convert a `f32` value to `i32` if it represents an exact integer that
+/// fits in the `i32` range.
+fn f32_to_int_checked(x: f32) -> Option<i32> {
+    // `i32::MIN as f32` preserves the exact value. `i32::MAX as f32` rounds up
+    // by one. Hence we use an exclusive upper bound.
+    if x.is_finite() && x.fract() == 0.0 && x >= (i32::MIN as f32) && x < (i32::MAX as f32) {
+        Some(x as i32)
+    } else {
+        None
+    }
+}
+
+/// Extract a constant's scalar value as a symbolic values.
+///
+/// This supports `i32` constants and `f32` constants whose value is an
+/// exact integer.
+fn const_to_sym_scalar(constant: &graph::Constant) -> Option<SymExpr> {
+    let int_val: Option<i32> = constant.as_scalar();
+    if let Some(val) = int_val {
+        return Some(SymExpr::Value(val));
+    }
+
+    let float_val: Option<f32> = constant.as_scalar();
+    if let Some(val) = float_val.and_then(f32_to_int_checked) {
+        return Some(SymExpr::Value(val));
+    }
+
+    None
+}
+
+/// Extract a constant's 1D values as symbolic values.
+///
+/// This supports `i32` vectors and `f32` vectors whose values are all exact
+/// integers.
+fn const_to_sym_vector(constant: &graph::Constant) -> Option<Vec<SymExpr>> {
+    let int_vec: Option<&[i32]> = constant.as_vector();
+    if let Some(int_vec) = int_vec {
+        return Some(int_vec.iter().copied().map(SymExpr::Value).collect());
+    }
+
+    let float_vec: Option<&[f32]> = constant.as_vector();
+    if let Some(float_vec) = float_vec {
+        return float_vec
+            .iter()
+            .map(|&f| f32_to_int_checked(f).map(SymExpr::Value))
+            .collect();
+    }
+
+    None
+}
+
 /// Convert an operator input into a symbolic tensor.
 ///
 /// If the input is a constant, we can use its shape and values directly. If
@@ -329,14 +444,14 @@ fn sym_tensor_from_input(
 ) -> SymTensor {
     match node {
         Node::Constant(constant) => {
-            // `as_scalar` will return a value if the constant is a vector
-            // with one item. Only convert to a scalar if it is actually scalar.
-            if let Some(scalar) = constant.as_scalar()
+            // `const_to_sym_scalar` will return a value if the constant is a
+            // vector with one item. Only convert to a scalar if it is actually
+            // scalar.
+            if let Some(scalar) = const_to_sym_scalar(constant)
                 && constant.ndim() == 0
             {
-                SymTensor::from_scalar(SymExpr::Value(scalar))
-            } else if let Some(vec) = constant.as_vector() {
-                let vec = vec.iter().copied().map(SymExpr::Value).collect();
+                SymTensor::from_scalar(scalar)
+            } else if let Some(vec) = const_to_sym_vector(constant) {
                 SymTensor::from_vec(vec)
             } else {
                 SymTensor::from_fixed_shape(constant.shape())
@@ -353,6 +468,7 @@ fn sym_tensor_from_input(
                             Symbol {
                                 name: name.clone(),
                                 positive: true,
+                                synthetic: false,
                             }
                             .into(),
                         ),
@@ -375,7 +491,7 @@ mod tests {
 
     use crate::Dimension;
     use crate::graph::builder::{Expr, OutputMeta, dims};
-    use crate::ops::{Concat, Gather, MatMul, Shape as ShapeOp, Split, Unsqueeze};
+    use crate::ops::{Concat, Gather, Gemm, MatMul, Shape as ShapeOp, Split, Unsqueeze};
     use crate::value::{DataType, ValueType};
 
     use super::{Constant, InferError, InferShapeOptions, Shape, infer_shapes};
@@ -408,7 +524,10 @@ mod tests {
 
     #[test]
     fn test_infer_shapes_strict() {
-        let opts = InferShapeOptions { strict: true };
+        let opts = InferShapeOptions {
+            strict: true,
+            ..Default::default()
+        };
 
         // Successful strict shape inference
         let graph = {
@@ -424,16 +543,44 @@ mod tests {
         let result = infer_shapes(&graph, opts.clone());
         assert!(result.is_ok());
 
-        // Unsuccessful shape inference
+        // Incomplete shape inference.
         let graph = {
-            let x = Expr::value("data");
+            let x = Expr::value("data"); // Missing type, shape
             let w = Expr::constant(NdTensor::<f32, _>::zeros([64, 12]));
             let out = x.apply(MatMul {}, &[w], &[OutputMeta::NoMeta]);
             out.build_graph(&["data"])
         };
         let result = infer_shapes(&graph, opts.clone());
         assert!(
-            matches!(&result, Err(InferError::ShapeInferenceFailed(op_info)) if op_info.name == "MatMul"),
+            matches!(&result, Err(InferError::ShapeInferenceIncomplete(op_info)) if op_info.name == "MatMul"),
+            "{:?} is not expected error",
+            result
+        );
+
+        // Failed shape inference.
+        let graph = {
+            let x = Expr::value_with_info(
+                "data",
+                ValueType::Tensor(DataType::Float),
+                &dims!("batch", 64),
+            );
+            // RHS input to Gemm with too few dims.
+            let w = Expr::constant(NdTensor::<f32, _>::zeros([64]));
+            let out = x.apply(
+                Gemm {
+                    alpha: 1.,
+                    beta: 0.,
+                    transpose_a: false,
+                    transpose_b: false,
+                },
+                &[w],
+                &[OutputMeta::NoMeta],
+            );
+            out.build_graph(&["data"])
+        };
+        let result = infer_shapes(&graph, opts.clone());
+        assert!(
+            matches!(&result, Err(InferError::ShapeInferenceFailed(op_info)) if op_info.name == "Gemm"),
             "{:?} is not expected error",
             result
         );

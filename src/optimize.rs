@@ -1,10 +1,11 @@
 use std::any::Any;
+use std::collections::hash_map::Entry;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use rten_tensor::Tensor;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::Value;
@@ -16,6 +17,7 @@ use crate::graph::{
 use crate::infer_shapes::{InferError, InferShapeOptions, Shape, infer_shapes};
 use crate::operator::Operator;
 use crate::ops::Identity;
+use crate::value::{DataType, ValueType};
 
 mod diagnostics;
 mod fusions;
@@ -24,12 +26,12 @@ mod pattern_matcher;
 use diagnostics::{DiagnosticLevel, Diagnostics};
 
 use fusions::{
-    AddSoftmaxFusion, ApproxGeluFusion, CastElimination, ComputeShapeFusion, Fusion, FusionError,
-    FusionVisitor, GeluFusion, GroupedQueryAttentionMatMulFusion, IdentityFusion,
-    LayerNormalizationFusion, MatMulAddFusion, MatMulIntegerToFloatFusion, MatMulScaleFusion,
-    PatternFusion, RMSNormalizationFusion, ReciprocalFusion, ReduceMeanAxesFusion,
-    RepeatInterleaveFusion, SafeSoftmaxFusion, ShapeSliceToConstant, SiluFusion, SwishFusion,
-    TransposeFusion,
+    AddSoftmaxFusion, ApproxGeluFusion, CastElimination, ComputeShapeFusion, ConvAddFusion,
+    ConvIntegerToFloatFusion, Fusion, FusionError, FusionVisitor, GeluFusion,
+    GroupedQueryAttentionMatMulFusion, IdentityFusion, LayerNormalizationFusion, MatMulAddFusion,
+    MatMulIntegerToFloatFusion, MatMulScaleFusion, PatternFusion, RMSNormalizationFusion,
+    ReciprocalFusion, ReduceMeanAxesFusion, RepeatInterleaveFusion, SafeSoftmaxFusion,
+    ShapeSliceToConstant, SiluFusion, SwishFusion, TransposeFusion,
 };
 
 /// Errors that occur while applying graph optimizations.
@@ -126,6 +128,8 @@ impl GraphMutator {
 
         let mut ops_pending_removal = FxHashSet::default();
 
+        let captured_values = self.graph.subgraph_capture_value_ids();
+
         // Get all operators, in the order they will be run.
         let Ok(mut operators) = self.graph.execution_plan(
             self.graph.input_ids(),
@@ -216,6 +220,28 @@ impl GraphMutator {
                     return None;
                 }
 
+                // Skip fusion if it would remove a value captured by a subgraph.
+                //
+                // Ideally we would replace references to the value in the
+                // subgraph instead of skipping the fusion.
+                // See https://github.com/robertknight/rten/issues/1359.
+                if let Some(captured) =
+                    find_operator_output_captured_by_subgraph(&self.graph, &captured_values, &unfused_ops, &fusion)
+                {
+                    if diag.enabled(DiagnosticLevel::Warn) {
+                        diag.warn(
+                            &self.graph,
+                            op_node_id,
+                            std::format_args!(
+                                "skipping {} fusion because output \"{}\" is captured by a subgraph",
+                                fusion.name(),
+                                self.graph.node_name(captured)
+                            ),
+                        );
+                    }
+                    return None;
+                }
+
                 diag.info(
                     &self.graph,
                     op_node_id,
@@ -251,10 +277,17 @@ impl GraphMutator {
         {
             match fusion {
                 Fusion::Op(fusion) => {
+                    // Create any new constants required by the fused op and
+                    // place their IDs in the input list.
+                    let mut input_ids = fusion.input_ids;
+                    for (index, constant) in fusion.new_constant_inputs {
+                        let const_id = self.add_constant_node(constant);
+                        input_ids[index] = Some(const_id);
+                    }
                     self.add_operator(
                         fusion.name.as_deref(),
                         fusion.fused_op,
-                        &fusion.input_ids,
+                        &input_ids,
                         &fusion.output_ids,
                     );
                 }
@@ -295,6 +328,16 @@ impl GraphMutator {
         &self.output_ids
     }
 
+    /// Mark operator outputs as unused and remove their value nodes from the
+    /// graph.
+    fn clear_operator_outputs(&mut self, outputs: &[(NodeId, usize)]) {
+        let removed_values: Vec<NodeId> = outputs
+            .iter()
+            .filter_map(|(op_id, index)| self.graph.clear_operator_output(*op_id, *index))
+            .collect();
+        self.graph.remove_nodes(&removed_values);
+    }
+
     fn set_captures(&mut self, captures: &[NodeId]) {
         self.graph.set_captures(captures)
     }
@@ -328,6 +371,74 @@ struct ConsumerInfo {
     #[expect(unused)]
     output: NodeId,
     consumer: ConsumerKind,
+}
+
+/// Add a constant produced by shape inference to the graph, using `dtype` as
+/// the element type.
+///
+/// Returns `None` if any elements cannot be represented exactly in `dtype`.
+fn add_typed_constant(
+    graph: &mut GraphMutator,
+    constant: &rten_shape_inference::Constant,
+    dtype: DataType,
+) -> Option<NodeId> {
+    fn add_constant<T: Copy + rten_tensor::Scalar>(
+        graph: &mut GraphMutator,
+        constant: &rten_shape_inference::Constant,
+        convert: impl Fn(i32) -> Option<T>,
+    ) -> Option<NodeId>
+    where
+        Constant: From<ConstantNode<T>>,
+    {
+        let tensor = match constant {
+            rten_shape_inference::Constant::Scalar(x) => Tensor::from(convert(*x)?),
+            rten_shape_inference::Constant::Vector(vec) => {
+                let elts: Option<Vec<T>> = vec.iter().map(|&x| convert(x)).collect();
+                Tensor::from(elts?)
+            }
+        };
+        Some(graph.add_constant(None, tensor.into_arc()))
+    }
+
+    match dtype {
+        DataType::Int32 => add_constant(graph, constant, Some),
+        // `f32` represents integers exactly only up to 2^24.
+        DataType::Float => add_constant(graph, constant, |x| {
+            (x.unsigned_abs() <= (1 << f32::MANTISSA_DIGITS)).then_some(x as f32)
+        }),
+        DataType::Int8 => add_constant(graph, constant, |x| i8::try_from(x).ok()),
+        DataType::UInt8 => add_constant(graph, constant, |x| u8::try_from(x).ok()),
+    }
+}
+
+/// Check for an operator output ID that would be removed by a fusion and is
+/// captured by a subgraph.
+fn find_operator_output_captured_by_subgraph(
+    graph: &Graph,
+    captured_values: &FxHashSet<NodeId>,
+    unfused_ops: &[NodeId],
+    fusion: &Fusion,
+) -> Option<NodeId> {
+    if captured_values.is_empty() {
+        return None;
+    }
+
+    let preserved: &[Option<NodeId>] = match fusion {
+        Fusion::Op(op) => &op.output_ids,
+        Fusion::Identity { .. } | Fusion::Constant { .. } => &[],
+    };
+
+    for &op_id in unfused_ops {
+        let Some(op) = graph.get_node(op_id).and_then(|n| n.as_operator()) else {
+            continue;
+        };
+        for &output in op.output_ids().iter().flatten() {
+            if captured_values.contains(&output) && !preserved.contains(&Some(output)) {
+                return Some(output);
+            }
+        }
+    }
+    None
 }
 
 /// Find an operator output in a subgraph which is used outside the subgraph,
@@ -417,6 +528,13 @@ impl GraphOptimizer {
             diag.set_level(level);
         }
 
+        // Remove unused operator outputs.
+        //
+        // This is done first so that later passes, in particular constant
+        // propagation, don't evaluate operators which would fail because an
+        // unsupported output was requested.
+        self.remove_unused_outputs(&mut graph_mut);
+
         // Perform shape inference to update type and shape metadata for nodes.
         //
         // This can unlock fusions which have restrictions on the shapes and
@@ -424,22 +542,41 @@ impl GraphOptimizer {
         if let Some(infer_opts) = opts.infer_shapes {
             let infer_result = infer_shapes(&graph_mut.graph, infer_opts)
                 .map_err(OptimizeError::InferShapesError)?;
-            let const_ids: Vec<NodeId> = infer_result
-                .constants
-                .into_iter()
-                .map(|constant| {
-                    let tensor = match constant {
-                        rten_shape_inference::Constant::Scalar(x) => Tensor::from(x),
-                        rten_shape_inference::Constant::Vector(vec) => Tensor::from(vec),
-                    };
-                    graph_mut.add_constant(None, tensor.into_arc())
-                })
-                .collect();
+
+            // Map of `(const_index, value_dtype) => const_id` for constant
+            // nodes created from shape inference constants. This exists because
+            // a single constant from shape inference might need to be converted
+            // into multiple constant nodes with different dtypes.
+            let mut const_ids: FxHashMap<(usize, DataType), NodeId> = FxHashMap::default();
 
             for (value_id, shape) in infer_result.shapes {
                 match shape {
                     Shape::Constant { index } => {
-                        let const_id = const_ids[index];
+                        let dtype = graph_mut
+                            .graph()
+                            .get_node(value_id)
+                            .and_then(|node| node.dtype())
+                            .or_else(|| infer_result.types.get(&value_id).copied());
+                        let Some(ValueType::Tensor(dtype)) = dtype else {
+                            // Without a known element type we can't produce a
+                            // correctly typed constant, so leave the value as is.
+                            continue;
+                        };
+
+                        let const_id = match const_ids.entry((index, dtype)) {
+                            Entry::Occupied(entry) => *entry.get(),
+                            Entry::Vacant(entry) => {
+                                let Some(const_id) = add_typed_constant(
+                                    &mut graph_mut,
+                                    &infer_result.constants[index],
+                                    dtype,
+                                ) else {
+                                    // Value is not representable in target type
+                                    continue;
+                                };
+                                *entry.insert(const_id)
+                            }
+                        };
                         graph_mut.replace_value(value_id, const_id);
                     }
                     Shape::Shape(shape) => {
@@ -514,6 +651,10 @@ impl GraphOptimizer {
         fusions.push(MatMulScaleFusion {});
         fusions.push(MatMulIntegerToFloatFusion {}.into_visitor());
 
+        // Convolution fusions
+        fusions.push(ConvAddFusion {});
+        fusions.push(ConvIntegerToFloatFusion {}.into_visitor());
+
         // Attention fusions.
         //
         // Note SafeSoftmaxFusion must come before other softmax fusions.
@@ -535,6 +676,39 @@ impl GraphOptimizer {
         }
 
         Ok(graph_mut.finalize_graph())
+    }
+
+    /// Mark operator outputs whose values are not used anywhere in the graph
+    /// as unused, and remove the corresponding value nodes.
+    fn remove_unused_outputs(&self, graph: &mut GraphMutator) {
+        let captured_values = graph.graph().subgraph_capture_value_ids();
+
+        // Check if a value is used - either as a graph output, captured by a
+        // subgraph or as an input to another operator.
+        let is_used = |value_id: NodeId| {
+            graph.output_ids().contains(&value_id)
+                || captured_values.contains(&value_id)
+                || graph
+                    .graph()
+                    .get_consumers(value_id)
+                    .is_some_and(|consumers| !consumers.is_empty())
+        };
+
+        // Unused operator outputs as `(operator_id, output_index)` pairs.
+        let unused: Vec<(NodeId, usize)> = graph
+            .graph()
+            .iter()
+            .filter_map(|(op_id, node)| node.as_operator().map(|op| (op_id, op)))
+            .flat_map(|(op_id, op)| {
+                op.output_ids()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_index, output_id)| output_id.is_some_and(|id| !is_used(id)))
+                    .map(move |(index, _output_id)| (op_id, index))
+            })
+            .collect();
+
+        graph.clear_operator_outputs(&unused);
     }
 
     /// Replace captured values in a graph with constants if the captured value

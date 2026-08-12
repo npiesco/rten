@@ -1,7 +1,7 @@
 use std::mem::MaybeUninit;
 use std::ops::Range;
 
-use rten_base::byte_cast::{cast_pod_slice, cast_uninit_pod_mut_slice};
+use rten_base::byte_cast::{cast_slice, cast_uninit_mut_slice};
 use rten_base::iter::range_chunks;
 use rten_tensor::storage::Alloc;
 use rten_tensor::{AssumeInit, Matrix, MatrixLayout, Storage};
@@ -152,7 +152,7 @@ pub fn pack_b_block<T: Copy + Default, const NR: usize>(
     let b_rows = rows.len();
     let b_row_stride = b.row_stride();
     let b_col_stride = b.col_stride();
-    let n_panels = b_cols.next_multiple_of(NR) / NR;
+    let n_panels = b_cols.div_ceil(NR);
 
     let used_size = n_panels * b_rows * NR;
     assert_eq!(out.len(), used_size);
@@ -249,7 +249,7 @@ impl<'a, const NR: usize> BlockQuantizedMatrixPacker<'a, f32, NR> {
         rows: Range<usize>,
         cols: Range<usize>,
     ) -> &'a mut [f32] {
-        let n_panels = cols.len().next_multiple_of(NR) / NR;
+        let n_panels = cols.len().div_ceil(NR);
 
         let block_size = self.mat.elements_per_block();
         assert!(rows.start.is_multiple_of(block_size) && rows.len().is_multiple_of(block_size));
@@ -326,7 +326,7 @@ impl<'a, const NR: usize> BlockQuantizedMatrixPacker<'a, f32, NR> {
 
 impl<'a, const NR: usize> Packer<'a> for BlockQuantizedMatrixPacker<'a, f32, NR> {
     fn pack(&self, out: &mut [MaybeUninit<u8>], rows: Range<usize>, cols: Range<usize>) {
-        let out = cast_uninit_pod_mut_slice(out).unwrap();
+        let out = cast_uninit_mut_slice(out).unwrap();
         self.pack(out, rows, cols);
     }
 }
@@ -373,7 +373,7 @@ impl PackingBuffer {
         self.used_len = 0;
 
         let uninit_data = &mut self.buf.spare_capacity_mut()[..buf_len];
-        cast_uninit_pod_mut_slice(uninit_data).unwrap()
+        cast_uninit_mut_slice(uninit_data).unwrap()
     }
 
     /// Clear the buffer and allocate a new one using `alloc`.
@@ -394,7 +394,7 @@ impl PackingBuffer {
         self.used_len = 0;
 
         let uninit_data = &mut self.buf.spare_capacity_mut()[..buf_len];
-        cast_uninit_pod_mut_slice(uninit_data).unwrap()
+        cast_uninit_mut_slice(uninit_data).unwrap()
     }
 
     /// Set the number of bytes in the buffer which have been initialized.
@@ -410,7 +410,7 @@ impl PackingBuffer {
 
     /// Return the contents of the buffer as a slice of bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        &cast_pod_slice(&self.buf).unwrap()[..self.used_len]
+        &cast_slice(&self.buf).unwrap()[..self.used_len]
     }
 
     /// Extract the buffer from self.

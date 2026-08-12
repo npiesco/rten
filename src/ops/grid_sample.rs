@@ -1,7 +1,9 @@
+use rten_shape_inference::ops as shape_ops;
 use rten_tensor::prelude::*;
 use rten_tensor::{NdTensor, NdTensorView};
 
 use crate::buffer_pool::BufferPool;
+use crate::infer_shapes::{InferShapes, impl_infer_shapes};
 use crate::operator::{
     IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
     OutputTypesContext,
@@ -22,13 +24,13 @@ fn grid_sample(
     let [in_batch, in_c, in_h, in_w] = input.shape();
 
     if batch != in_batch {
-        return Err(OpError::IncompatibleInputShapes(
+        return Err(OpError::incompatible_input_shapes(
             "Batch size of input and grid must match",
         ));
     }
 
     if coord_ndim != 2 {
-        return Err(OpError::UnsupportedValue(
+        return Err(OpError::unsupported_value(
             "Unsupported grid coordinate size",
         ));
     }
@@ -145,7 +147,13 @@ impl Operator for GridSample {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(0)].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(GridSample, _op, shape_ops::GridSample);
 
 #[cfg(test)]
 mod tests {
@@ -304,14 +312,14 @@ mod tests {
             Case {
                 input_shape: [1, 1, 1, 1],
                 grid_shape: [2, 1, 1, 2],
-                expected: OpError::IncompatibleInputShapes(
+                expected: OpError::incompatible_input_shapes(
                     "Batch size of input and grid must match",
                 ),
             },
             Case {
                 input_shape: [1, 1, 1, 1],
                 grid_shape: [1, 1, 1, 3],
-                expected: OpError::UnsupportedValue("Unsupported grid coordinate size"),
+                expected: OpError::unsupported_value("Unsupported grid coordinate size"),
             },
         ];
 

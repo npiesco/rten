@@ -3,6 +3,7 @@ use rayon::prelude::*;
 use std::fmt::Debug;
 use std::mem::MaybeUninit;
 
+use rten_base::bit_set::BitSet;
 use rten_base::num::AsBool;
 use rten_shape_inference::ops as shape_ops;
 use rten_simd::SimdUnaryOp;
@@ -14,8 +15,8 @@ use rten_vecmath as vecmath;
 use crate::buffer_pool::{AutoReturn, BufferPool};
 use crate::infer_shapes::{InferShapes, UnaryOp};
 use crate::operator::{
-    IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
-    OutputTypesContext,
+    InPlaceInputs, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
+    OutputTypeList, OutputTypesContext,
 };
 use crate::ops::binary_elementwise::binary_op;
 use crate::ops::{map_value, map_value_view};
@@ -131,8 +132,8 @@ macro_rules! impl_operator {
                 Some(1)
             }
 
-            fn can_run_in_place(&self) -> bool {
-                true
+            fn in_place_inputs(&self) -> BitSet<u16> {
+                BitSet::from_indices([0])
             }
 
             fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
@@ -143,11 +144,16 @@ macro_rules! impl_operator {
                 })
             }
 
-            fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
+            fn run_in_place(
+                &self,
+                in_place: InPlaceInputs,
+                ctx: &OpRunContext,
+            ) -> Result<OutputList, OpError> {
+                let input = in_place.into_single();
                 map_value!(input, input, $types, {
                     let kernel = self.get_kernel();
                     let result = unary_op_in_place(ctx.pool(), input, &kernel);
-                    Ok(result.into())
+                    result.into_op_result()
                 })
             }
 
@@ -222,6 +228,18 @@ impl_get_kernel!(Asin, f32, |val: f32| val.asin());
 declare_operator!(Atan);
 impl_operator!(Atan, [FloatTensor]);
 impl_get_kernel!(Atan, f32, |val: f32| val.atan());
+
+declare_operator!(Acosh);
+impl_operator!(Acosh, [FloatTensor]);
+impl_get_kernel!(Acosh, f32, |val: f32| val.acosh());
+
+declare_operator!(Asinh);
+impl_operator!(Asinh, [FloatTensor]);
+impl_get_kernel!(Asinh, f32, |val: f32| val.asinh());
+
+declare_operator!(Atanh);
+impl_operator!(Atanh, [FloatTensor]);
+impl_get_kernel!(Atanh, f32, |val: f32| val.atanh());
 
 declare_operator!(Ceil);
 impl_operator!(Ceil, [FloatTensor]);
@@ -315,16 +333,21 @@ impl Operator for Clip {
         })
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, ctx: &OpRunContext) -> Result<Value, OpError> {
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let input = in_place.into_single();
         map_value!(input, input, [FloatTensor, Int32Tensor], {
-            let min = ctx.inputs().get_as(0)?;
-            let max = ctx.inputs().get_as(1)?;
+            let min = ctx.inputs().get_as(1)?;
+            let max = ctx.inputs().get_as(2)?;
             clip_in_place(&mut input, min, max);
-            Ok(input.into())
+            input.into_op_result()
         })
     }
 
@@ -340,6 +363,10 @@ impl Operator for Clip {
 declare_operator!(Cos);
 impl_operator!(Cos, [FloatTensor]);
 impl_get_kernel!(Cos, f32, SimdKernel(vecmath::Cos::new()));
+
+declare_operator!(Cosh);
+impl_operator!(Cosh, [FloatTensor]);
+impl_get_kernel!(Cosh, f32, |val: f32| val.cosh());
 
 #[derive(Debug)]
 pub struct Elu {
@@ -554,14 +581,18 @@ impl Operator for Not {
         not(ctx.pool(), input).into_op_result()
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, _ctx: &OpRunContext) -> Result<Value, OpError> {
-        let mut output: Tensor<i32> = input.try_into()?;
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        _ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        let mut output: Tensor<i32> = in_place.into_single().try_into()?;
         not_in_place(output.view_mut());
-        Ok(output.into())
+        output.into_op_result()
     }
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
@@ -596,7 +627,7 @@ fn prelu<T: Copy + Default + PartialOrd + std::ops::Mul<Output = T>>(
     slope: TensorView<T>,
 ) -> Result<Tensor<T>, OpError> {
     if !slope.can_broadcast_to(x.shape()) {
-        return Err(OpError::IncompatibleInputShapes(
+        return Err(OpError::incompatible_input_shapes(
             "Slope is not broadcastable to input shape",
         ));
     }
@@ -657,24 +688,28 @@ impl_get_kernel!(Silu, f32, SimdKernel(vecmath::Silu {}));
 
 /// Swish function (<https://en.wikipedia.org/wiki/Swish_function>).
 ///
-/// This computes `x * sigmoid(beta * x)`. The special case where beta = 1 is
+/// This computes `x * sigmoid(alpha * x)`. The special case where alpha = 1 is
 /// known as [`Silu`].
 #[derive(Debug)]
 pub struct Swish {
-    pub beta: f32,
+    pub alpha: f32,
 }
 
 impl_operator!(Swish, [FloatTensor]);
 
 impl GetKernel<f32> for Swish {
     fn get_kernel(&self) -> impl UnaryKernel<f32> + Send + Sync {
-        SimdKernel(vecmath::Swish { beta: self.beta })
+        SimdKernel(vecmath::Swish { alpha: self.alpha })
     }
 }
 
 declare_operator!(Sin);
 impl_operator!(Sin, [FloatTensor]);
 impl_get_kernel!(Sin, f32, SimdKernel(vecmath::Sin::new()));
+
+declare_operator!(Sinh);
+impl_operator!(Sinh, [FloatTensor]);
+impl_get_kernel!(Sinh, f32, |val: f32| val.sinh());
 
 /// Trait for obtaining the sign of a number (-1, 0 or 1) as a value of the
 /// same type.
@@ -722,6 +757,12 @@ impl_operator!(Tanh, [FloatTensor]);
 impl_operator_fn!(Tanh, tanh);
 impl_get_kernel!(Tanh, f32, SimdKernel(vecmath::Tanh {}));
 
+#[cfg(feature = "contrib")]
+pub use contrib::{BiasGelu, FastGelu, GeluMicrosoft, QuickGelu};
+
+#[cfg(feature = "contrib")]
+mod contrib;
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -733,9 +774,10 @@ mod tests {
     use rten_testing::TestCases;
 
     use super::{
-        Abs, Acos, Asin, Atan, Cos, Elu, Exp, Gelu, IsInf, IsNaN, Log, Neg, Not, PRelu, Reciprocal,
-        Relu, Sigmoid, Sign, Silu, Sin, Softplus, Sqrt, Swish, Tan, Tanh, ceil, clip,
-        clip_in_place, erf, floor, hard_sigmoid, hard_swish, leaky_relu, round,
+        Abs, Acos, Acosh, Asin, Asinh, Atan, Atanh, Cos, Cosh, Elu, Exp, Gelu, IsInf, IsNaN, Log,
+        Neg, Not, PRelu, Reciprocal, Relu, Sigmoid, Sign, Silu, Sin, Sinh, Softplus, Sqrt, Swish,
+        Tan, Tanh, ceil, clip, clip_in_place, erf, floor, hard_sigmoid, hard_swish, leaky_relu,
+        round,
     };
     use crate::buffer_pool::BufferPool;
     use crate::operator::{OpError, Operator, OperatorExt};
@@ -844,6 +886,14 @@ mod tests {
     test_unary_op!(test_acos, Acos {}, |x: &f32| x.acos());
     test_unary_op!(test_asin, Asin {}, |x: &f32| x.asin());
     test_unary_op!(test_atan, Atan {}, |x: &f32| x.atan());
+    test_unary_op!(
+        test_acosh,
+        Acosh {},
+        |x: &f32| x.acosh(),
+        Tensor::from([1.0, 1.5, 2.0, 5.0, 100.0])
+    );
+    test_unary_op!(test_asinh, Asinh {}, |x: &f32| x.asinh());
+    test_unary_op!(test_atanh, Atanh {}, |x: &f32| x.atanh());
 
     #[test]
     fn test_ceil() {
@@ -915,6 +965,7 @@ mod tests {
     }
 
     test_unary_op!(test_cos, Cos {}, |x: &f32| x.cos());
+    test_unary_op!(test_cosh, Cosh {}, |x: &f32| x.cosh());
 
     #[test]
     fn test_elu() {
@@ -1004,11 +1055,11 @@ mod tests {
         assert!(eq_with_nans(result.view(), expected.view()));
     }
 
-    fn reference_gelu(x: f32) -> f32 {
+    pub(super) fn reference_gelu(x: f32) -> f32 {
         0.5 * x * (1. + libm::erff(x / (2.0f32).sqrt()))
     }
 
-    fn reference_approx_gelu(x: f32) -> f32 {
+    pub(super) fn reference_approx_gelu(x: f32) -> f32 {
         let x_cubed = x * x * x;
         let approx_erf = ((2.0f32 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x_cubed)).tanh();
         0.5 * x * (1. + approx_erf)
@@ -1129,7 +1180,7 @@ mod tests {
         let result: Result<Tensor, _> = op.run_simple((x.view(), slope_2d.view()));
         assert_eq!(
             result.err(),
-            Some(OpError::IncompatibleInputShapes(
+            Some(OpError::incompatible_input_shapes(
                 "Slope is not broadcastable to input shape"
             ))
         );
@@ -1149,6 +1200,7 @@ mod tests {
     );
     test_unary_op!(test_silu, Silu {}, |x: &f32| x * reference_sigmoid(*x));
     test_unary_op!(test_sin, Sin {}, |x: &f32| x.sin());
+    test_unary_op!(test_sinh, Sinh {}, |x: &f32| x.sinh());
     test_unary_op!(test_softplus, Softplus {}, |x: &f32| { x.exp().ln_1p() });
     test_unary_op!(
         test_sqrt,
@@ -1156,7 +1208,7 @@ mod tests {
         |x: &f32| x.sqrt(),
         Tensor::from([4., 9., 16.])
     );
-    test_unary_op!(test_swish, Swish { beta: 0.5 }, |x: &f32| x
+    test_unary_op!(test_swish, Swish { alpha: 0.5 }, |x: &f32| x
         * reference_sigmoid(0.5 * *x));
     test_unary_op!(test_tan, Tan {}, |x: &f32| x.tan());
     test_unary_op!(test_tanh, Tanh {}, |x: &f32| x.tanh());

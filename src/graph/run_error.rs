@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use crate::operator::{OpError, OpRunContext};
-use crate::value::{ValueMeta, ValueType};
+use crate::value::ValueMeta;
 
 /// Errors that occur when running a model.
 #[derive(Debug)]
@@ -44,15 +44,24 @@ impl RunError {
         name: &str,
         error: OpError,
         ctx: &OpRunContext,
-        main_input_dtype: ValueType,
-        main_input_shape: &[usize],
+        in_place_metas: &[(usize, ValueMeta)],
     ) -> Self {
-        let meta = ValueMeta {
-            dtype: main_input_dtype,
-            shape: main_input_shape.to_vec(),
-        };
-        let mut inputs: Vec<_> = [Some(meta)].into();
-        inputs.extend(ctx.inputs().iter().map(|inp| inp.map(|inp| inp.to_meta())));
+        let inputs: Vec<_> = ctx
+            .inputs()
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                // `ctx.inputs()` has a `None` placeholder at each in-place
+                // input's position, since those inputs are passed separately.
+                // Fill them in so the metadata reflects all of the inputs.
+                in_place_metas
+                    .iter()
+                    .find(|(pos, _)| *pos == index)
+                    .map(|(_, meta)| meta.clone())
+                    .or_else(|| input.map(|input| input.to_meta()))
+            })
+            .collect();
+
         RunErrorImpl::OperatorError {
             name: name.to_string(),
             error,
@@ -90,6 +99,8 @@ impl From<RunErrorImpl> for RunError {
 pub enum RunErrorKind {
     /// An input or output node was not found.
     NodeNotFound,
+    /// An input value did not match the shape or dtype expected by the model.
+    InvalidInput,
     /// Failed to construct an execution plan that would generate the requested
     /// outputs from the inputs.
     PlanningError,
@@ -105,6 +116,15 @@ pub(crate) enum RunErrorImpl {
 
     /// No node with a given name could be found
     InvalidNodeName(String),
+
+    /// An input value did not match the shape or dtype expected by the model.
+    InvalidInput {
+        /// Name of the input node.
+        name: String,
+
+        /// Error details.
+        error: String,
+    },
 
     /// A plan could not be constructed that would generate the requested output
     /// from the input.
@@ -149,6 +169,7 @@ impl RunErrorImpl {
 
         match self {
             Self::InvalidNodeId | Self::InvalidNodeName(_) => Kind::NodeNotFound,
+            Self::InvalidInput { .. } => Kind::InvalidInput,
             Self::PlanningError(_) => Kind::PlanningError,
             Self::OperatorError { .. } | Self::OutputMismatch { .. } => Kind::OperatorError,
             Self::SubgraphError { error, .. } => error.kind(),
@@ -159,6 +180,7 @@ impl RunErrorImpl {
         match self {
             Self::InvalidNodeId => [None].into(),
             Self::InvalidNodeName(name) => [Some(name.as_str())].into(),
+            Self::InvalidInput { name, .. } => [Some(name.as_str())].into(),
             Self::PlanningError(_) => [None].into(),
             Self::OperatorError { name, .. } => [Some(name.as_str())].into(),
             Self::OutputMismatch { name, .. } => [Some(name.as_str())].into(),
@@ -176,6 +198,9 @@ impl Display for RunErrorImpl {
         match self {
             Self::InvalidNodeId => write!(f, "node ID is invalid"),
             Self::InvalidNodeName(name) => write!(f, "no node found with name {}", name),
+            Self::InvalidInput { name, error } => {
+                write!(f, "input \"{}\" is invalid: {}", name, error)
+            }
             Self::PlanningError(err) => write!(f, "planning error: {}", err),
             Self::OperatorError {
                 name,

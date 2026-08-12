@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use rten_base::num::{Identities, IsNaN, MinMax};
+use rten_shape_inference::ops as shape_ops;
 use rten_simd::SimdOp;
 use rten_tensor;
 use rten_tensor::prelude::*;
@@ -9,7 +10,10 @@ use rten_tensor::{NdTensor, NdTensorView, Tensor, TensorView};
 use rten_vecmath as vecmath;
 
 use crate::buffer_pool::BufferPool;
-use crate::infer_shapes::{InferShapes, InferShapesError, ReductionOp, SymTensor, SymbolGen};
+use crate::infer_shapes::{
+    InferShapes, InferShapesContext, InferShapesError, ReductionOp, SymTensor, SymbolGen,
+    impl_infer_shapes,
+};
 use crate::operator::{
     InputList, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
     OutputTypeList, OutputTypesContext,
@@ -24,7 +28,7 @@ macro_rules! impl_infer_shapes_for_reduce_op {
         impl InferShapes for $op {
             fn infer_shapes(
                 &self,
-                inputs: &[SymTensor],
+                inputs: InferShapesContext,
                 sym_gen: &mut SymbolGen,
             ) -> Result<Vec<SymTensor>, InferShapesError> {
                 ReductionOp {
@@ -42,7 +46,7 @@ macro_rules! impl_infer_shapes_for_arg_op {
         impl InferShapes for $op {
             fn infer_shapes(
                 &self,
-                inputs: &[SymTensor],
+                inputs: InferShapesContext,
                 sym_gen: &mut SymbolGen,
             ) -> Result<Vec<SymTensor>, InferShapesError> {
                 ReductionOp {
@@ -66,7 +70,7 @@ fn select_max_index<T, Cmp: Fn(&T, &T) -> std::cmp::Ordering>(
 ) -> Result<Tensor<i32>, OpError> {
     let resolved_axis = resolve_axis(input.ndim(), axis)?;
     if input.size(resolved_axis) == 0 {
-        return Err(OpError::InvalidValue(
+        return Err(OpError::invalid_value(
             "Cannot select index from empty sequence",
         ));
     }
@@ -205,25 +209,43 @@ impl Operator for ArgMin {
 
 impl_infer_shapes_for_arg_op!(ArgMin);
 
+/// Compute the cumulative sum of `input` along `axis`.
+///
+/// If `exclusive` is true, each output element is the sum of the elements
+/// which precede it along `axis`, excluding the element itself. If `reverse`
+/// is true, the sum is accumulated from the end of the axis towards the start.
 pub fn cum_sum<T: Copy + Default + Identities + std::ops::AddAssign>(
     pool: &BufferPool,
     input: TensorView<T>,
     axis: isize,
+    exclusive: bool,
+    reverse: bool,
 ) -> Result<Tensor<T>, OpError> {
     let resolved_axis = resolve_axis(input.ndim(), axis)?;
     let mut output = Tensor::uninit_in(pool, input.shape());
 
     let mut n_init = 0;
     if !input.is_empty() {
-        for (in_slice, out_slice) in input
+        for (in_lane, out_lane) in input
             .lanes(resolved_axis)
             .zip(output.lanes_mut(resolved_axis))
         {
             let mut cum_sum = T::zero();
-            for (x, y) in in_slice.zip(out_slice) {
-                cum_sum += *x;
-                y.write(cum_sum);
-                n_init += 1;
+
+            if reverse {
+                for (x, y) in in_lane.rev().zip(out_lane.rev()) {
+                    let prev_sum = cum_sum;
+                    cum_sum += *x;
+                    y.write(if exclusive { prev_sum } else { cum_sum });
+                    n_init += 1;
+                }
+            } else {
+                for (x, y) in in_lane.zip(out_lane) {
+                    let prev_sum = cum_sum;
+                    cum_sum += *x;
+                    y.write(if exclusive { prev_sum } else { cum_sum });
+                    n_init += 1;
+                }
             }
         }
     }
@@ -235,7 +257,10 @@ pub fn cum_sum<T: Copy + Default + Identities + std::ops::AddAssign>(
 }
 
 #[derive(Debug)]
-pub struct CumSum {}
+pub struct CumSum {
+    pub exclusive: bool,
+    pub reverse: bool,
+}
 
 impl Operator for CumSum {
     fn name(&self) -> &str {
@@ -251,12 +276,23 @@ impl Operator for CumSum {
         let input = inputs.require(0)?;
         let axis: i32 = inputs.require_as(1)?;
         map_value_view!(input, input, [FloatTensor, Int32Tensor], {
-            cum_sum(ctx.pool(), input, axis as isize).into_op_result()
+            cum_sum(
+                ctx.pool(),
+                input,
+                axis as isize,
+                self.exclusive,
+                self.reverse,
+            )
+            .into_op_result()
         })
     }
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(0)].into())
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(&rten_shape_inference::UnaryOp)
     }
 }
 
@@ -310,7 +346,13 @@ impl Operator for NonZero {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::Fixed(ValueType::Tensor(DataType::Int32))].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(NonZero, _op, shape_ops::NonZero);
 
 /// Manages a scratch buffer allocated from a pool.
 struct TempBuffer<'a, T> {
@@ -376,11 +418,10 @@ fn reduce<T: Copy>(
     keep_dims: bool,
     kernel: &dyn ReduceKernel<T>,
 ) -> Result<Tensor<T>, OpError> {
-    let mut resolved_axes = match axes {
+    let resolved_axes = match axes {
         Some(axes) if !axes.is_empty() => resolve_axes(input.ndim(), axes.iter())?,
         _ => (0..input.ndim()).collect(),
     };
-    resolved_axes.sort();
 
     // Temporary buffer where slices of the input to be reduced are packed first
     // if non-contiguous.
@@ -390,20 +431,6 @@ fn reduce<T: Copy>(
         let item = input.item().unwrap();
         return Ok(Tensor::from_scalar(kernel.reduce_slice(&[*item])));
     }
-
-    // nb. Some reduce operations cannot produce a meaningful result with
-    // an empty tensor, but others can, if there is a suitable identity.
-    if input.is_empty() {
-        return Err(OpError::InvalidValue("Cannot reduce empty tensor"));
-    }
-
-    // Number of innermost dims being iterated over, or None if we're not
-    // iterating over innermost dims.
-    let reduced_inner_dims: Option<usize> = resolved_axes
-        .iter()
-        .enumerate()
-        .all(|(i, &axis)| axis == input.ndim() - 1 - i)
-        .then_some(resolved_axes.len());
 
     let reduced_shape: Vec<usize> = input
         .shape()
@@ -417,55 +444,67 @@ fn reduce<T: Copy>(
             }
         })
         .collect();
-    let mut reduced_data = pool.alloc(reduced_shape.iter().product());
+    let output_size: usize = reduced_shape.iter().product();
+    let mut reduced_data = pool.alloc(output_size);
 
-    match (reduced_inner_dims, input.data()) {
-        (Some(ndims), Some(input_data)) => {
-            // Fast path for reducing over contiguous chunks of the input.
-            let slice_len = if ndims == input.ndim() {
-                input.len()
-            } else {
-                input.stride(input.ndim() - 1 - ndims)
-            };
-
-            reduced_data.extend(
-                input_data
-                    .chunks(slice_len)
-                    .map(|chunk| kernel.reduce_slice(chunk)),
-            );
+    if input.is_empty() {
+        // Per the ONNX spec, reduction over an empty set yields the kernel's
+        // identity. Output may itself be empty if a non-reduced dim is zero.
+        if output_size > 0 {
+            reduced_data.resize(output_size, kernel.reduce_slice(&[]));
         }
-        _ => {
-            if resolved_axes.len() == 1 {
-                // Fast path for reducing a single axis.
-                let resolved_axis = resolved_axes[0];
-                reduced_data.extend(input.lanes(resolved_axis).map(|lane| {
-                    if let Some(lane_slice) = lane.as_slice() {
-                        kernel.reduce_slice(lane_slice)
-                    } else {
-                        let buf = tmp_buf.reserve(lane.len());
-                        buf.extend(lane.copied());
-                        kernel.reduce_slice(buf)
-                    }
-                }));
-            } else {
-                // Permute input so the N reduced dims are last, then iterate
-                // over slices of the inner N dims.
-                let mut perm: Vec<usize> = (0..input.ndim()).collect();
-                perm.sort_by_key(|&dim| (resolved_axes.contains(&dim), dim));
-                let permuted = input.permuted(&perm);
+    } else {
+        // Number of innermost dims being iterated over, or None if we're not
+        // iterating over innermost dims.
+        let reduced_inner_dims: Option<usize> = resolved_axes
+            .iter()
+            .enumerate()
+            .all(|(i, axis)| *axis == input.ndim() - 1 - i)
+            .then_some(resolved_axes.len());
 
-                for slice in permuted.inner_iter_dyn(resolved_axes.len()) {
-                    // The reduced dimensions may be contiguous even if the
-                    // tensor is not.
-                    let reduced = if let Some(data) = slice.data() {
-                        kernel.reduce_slice(data)
-                    } else {
-                        let buf = tmp_buf.reserve(slice.len());
-                        let tmp_uninit = &mut buf.spare_capacity_mut()[..slice.len()];
-                        let tmp = slice.copy_into_slice(tmp_uninit);
-                        kernel.reduce_slice(tmp)
-                    };
-                    reduced_data.push(reduced);
+        match (reduced_inner_dims, input.data()) {
+            (Some(ndims), Some(input_data)) => {
+                // Fast path for reducing over contiguous chunks of the input.
+                let slice_len: usize = input.shape()[input.ndim() - ndims..].iter().product();
+                reduced_data.extend(
+                    input_data
+                        .chunks(slice_len)
+                        .map(|chunk| kernel.reduce_slice(chunk)),
+                );
+            }
+            _ => {
+                if resolved_axes.len() == 1 {
+                    // Fast path for reducing a single axis.
+                    let resolved_axis = resolved_axes[0];
+                    reduced_data.extend(input.lanes(resolved_axis).map(|lane| {
+                        if let Some(lane_slice) = lane.as_slice() {
+                            kernel.reduce_slice(lane_slice)
+                        } else {
+                            let buf = tmp_buf.reserve(lane.len());
+                            buf.extend(lane.copied());
+                            kernel.reduce_slice(buf)
+                        }
+                    }));
+                } else {
+                    // Permute input so the N reduced dims are last, then iterate
+                    // over slices of the inner N dims.
+                    let mut perm: Vec<usize> = (0..input.ndim()).collect();
+                    perm.sort_by_key(|&dim| (resolved_axes.contains(&dim), dim));
+                    let permuted = input.permuted(&perm);
+
+                    for slice in permuted.inner_iter_dyn(resolved_axes.len()) {
+                        // The reduced dimensions may be contiguous even if the
+                        // tensor is not.
+                        let reduced = if let Some(data) = slice.data() {
+                            kernel.reduce_slice(data)
+                        } else {
+                            let buf = tmp_buf.reserve(slice.len());
+                            let tmp_uninit = &mut buf.spare_capacity_mut()[..slice.len()];
+                            let tmp = slice.copy_into_slice(tmp_uninit);
+                            kernel.reduce_slice(tmp)
+                        };
+                        reduced_data.push(reduced);
+                    }
                 }
             }
         }
@@ -475,7 +514,7 @@ fn reduce<T: Copy>(
 
     if !keep_dims {
         let resolved_axes_i32: NdTensor<i32, 1> =
-            resolved_axes.iter().map(|&axis| axis as i32).collect();
+            resolved_axes.iter().map(|axis| *axis as i32).collect();
         squeeze_in_place(&mut reduced, Some(resolved_axes_i32.view())).expect("Invalid axis");
     }
 
@@ -491,6 +530,9 @@ pub fn reduce_mean(
     struct MeanKernel {}
     impl ReduceKernel<f32> for MeanKernel {
         fn reduce_slice(&self, slice: &[f32]) -> f32 {
+            // ONNX leaves reduction over an empty set undefined for
+            // ReduceMean. We yield NaN here, matching numpy and the ONNX
+            // reference implementation. ONNX Runtime returns 0 instead.
             vecmath::Sum::new(slice).dispatch() / slice.len() as f32
         }
     }
@@ -607,6 +649,200 @@ impl Operator for ReduceL2 {
 }
 
 impl_infer_shapes_for_reduce_op!(ReduceL2);
+
+pub fn reduce_log_sum(
+    pool: &BufferPool,
+    input: TensorView,
+    axes: Option<&[i32]>,
+    keep_dims: bool,
+) -> Result<Tensor, OpError> {
+    struct LogSumKernel {}
+    impl ReduceKernel<f32> for LogSumKernel {
+        fn reduce_slice(&self, slice: &[f32]) -> f32 {
+            vecmath::Sum::new(slice).dispatch().ln()
+        }
+    }
+
+    reduce(pool, input, axes, keep_dims, &LogSumKernel {})
+}
+
+#[derive(Debug)]
+pub struct ReduceLogSum {
+    pub axes: Option<Vec<i32>>,
+    pub keep_dims: bool,
+    pub noop_with_empty_axes: bool,
+}
+
+impl Operator for ReduceLogSum {
+    fn name(&self) -> &str {
+        "ReduceLogSum"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let inputs = ctx.inputs();
+        let input: TensorView<f32> = inputs.require_as(0)?;
+        let axes = get_axes(inputs, &self.axes)?;
+
+        if is_none_or_empty(axes.as_deref()) && self.noop_with_empty_axes {
+            // This operator is defined as `Log(ReduceSum(x))`, so if the
+            // reduction is skipped, the log still applies.
+            return input.map_in(ctx.pool(), |x| x.ln()).into_op_result();
+        }
+
+        reduce_log_sum(ctx.pool(), input, axes.as_deref(), self.keep_dims).into_op_result()
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+}
+
+impl_infer_shapes_for_reduce_op!(ReduceLogSum);
+
+pub fn reduce_log_sum_exp(
+    pool: &BufferPool,
+    input: TensorView,
+    axes: Option<&[i32]>,
+    keep_dims: bool,
+) -> Result<Tensor, OpError> {
+    struct LogSumExpKernel {}
+    impl ReduceKernel<f32> for LogSumExpKernel {
+        fn reduce_slice(&self, slice: &[f32]) -> f32 {
+            // Subtract the maximum before exponentiating to avoid overflow.
+            let max = vecmath::MaxNum::new(slice).dispatch();
+            if !max.is_finite() {
+                // Reduction over an empty set yields log(0) = -inf. If the
+                // maximum is +/- infinity or NaN, the result is the maximum.
+                return max;
+            }
+            let exp_sum = vecmath::SumExpSub::new(slice, max).dispatch();
+            max + exp_sum.ln()
+        }
+    }
+
+    reduce(pool, input, axes, keep_dims, &LogSumExpKernel {})
+}
+
+#[derive(Debug)]
+pub struct ReduceLogSumExp {
+    pub axes: Option<Vec<i32>>,
+    pub keep_dims: bool,
+    pub noop_with_empty_axes: bool,
+}
+
+impl Operator for ReduceLogSumExp {
+    fn name(&self) -> &str {
+        "ReduceLogSumExp"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let inputs = ctx.inputs();
+        let input: TensorView<f32> = inputs.require_as(0)?;
+        let axes = get_axes(inputs, &self.axes)?;
+
+        if is_none_or_empty(axes.as_deref()) && self.noop_with_empty_axes {
+            // This operator is defined as `Log(ReduceSum(Exp(x)))`, so if the
+            // reduction is skipped the result is `log(exp(x)) = x`.
+            return input.to_tensor_in(ctx.pool()).into_op_result();
+        }
+
+        reduce_log_sum_exp(ctx.pool(), input, axes.as_deref(), self.keep_dims).into_op_result()
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+}
+
+impl_infer_shapes_for_reduce_op!(ReduceLogSumExp);
+
+struct OptimizedL1ReduceKernel;
+impl ReduceKernel<f32> for OptimizedL1ReduceKernel {
+    fn reduce_slice(&self, slice: &[f32]) -> f32 {
+        vecmath::SumAbs::new(slice).dispatch()
+    }
+}
+
+struct GenericL1ReduceKernel;
+impl<T: Copy + std::ops::Neg<Output = T> + PartialOrd + Default + std::iter::Sum> ReduceKernel<T>
+    for GenericL1ReduceKernel
+{
+    fn reduce_slice(&self, slice: &[T]) -> T {
+        let zero = T::default();
+        slice
+            .iter()
+            .copied()
+            .map(|x| if x < zero { -x } else { x })
+            .sum()
+    }
+}
+
+pub fn reduce_l1<T: Copy + std::ops::Neg<Output = T> + PartialOrd + Default + std::iter::Sum>(
+    pool: &BufferPool,
+    input: TensorView<T>,
+    axes: Option<&[i32]>,
+    keep_dims: bool,
+) -> Result<Tensor<T>, OpError> {
+    let kernel = cast_kernel::<f32, T>(&OptimizedL1ReduceKernel).unwrap_or(&GenericL1ReduceKernel);
+    reduce(pool, input, axes, keep_dims, kernel)
+}
+
+#[derive(Debug)]
+pub struct ReduceL1 {
+    pub axes: Option<Vec<i32>>,
+    pub keep_dims: bool,
+    pub noop_with_empty_axes: bool,
+}
+
+impl Operator for ReduceL1 {
+    fn name(&self) -> &str {
+        "ReduceL1"
+    }
+
+    fn max_inputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let inputs = ctx.inputs();
+        let input = inputs.require(0)?;
+        let axes = get_axes(inputs, &self.axes)?;
+
+        map_value_view!(input, input, [FloatTensor, Int32Tensor], {
+            if is_none_or_empty(axes.as_deref()) && self.noop_with_empty_axes {
+                input.map_in(ctx.pool(), |x| x.abs()).into_op_result()
+            } else {
+                reduce_l1(ctx.pool(), input, axes.as_deref(), self.keep_dims).into_op_result()
+            }
+        })
+    }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
+
+    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
+        Some([OutputType::CopyFromInput(0)].into())
+    }
+}
+
+impl_infer_shapes_for_reduce_op!(ReduceL1);
 
 /// Compare `a` and `b`, treating all NaN values as greater than non-NaN values.
 pub fn cmp_nan_greater<T: PartialOrd + IsNaN>(a: T, b: T) -> std::cmp::Ordering {
@@ -1022,7 +1258,7 @@ pub fn topk<T: Copy + Default + PartialOrd + IsNaN>(
 
     let axis_size = values.size(axis);
     if k > axis_size {
-        return Err(OpError::InvalidValue("k > dimension size"));
+        return Err(OpError::invalid_value("k > dimension size"));
     }
 
     let topk_cmp = |(a_val, a_idx): &(T, usize), (b_val, b_idx): &(T, usize)| -> Ordering {
@@ -1085,12 +1321,16 @@ impl Operator for TopK {
         Some(2)
     }
 
+    fn max_outputs(&self) -> Option<usize> {
+        Some(2)
+    }
+
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
         let inputs = ctx.inputs();
         let values = inputs.require(0)?;
         let k = inputs.require_as::<i32>(1).and_then(|k| {
             if k < 0 {
-                Err(OpError::InvalidValue("k must be positive"))
+                Err(OpError::invalid_value("k must be positive"))
             } else {
                 Ok(k as usize)
             }
@@ -1109,7 +1349,19 @@ impl Operator for TopK {
             OutputType::Fixed(ValueType::Tensor(DataType::Int32)),
         ]))
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        Some(self)
+    }
 }
+
+impl_infer_shapes!(
+    TopK,
+    op,
+    shape_ops::TopK {
+        axis: op.axis.map(|a| a as i32),
+    }
+);
 
 #[cfg(test)]
 mod tests {
@@ -1124,8 +1376,9 @@ mod tests {
     use crate::buffer_pool::BufferPool;
     use crate::operator::{Operator, OperatorExt};
     use crate::ops::{
-        OpError, ReduceL2, ReduceMax, ReduceMean, ReduceMin, ReduceProd, ReduceSum,
-        ReduceSumSquare, arg_max, arg_min, cum_sum, nonzero, reduce_l2, reduce_max, reduce_mean,
+        OpError, ReduceL1, ReduceL2, ReduceLogSum, ReduceLogSumExp, ReduceMax, ReduceMean,
+        ReduceMin, ReduceProd, ReduceSum, ReduceSumSquare, arg_max, arg_min, cum_sum, nonzero,
+        reduce_l1, reduce_l2, reduce_log_sum, reduce_log_sum_exp, reduce_max, reduce_mean,
         reduce_min, reduce_prod, reduce_sum, reduce_sum_square, topk,
     };
 
@@ -1190,7 +1443,7 @@ mod tests {
                 input: Tensor::<f32>::from_data(&[10, 0, 5], vec![]),
                 axis: 1,
                 keep_dims: false,
-                expected: Err(OpError::InvalidValue(
+                expected: Err(OpError::invalid_value(
                     "Cannot select index from empty sequence",
                 )),
             },
@@ -1248,15 +1501,29 @@ mod tests {
         struct Case {
             input: Tensor<f32>,
             axis: isize,
+            exclusive: bool,
+            reverse: bool,
             expected: Result<Tensor<f32>, OpError>,
+        }
+
+        impl Default for Case {
+            fn default() -> Case {
+                Case {
+                    input: Tensor::from([0.; 0]),
+                    axis: 0,
+                    exclusive: false,
+                    reverse: false,
+                    expected: Ok(Tensor::from([0.; 0])),
+                }
+            }
         }
 
         let cases = [
             // Simple 1D case
             Case {
                 input: Tensor::from([0., 1., 2., 3., 4., 5.]),
-                axis: 0,
                 expected: Ok(Tensor::from([0., 1., 3., 6., 10., 15.])),
+                ..Default::default()
             },
             // 3D tensor, cumsum along axis 1
             Case {
@@ -1268,6 +1535,7 @@ mod tests {
                         1., 1., 1., 1., 2., 2., 2., 2., 3., 3., 3., 3., 4., 4., 4., 4.,
                     ],
                 )),
+                ..Default::default()
             },
             // Same 3D tensor, cumsum along last axis (-1)
             Case {
@@ -1279,12 +1547,49 @@ mod tests {
                         1., 2., 3., 4., 1., 2., 3., 4., 1., 2., 3., 4., 1., 2., 3., 4.,
                     ],
                 )),
+                ..Default::default()
             },
             // Empty tensor
             Case {
                 input: Tensor::from([0.; 0]),
-                axis: 0,
                 expected: Ok(Tensor::from([0.; 0])),
+                ..Default::default()
+            },
+            // Exclusive sum along a 1D tensor
+            Case {
+                input: Tensor::from([0., 1., 2., 3., 4., 5.]),
+                exclusive: true,
+                expected: Ok(Tensor::from([0., 0., 1., 3., 6., 10.])),
+                ..Default::default()
+            },
+            // Exclusive sum over an empty tensor
+            Case {
+                input: Tensor::from([0.; 0]),
+                exclusive: true,
+                expected: Ok(Tensor::from([0.; 0])),
+                ..Default::default()
+            },
+            // Reverse sum along a 1D tensor
+            Case {
+                input: Tensor::from([0., 1., 2., 3., 4., 5.]),
+                reverse: true,
+                expected: Ok(Tensor::from([15., 15., 14., 12., 9., 5.])),
+                ..Default::default()
+            },
+            // Reverse exclusive sum along a 1D tensor
+            Case {
+                input: Tensor::from([0., 1., 2., 3., 4., 5.]),
+                exclusive: true,
+                reverse: true,
+                expected: Ok(Tensor::from([15., 14., 12., 9., 5., 0.])),
+                ..Default::default()
+            },
+            // Reverse sum over an empty tensor
+            Case {
+                input: Tensor::from([0.; 0]),
+                reverse: true,
+                expected: Ok(Tensor::from([0.; 0])),
+                ..Default::default()
             },
         ];
 
@@ -1292,11 +1597,13 @@ mod tests {
             let Case {
                 input,
                 axis,
+                exclusive,
+                reverse,
                 expected,
             } = case;
 
             let pool = BufferPool::new();
-            let result = cum_sum(&pool, input.view(), *axis);
+            let result = cum_sum(&pool, input.view(), *axis, *exclusive, *reverse);
 
             assert_eq!(result, *expected);
         });
@@ -1359,7 +1666,10 @@ mod tests {
         }
 
         let cases = [
+            op_case!(ReduceL1),
             op_case!(ReduceL2),
+            op_case!(ReduceLogSum),
+            op_case!(ReduceLogSumExp),
             op_case!(ReduceMax),
             op_case!(ReduceMean),
             op_case!(ReduceMin),
@@ -1404,6 +1714,38 @@ mod tests {
         expect_equal(&result, &expected)?;
 
         Ok(())
+    }
+
+    #[test]
+    fn test_reduce_l1() {
+        let pool = BufferPool::new();
+
+        // Float tensor
+        let input = Tensor::from([
+            [[-1., 2.], [-3., 4.]],
+            [[-5., 6.], [-7., 8.]],
+            [[-9., 10.], [-11., 12.]],
+        ]);
+        let expected = Tensor::from([[3., 7.], [11., 15.], [19., 23.]]);
+
+        let result = reduce_l1(&pool, input.view(), Some(&[2]), false /* keep_dims */).unwrap();
+        assert_eq!(result, expected);
+
+        let result = reduce_l1(&pool, input.view(), Some(&[2]), true /* keep_dims */).unwrap();
+        let expected = expected.to_shape([3, 2, 1].as_slice());
+        assert_eq!(result, expected);
+
+        // Int tensor
+        let input = Tensor::from([[-1, 2, -3], [4, -5, 6]]);
+        let expected = Tensor::from([6, 15]);
+
+        let result = reduce_l1(&pool, input.view(), Some(&[1]), false /* keep_dims */).unwrap();
+        assert_eq!(result, expected);
+
+        // Reduce all axes
+        let input = Tensor::from([[-1.0, 2.0], [-3.0, 4.0]]);
+        let result = reduce_l1(&pool, input.view(), None, false /* keep_dims */).unwrap();
+        assert_eq!(result.item(), Some(&10.0));
     }
 
     // Tests for ReduceMean specifically that also cover common functionality
@@ -1577,22 +1919,96 @@ mod tests {
         let input = Tensor::from_data(&[3, 3], vec![1., 2., 3., 4., 5., 6., 7., 8., 9.]);
 
         let result = reduce_mean(&pool, input.view(), Some(&[3]), false /* keep_dims */);
-        assert_eq!(result.err(), Some(OpError::InvalidValue("Axis is invalid")));
-
-        let result = reduce_mean(&pool, input.view(), Some(&[-3]), false /* keep_dims */);
-        assert_eq!(result.err(), Some(OpError::InvalidValue("Axis is invalid")));
-
-        // Empty tensor
-        let result = reduce_mean(
-            &pool,
-            Tensor::from([0.; 0]).view(),
-            Some(&[0]),
-            false, /* keep_dims */
-        );
         assert_eq!(
             result.err(),
-            Some(OpError::InvalidValue("Cannot reduce empty tensor"))
+            Some(OpError::invalid_value(
+                "Axis 3 is out of range. Must be in [-2, 2)"
+            ))
         );
+
+        let result = reduce_mean(&pool, input.view(), Some(&[-3]), false /* keep_dims */);
+        assert_eq!(
+            result.err(),
+            Some(OpError::invalid_value(
+                "Axis -3 is out of range. Must be in [-2, 2)"
+            ))
+        );
+    }
+
+    // ONNX leaves `ReduceMean` over an empty set undefined. We follow numpy
+    // and yield NaN, rather than erroring.
+    #[test]
+    fn test_reduce_mean_empty() {
+        let pool = BufferPool::new();
+        let input = Tensor::<f32>::from_data(&[0], vec![]);
+        let result = reduce_mean(&pool, input.view(), Some(&[0]), false /* keep_dims */).unwrap();
+        assert!(result.item().unwrap().is_nan());
+    }
+
+    // Verify the identity values returned for reduction over an empty set.
+    #[test]
+    fn test_reduce_empty() {
+        let pool = BufferPool::new();
+
+        // ReduceMin: spec says +infinity (or max of dtype if no inf).
+        let input = Tensor::<f32>::from_data(&[0], vec![]);
+        let result = reduce_min(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&f32::INFINITY));
+
+        let input = Tensor::<i32>::from_data(&[0], vec![]);
+        let result = reduce_min(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&i32::MAX));
+
+        // ReduceMax: spec says -infinity (or min of dtype if no inf).
+        let input = Tensor::<f32>::from_data(&[0], vec![]);
+        let result = reduce_max(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&f32::NEG_INFINITY));
+
+        let input = Tensor::<i32>::from_data(&[0], vec![]);
+        let result = reduce_max(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&i32::MIN));
+
+        // ReduceSum: spec says 0.
+        let input = Tensor::<f32>::from_data(&[0], vec![]);
+        let result = reduce_sum(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&0.0));
+
+        // ReduceProd: spec says 1.
+        let input = Tensor::<f32>::from_data(&[0], vec![]);
+        let result = reduce_prod(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&1.0));
+
+        let input = Tensor::<i32>::from_data(&[0], vec![]);
+        let result = reduce_prod(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&1));
+
+        // ReduceL1, ReduceL2, ReduceSumSquare: spec says 0.
+        let input = Tensor::<f32>::from_data(&[0], vec![]);
+        let result = reduce_l1(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&0.0));
+        let result = reduce_l2(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&0.0));
+        let result = reduce_sum_square(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&0.0));
+
+        // Reduce a tensor where only a non-reduced dim is 0. Output should
+        // be empty.
+        let input = Tensor::<f32>::from_data(&[3, 0, 5], vec![]);
+        let result = reduce_max(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.shape(), &[0, 5]);
+
+        // Reduce a tensor where only the reduced dim is 0. Output should
+        // be filled with the identity value.
+        let input = Tensor::<f32>::from_data(&[3, 0, 5], vec![]);
+        let result = reduce_max(&pool, input.view(), Some(&[1]), false).unwrap();
+        assert_eq!(result.shape(), &[3, 5]);
+        assert!(result.iter().all(|&x| x == f32::NEG_INFINITY));
+
+        // Same, with keep_dims.
+        let input = Tensor::<f32>::from_data(&[3, 0, 5], vec![]);
+        let result = reduce_min(&pool, input.view(), Some(&[1]), true).unwrap();
+        assert_eq!(result.shape(), &[3, 1, 5]);
+        assert!(result.iter().all(|&x| x == f32::INFINITY));
     }
 
     fn result_item<T: Copy>(result: Result<Tensor<T>, OpError>) -> T {
@@ -1670,6 +2086,47 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_log_sum() {
+        let pool = BufferPool::new();
+
+        let input = Tensor::from([[1., 2., 3.], [4., 5., 6.]]);
+        let result = reduce_log_sum(&pool, input.view(), Some(&[1]), false).unwrap();
+        let expected = Tensor::from([6f32.ln(), 15f32.ln()]);
+        expect_equal(&result, &expected).unwrap();
+
+        // Reduction over an empty set yields log(0).
+        let input = Tensor::<f32>::from_data(&[0], vec![]);
+        let result = reduce_log_sum(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_reduce_log_sum_exp() {
+        let pool = BufferPool::new();
+
+        let input = Tensor::from([[1., 2., 3.], [4., 5., 6.]]);
+        let result = reduce_log_sum_exp(&pool, input.view(), Some(&[1]), false).unwrap();
+        let exp = input.map(|x| x.exp());
+        let expected = Tensor::from([
+            (exp[[0, 0]] + exp[[0, 1]] + exp[[0, 2]]).ln(),
+            (exp[[1, 0]] + exp[[1, 1]] + exp[[1, 2]]).ln(),
+        ]);
+        expect_equal(&result, &expected).unwrap();
+
+        // Large values which would overflow if the input was exponentiated
+        // without first subtracting the maximum.
+        let input = Tensor::from([100., 100.]);
+        let result = reduce_log_sum_exp(&pool, input.view(), Some(&[0]), false).unwrap();
+        let expected = Tensor::from_scalar(100. + 2f32.ln());
+        expect_equal(&result, &expected).unwrap();
+
+        // Reduction over an empty set yields log(0).
+        let input = Tensor::<f32>::from_data(&[0], vec![]);
+        let result = reduce_log_sum_exp(&pool, input.view(), Some(&[0]), false).unwrap();
+        assert_eq!(result.item(), Some(&f32::NEG_INFINITY));
+    }
+
+    #[test]
     fn test_reduce_sum() {
         let pool = BufferPool::new();
 
@@ -1692,6 +2149,25 @@ mod tests {
             false, /* keep_dims */
         ));
         assert_eq!(result, input.iter().sum::<f32>());
+    }
+
+    #[test]
+    fn test_reduce_permuted_contiguous_tensor() {
+        let pool = BufferPool::new();
+
+        let input = Tensor::from([[1.], [2.], [3.], [4.]]);
+        assert_eq!(input.strides(), &[1, 1]);
+
+        // Create a view which is permuted, so it has non-standard strides, yet
+        // is still contiguous. This is possible because the inner dim has size
+        // 1.
+        let permuted = input.permuted(&[1, 0]);
+        assert!(permuted.is_contiguous());
+        assert_eq!(permuted.stride(0), 1);
+        assert_eq!(permuted.size(1), 4);
+
+        let result = reduce_sum(&pool, permuted, Some(&[1]), false /* keep_dims */).unwrap();
+        assert_eq!(result, Tensor::from([10.]));
     }
 
     #[test]
@@ -1727,6 +2203,17 @@ mod tests {
 
         // For reductions with fused pointwise ops, the pointwise op is still
         // applied.
+        let input = Tensor::from([-1.0f32, -2., 3.]);
+        let expected = input.map(|x| x.abs());
+        let output: Tensor<f32> = ReduceL1 {
+            axes: None,
+            keep_dims: false,
+            noop_with_empty_axes: true,
+        }
+        .run_simple(input.view())
+        .unwrap();
+        assert_eq!(output, expected);
+
         let input = Tensor::<f32>::rand(&[5, 5], &mut rng);
         let expected = input.map(|x| x * x);
         let output: Tensor<f32> = ReduceSumSquare {
@@ -1844,14 +2331,16 @@ mod tests {
             Case {
                 input: [0., 1., 2.].into(),
                 k: 4,
-                expected: Err(OpError::InvalidValue("k > dimension size")),
+                expected: Err(OpError::invalid_value("k > dimension size")),
                 ..Default::default()
             },
             // Scalar input
             Case {
                 input: Tensor::from(0.),
                 k: 2,
-                expected: Err(OpError::InvalidValue("Axis is invalid")),
+                expected: Err(OpError::invalid_value(
+                    "Axis -1 is out of range. Must be in [0, 0)",
+                )),
                 ..Default::default()
             },
             // 2D input, take top-K over axis 1

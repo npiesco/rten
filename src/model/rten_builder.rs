@@ -8,18 +8,20 @@ use rten_tensor::prelude::*;
 use crate::graph::{Dimension, NodeId};
 use crate::ops::{
     ArgMax, ArgMin, AveragePool, BatchNormalization, BoxOrder, Cast, CastLike, Concat,
-    ConstantOfShape, Conv, ConvInteger, ConvTranspose, CoordTransformMode, DepthToSpace,
+    ConstantOfShape, Conv, ConvInteger, ConvTranspose, CoordTransformMode, CumSum, DepthToSpace,
     DepthToSpaceMode, DequantizeLinear, Einsum, Elu, EyeLike, Flatten, Gather, GatherElements,
     GatherND, Gelu, Gemm, HardSigmoid, InstanceNormalization, LayerNormalization, LeakyRelu,
     LogSoftmax, MaxPool, Mod, NearestMode, NonMaxSuppression, OneHot, Padding, QuantizeLinear,
-    ReduceMax, ReduceMean, ReduceMin, ReduceProd, ReduceSum, ReduceSumSquare, Reshape, Resize,
-    ResizeMode, ScatterElements, ScatterReduction, SequenceEmpty, Shape, Softmax, Split, TopK,
-    Transpose, Trilu,
+    ReduceL1, ReduceL2, ReduceMax, ReduceMean, ReduceMin, ReduceProd, ReduceSum, ReduceSumSquare,
+    Reshape, Resize, ResizeMode, RotaryEmbedding, Scatter, ScatterElements, ScatterReduction,
+    SequenceEmpty, Shape, Softmax, Split, TopK, Transpose, Trilu, Upsample,
 };
 use crate::value::{DataType, Scalar};
 
 #[cfg(feature = "random")]
-use crate::ops::{Dropout, RandomNormal, RandomNormalLike, RandomUniform, RandomUniformLike};
+use crate::ops::{
+    Dropout, Multinomial, RandomNormal, RandomNormalLike, RandomUniform, RandomUniformLike,
+};
 
 /// Struct like `crate::ops::If` with subgraph attributes replaced by
 /// pre-serialized graphs.
@@ -32,12 +34,15 @@ pub struct IfArgs<'a> {
 pub enum OpType<'a> {
     Abs,
     Acos,
+    Acosh,
     Add,
     And,
     ArgMax(ArgMax),
     ArgMin(ArgMin),
     Asin,
+    Asinh,
     Atan,
+    Atanh,
     AveragePool(AveragePool),
     BatchNormalization(BatchNormalization),
     Cast(Cast),
@@ -50,6 +55,8 @@ pub enum OpType<'a> {
     ConvInteger(ConvInteger),
     ConvTranspose(ConvTranspose),
     Cos,
+    Cosh,
+    CumSum(CumSum),
     DequantizeLinear(DequantizeLinear),
     DepthToSpace(DepthToSpace),
     Div,
@@ -98,6 +105,10 @@ pub enum OpType<'a> {
     Min,
     Mod(Mod),
     Mul,
+
+    #[cfg(feature = "random")]
+    Multinomial(Multinomial),
+
     Neg,
     NonMaxSuppression(NonMaxSuppression),
     NonZero,
@@ -118,6 +129,8 @@ pub enum OpType<'a> {
 
     Range,
     Reciprocal,
+    ReduceL1(ReduceL1),
+    ReduceL2(ReduceL2),
     ReduceMax(ReduceMax),
     ReduceMean(ReduceMean),
     ReduceMin(ReduceMin),
@@ -127,8 +140,10 @@ pub enum OpType<'a> {
     Relu,
     Reshape(Reshape),
     Resize(Resize),
+    RotaryEmbedding(RotaryEmbedding),
     Round,
     QuantizeLinear(QuantizeLinear),
+    Scatter(Scatter),
     ScatterElements(ScatterElements),
     #[allow(dead_code)]
     SequenceAt,
@@ -140,6 +155,7 @@ pub enum OpType<'a> {
     Sigmoid,
     Sign,
     Sin,
+    Sinh,
     Size,
     Slice,
     Softmax(Softmax),
@@ -156,6 +172,7 @@ pub enum OpType<'a> {
     Transpose(Transpose),
     Trilu(Trilu),
     Unsqueeze,
+    Upsample(Upsample),
     Where,
     Xor,
 }
@@ -425,6 +442,7 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
         let (op_type, attrs_type, attrs) = match op_info {
             OpType::Abs => op!(Abs),
             OpType::Acos => op!(Acos),
+            OpType::Acosh => op!(Acosh),
             OpType::Add => op!(Add),
             OpType::And => op!(And),
             OpType::ArgMax(args) => op_with_attrs!(ArgMax, ArgMaxAttrs, {
@@ -440,7 +458,9 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
                 }
             }),
             OpType::Asin => op!(Asin),
+            OpType::Asinh => op!(Asinh),
             OpType::Atan => op!(Atan),
+            OpType::Atanh => op!(Atanh),
             OpType::AveragePool(args) => op_with_attrs!(AveragePool, AveragePoolAttrs, {
                 let pad_args = pad_args_from_padding(args.padding);
                 let pads = self.create_vec(pad_args.pads, |pad| pad as u32);
@@ -484,7 +504,7 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
             OpType::ConstantOfShape(args) => {
                 op_with_attrs!(ConstantOfShape, ConstantOfShapeAttrs, {
                     match args.value {
-                        Scalar::Int(int_value) => sg::ConstantOfShapeAttrsArgs {
+                        Scalar::Int32(int_value) => sg::ConstantOfShapeAttrsArgs {
                             value_type: sg::Scalar::IntScalar,
                             value: Some(
                                 sg::IntScalar::create(
@@ -504,6 +524,9 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
                                 .as_union_value(),
                             ),
                         },
+                        Scalar::Int8(_) | Scalar::UInt8(_) => unimplemented!(
+                            "serializing int8/uint8 ConstantOfShape values requires a schema change"
+                        ),
                     }
                 })
             }
@@ -539,9 +562,11 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
                 let pad_args = pad_args_from_padding(args.padding);
                 let pads = self.create_vec(pad_args.pads, |pad| pad as u32);
                 let strides = self.create_vec(Some(args.strides), |s| s as u32);
+                let dilations = self.create_vec(Some(args.dilations), |d| d as u32);
                 let output_padding = self.create_vec(args.output_padding, |s| s as u32);
                 sg::ConvTransposeAttrsArgs {
                     strides,
+                    dilations,
                     output_padding,
                     auto_pad: pad_args.auto_pad,
                     pads,
@@ -549,6 +574,15 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
                 }
             }),
             OpType::Cos => op!(Cos),
+            OpType::Cosh => op!(Cosh),
+            OpType::CumSum(args) => op_with_attrs!(
+                CumSum,
+                CumSumAttrs,
+                sg::CumSumAttrsArgs {
+                    exclusive: args.exclusive,
+                    reverse: args.reverse,
+                }
+            ),
             OpType::DequantizeLinear(args) => op_with_attrs!(
                 DequantizeLinear,
                 DequantizeLinearAttrs,
@@ -728,6 +762,17 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
                 op_with_attrs!(Mod, ModAttrs, sg::ModAttrsArgs { fmod: args.fmod })
             }
             OpType::Mul => op!(Mul),
+
+            #[cfg(feature = "random")]
+            OpType::Multinomial(args) => {
+                op_with_attrs!(Multinomial, MultinomialAttrs, {
+                    sg::MultinomialAttrsArgs {
+                        sample_size: args.sample_size as i32,
+                        seed: args.seed,
+                    }
+                })
+            }
+
             OpType::Neg => op!(Neg),
             OpType::NonMaxSuppression(args) => {
                 op_with_attrs!(
@@ -815,6 +860,12 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
 
             OpType::Range => op!(Range),
             OpType::Reciprocal => op!(Reciprocal),
+            OpType::ReduceL1(args) => {
+                op_with_attrs!(ReduceL1, ReduceMeanAttrs, reduce_attrs!(args))
+            }
+            OpType::ReduceL2(args) => {
+                op_with_attrs!(ReduceL2, ReduceMeanAttrs, reduce_attrs!(args))
+            }
             OpType::ReduceMax(args) => {
                 op_with_attrs!(ReduceMax, ReduceMeanAttrs, reduce_attrs!(args))
             }
@@ -864,6 +915,15 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
                     nearest_mode,
                 }
             }),
+            OpType::RotaryEmbedding(args) => op_with_attrs!(
+                RotaryEmbedding,
+                RotaryEmbeddingAttrs,
+                sg::RotaryEmbeddingAttrsArgs {
+                    interleaved: args.interleaved,
+                    num_heads: args.num_heads as u32,
+                    rotary_embedding_dim: args.rotary_embedding_dim as u32,
+                }
+            ),
             OpType::Round => op!(Round),
             OpType::SequenceAt => op!(SequenceAt),
             OpType::SequenceEmpty(args) => op_with_attrs!(
@@ -874,6 +934,14 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
                 }
             ),
             OpType::SequenceInsert => op!(SequenceInsert),
+            OpType::Scatter(args) => op_with_attrs!(
+                Scatter,
+                ScatterElementsAttrs,
+                sg::ScatterElementsAttrsArgs {
+                    axis: args.axis as i32,
+                    reduction: sg::ScatterReduction::None,
+                }
+            ),
             OpType::ScatterElements(args) => {
                 op_with_attrs!(ScatterElements, ScatterElementsAttrs, {
                     let reduction = match args.reduction {
@@ -898,6 +966,7 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
             OpType::Sigmoid => op!(Sigmoid),
             OpType::Slice => op!(Slice),
             OpType::Sin => op!(Sin),
+            OpType::Sinh => op!(Sinh),
             OpType::Sign => op!(Sign),
             OpType::Size => op!(Size),
             OpType::Softmax(args) => op_with_attrs!(
@@ -936,6 +1005,13 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
                 sg::TriluAttrsArgs { upper: args.upper }
             }),
             OpType::Unsqueeze => op!(Unsqueeze),
+            OpType::Upsample(args) => op_with_attrs!(Upsample, UpsampleAttrs, {
+                let mode = match args.mode {
+                    ResizeMode::Nearest => sg::ResizeMode::Nearest,
+                    ResizeMode::Linear => sg::ResizeMode::Linear,
+                };
+                sg::UpsampleAttrsArgs { mode }
+            }),
             OpType::Where => op!(Where),
             OpType::Xor => op!(Xor),
         };
@@ -1130,7 +1206,7 @@ impl TensorDataBuilder {
         // of matrices start on a cache line boundary.
         let align = std::mem::align_of::<T>();
         let padding = offset.next_multiple_of(align) - offset;
-        self.data.extend(std::iter::repeat(0).take(padding));
+        self.data.extend(std::iter::repeat_n(0, padding));
 
         let start_offset = self.data.len();
 

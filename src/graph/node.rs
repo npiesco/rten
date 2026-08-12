@@ -2,13 +2,14 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
+use rten_base::bit_set::BitSet;
 use rten_tensor::prelude::*;
 use rten_tensor::{ArcTensor, DynLayout, TensorView};
 
 use super::NodeId;
 use crate::constant_storage::ArcTensorView;
-use crate::operator::Operator;
-use crate::value::{DataType, ValueType, ValueView};
+use crate::operator::{Operator, OutputMask};
+use crate::value::{DataType, Scalar, ValueType, ValueView};
 
 #[derive(Debug)]
 pub enum Node {
@@ -113,11 +114,26 @@ impl fmt::Debug for Dimension {
     }
 }
 
+/// Trim trailing `None`s from a slice.
+fn trim_none_suffix<T>(mut slice: &[Option<T>]) -> &[Option<T>] {
+    while let Some((last, prefix)) = slice.split_last() {
+        match last {
+            None => slice = prefix,
+            Some(_) => break,
+        }
+    }
+    slice
+}
+
 #[derive(Debug)]
 pub struct OperatorNode {
     name: Option<String>,
     inputs: Box<[Option<NodeId>]>,
     outputs: Box<[Option<NodeId>]>,
+
+    // Cached mask indicating which positions in `outputs` are set.
+    output_mask: OutputMask,
+
     operator: Arc<dyn Operator + Send + Sync>,
 
     // Cached names of nodes captured by operator's subgraphs.
@@ -138,10 +154,23 @@ impl OperatorNode {
             }
         }
 
+        // Trim trailing empty IDs
+        let output_ids = trim_none_suffix(output_ids);
+
+        // Pre-compute mask of used outputs. Only the first 32 outputs are
+        // tracked individually; outputs beyond that are always treated as used.
+        let used = output_ids
+            .iter()
+            .take(u32::BITS as usize)
+            .enumerate()
+            .filter_map(|(i, id)| id.is_some().then_some(i as u32));
+        let output_mask = OutputMask::new(BitSet::from_indices(used), output_ids.len() as u32);
+
         OperatorNode {
             name: name.map(|s| s.to_owned()),
             inputs: input_ids.into(),
             outputs: output_ids.into(),
+            output_mask,
             operator,
             capture_names: capture_names.into(),
         }
@@ -157,6 +186,11 @@ impl OperatorNode {
 
     pub fn output_ids(&self) -> &[Option<NodeId>] {
         &self.outputs
+    }
+
+    /// Return a bit mask indicating which outputs are used.
+    pub fn output_mask(&self) -> OutputMask {
+        self.output_mask
     }
 
     /// Return the names of nodes captured by this operator's subgraphs.
@@ -177,6 +211,16 @@ impl OperatorNode {
     /// can be "cloned" just be creating a new reference.
     pub fn clone_operator(&self) -> Arc<dyn Operator + Send + Sync> {
         self.operator.clone()
+    }
+
+    /// Mark the output at `index` as unused and return its previous ID.
+    ///
+    /// The entry is set to `None` rather than removed, as the number of outputs
+    /// affects the behavior of some operators (eg. `Split`).
+    pub(super) fn clear_output(&mut self, index: usize) -> Option<NodeId> {
+        let output_id = self.outputs.get_mut(index)?.take()?;
+        self.output_mask.set_unused(index);
+        Some(output_id)
     }
 
     /// Replace an input in the operator's list of inputs.
@@ -288,6 +332,16 @@ impl Constant {
             Constant::Int32(i) => i.layout(),
             Constant::Int8(i) => i.layout(),
             Constant::UInt8(i) => i.layout(),
+        }
+    }
+
+    /// Return this constant's value as a scalar, if it has exactly one element.
+    pub fn item(&self) -> Option<Scalar> {
+        match self {
+            Constant::Float(f) => f.view().item().copied().map(Scalar::Float),
+            Constant::Int32(i) => i.view().item().copied().map(Scalar::Int32),
+            Constant::Int8(i) => i.view().item().copied().map(Scalar::Int8),
+            Constant::UInt8(i) => i.view().item().copied().map(Scalar::UInt8),
         }
     }
 

@@ -95,12 +95,16 @@ impl RtenOpRegistry {
 
         register_op!(Abs);
         register_op!(Acos);
+        register_op!(Acosh);
         register_op!(Add);
         register_op!(And);
         register_op!(ArgMax);
         register_op!(ArgMin);
         register_op!(Asin);
+        register_op!(Asinh);
         register_op!(Atan);
+        register_op!(Atanh);
+        register_op!(Attention);
         register_op!(AveragePool);
         register_op!(BatchNormalization);
         register_op!(Cast);
@@ -114,7 +118,9 @@ impl RtenOpRegistry {
         register_op!(ConstantOfShape);
         register_op!(ConvTranspose);
         register_op!(Cos);
+        register_op!(Cosh);
         register_op!(CumSum);
+        register_op!(DFT, feature = "fft");
         register_op!(DequantizeLinear);
         register_op!(DepthToSpace);
         register_op!(Div);
@@ -154,6 +160,7 @@ impl RtenOpRegistry {
         register_op!(Log);
         register_op!(LogSoftmax);
         register_op!(Loop);
+        register_op!(LpNormalization);
         register_op!(LSTM);
         register_op!(MatMul);
         register_op!(MatMulInteger);
@@ -163,6 +170,7 @@ impl RtenOpRegistry {
         register_op!(Min);
         register_op!(Mod);
         register_op!(Mul);
+        register_op!(Multinomial, feature = "random");
         register_op!(Neg);
         register_op!(NonMaxSuppression);
         register_op!(NonZero);
@@ -179,7 +187,10 @@ impl RtenOpRegistry {
         register_op!(RandomUniformLike, feature = "random");
         register_op!(Range);
         register_op!(Reciprocal);
+        register_op!(ReduceL1);
         register_op!(ReduceL2);
+        register_op!(ReduceLogSum);
+        register_op!(ReduceLogSumExp);
         register_op!(ReduceMax);
         register_op!(ReduceMean);
         register_op!(ReduceMin);
@@ -189,7 +200,10 @@ impl RtenOpRegistry {
         register_op!(Relu);
         register_op!(Reshape);
         register_op!(Resize);
+        register_op!(ReverseSequence);
+        register_op!(RotaryEmbedding);
         register_op!(Round);
+        register_op!(Scatter);
         register_op!(ScatterElements);
         register_op!(ScatterND);
         register_op!(SequenceAt);
@@ -202,6 +216,7 @@ impl RtenOpRegistry {
         register_op!(Sigmoid);
         register_op!(Sign);
         register_op!(Sin);
+        register_op!(Sinh);
         register_op!(Size);
         register_op!(Slice);
         register_op!(Softmax);
@@ -220,6 +235,7 @@ impl RtenOpRegistry {
         register_op!(Transpose);
         register_op!(Trilu);
         register_op!(Unsqueeze);
+        register_op!(Upsample);
         register_op!(Where);
         register_op!(Xor);
 
@@ -399,12 +415,28 @@ macro_rules! impl_read_op {
 
 impl_read_op!(Abs);
 impl_read_op!(Acos);
+impl_read_op!(Acosh);
 impl_read_op!(Add);
 impl_read_op!(And);
 impl_read_op!(ArgMax, attrs_as_arg_max_attrs, reduce_axis);
 impl_read_op!(ArgMin, attrs_as_arg_max_attrs, reduce_axis);
 impl_read_op!(Asin);
+impl_read_op!(Asinh);
 impl_read_op!(Atan);
+impl_read_op!(Atanh);
+impl_read_op!(
+    Attention,
+    attrs_as_attention_attrs,
+    |attrs: sg::AttentionAttrs| {
+        Ok(ops::Attention {
+            is_causal: attrs.is_causal(),
+            kv_num_heads: attrs.kv_num_heads(),
+            q_num_heads: attrs.q_num_heads(),
+            scale: attrs.scale(),
+            softcap: attrs.softcap(),
+        })
+    }
+);
 impl_read_op!(
     AveragePool,
     attrs_as_average_pool_attrs,
@@ -414,7 +446,7 @@ impl_read_op!(
         let strides = attrs
             .strides()
             .map(|stride| stride.iter().map(|x| x.as_usize()).collect())
-            .unwrap_or(std::iter::repeat(1).take(kernel_size.len()).collect());
+            .unwrap_or(std::iter::repeat_n(1, kernel_size.len()).collect());
 
         Ok(ops::AveragePool {
             kernel_size,
@@ -484,11 +516,11 @@ impl_read_op!(
     attrs_as_constant_of_shape_attrs,
     |attrs: sg::ConstantOfShapeAttrs| {
         let value = if let Some(int_val) = attrs.value_as_int_scalar() {
-            Scalar::Int(int_val.value())
+            Scalar::Int32(int_val.value())
         } else if let Some(float_val) = attrs.value_as_float_scalar() {
             Scalar::Float(float_val.value())
         } else {
-            Scalar::Int(0)
+            Scalar::Int32(0)
         };
         Ok(ops::ConstantOfShape { value })
     }
@@ -501,7 +533,10 @@ impl_read_op!(
         let strides = vec_from_attr(attrs.strides(), &[1, 1]);
         let output_padding = opt_vec_from_attr(attrs.output_padding());
         let groups = attrs.groups().as_usize();
+        let dilations =
+            opt_vec_from_attr(attrs.dilations()).unwrap_or_else(|| vec![1; strides.len()]);
         Ok(ops::ConvTranspose {
+            dilations,
             padding,
             strides,
             groups,
@@ -510,7 +545,29 @@ impl_read_op!(
     }
 );
 impl_read_op!(Cos);
-impl_read_op!(CumSum);
+impl_read_op!(Cosh);
+
+impl ReadOp for ops::CumSum {
+    fn op_type() -> sg::OperatorType {
+        sg::OperatorType::CumSum
+    }
+
+    fn read(op: &sg::OperatorNode, _ctx: &dyn OpLoadContext) -> Result<Self, ReadOpError> {
+        // CumSum attributes are optional for backwards compatibility.
+        let attrs = op.attrs_as_cum_sum_attrs();
+        let exclusive = attrs.map(|a| a.exclusive()).unwrap_or(false);
+        let reverse = attrs.map(|a| a.reverse()).unwrap_or(false);
+        Ok(ops::CumSum { exclusive, reverse })
+    }
+}
+
+#[cfg(feature = "fft")]
+impl_read_op!(DFT, attrs_as_dftattrs, |attrs: sg::DFTAttrs| {
+    Ok(ops::DFT {
+        inverse: attrs.inverse(),
+        onesided: attrs.onesided(),
+    })
+});
 impl_read_op!(DequantizeLinear, attrs_as_dequantize_linear_attrs, axis);
 impl_read_op!(
     DepthToSpace,
@@ -702,6 +759,16 @@ impl_read_op!(Less);
 impl_read_op!(LessOrEqual);
 impl_read_op!(Log);
 impl_read_op!(LogSoftmax, attrs_as_softmax_attrs, axis);
+impl_read_op!(
+    LpNormalization,
+    attrs_as_lp_normalization_attrs,
+    |attrs: sg::LpNormalizationAttrs| {
+        Ok(ops::LpNormalization {
+            axis: attrs.axis() as isize,
+            p: attrs.p(),
+        })
+    }
+);
 
 impl ReadOp for ops::Loop {
     fn op_type() -> sg::OperatorType {
@@ -747,7 +814,7 @@ impl_read_op!(
         let strides = attrs
             .strides()
             .map(|stride| stride.iter().map(|x| x.as_usize()).collect())
-            .unwrap_or(std::iter::repeat(1).take(kernel_size.len()).collect());
+            .unwrap_or(std::iter::repeat_n(1, kernel_size.len()).collect());
 
         Ok(ops::MaxPool {
             kernel_size,
@@ -822,6 +889,18 @@ impl_read_op!(
 
 #[cfg(feature = "random")]
 impl_read_op!(
+    Multinomial,
+    attrs_as_multinomial_attrs,
+    |attrs: sg::MultinomialAttrs| {
+        Ok(ops::Multinomial {
+            sample_size: attrs.sample_size().max(0) as usize,
+            seed: attrs.seed(),
+        })
+    }
+);
+
+#[cfg(feature = "random")]
+impl_read_op!(
     RandomNormal,
     attrs_as_random_normal_attrs,
     |attrs: sg::RandomNormalAttrs| {
@@ -883,7 +962,10 @@ impl_read_op!(
 
 impl_read_op!(Range);
 impl_read_op!(Reciprocal);
+impl_read_op!(ReduceL1, attrs_as_reduce_mean_attrs, reduce_axes);
 impl_read_op!(ReduceL2, attrs_as_reduce_mean_attrs, reduce_axes);
+impl_read_op!(ReduceLogSum, attrs_as_reduce_mean_attrs, reduce_axes);
+impl_read_op!(ReduceLogSumExp, attrs_as_reduce_mean_attrs, reduce_axes);
 impl_read_op!(ReduceMax, attrs_as_reduce_mean_attrs, reduce_axes);
 impl_read_op!(ReduceMean, attrs_as_reduce_mean_attrs, reduce_axes);
 impl_read_op!(ReduceMin, attrs_as_reduce_mean_attrs, reduce_axes);
@@ -928,7 +1010,37 @@ impl_read_op!(Resize, attrs_as_resize_attrs, |attrs: sg::ResizeAttrs| {
         nearest_mode,
     })
 });
+impl_read_op!(
+    ReverseSequence,
+    attrs_as_reverse_sequence_attrs,
+    |attrs: sg::ReverseSequenceAttrs| {
+        Ok(ops::ReverseSequence {
+            batch_axis: attrs.batch_axis(),
+            time_axis: attrs.time_axis(),
+        })
+    }
+);
+impl_read_op!(
+    RotaryEmbedding,
+    attrs_as_rotary_embedding_attrs,
+    |attrs: sg::RotaryEmbeddingAttrs| {
+        Ok(ops::RotaryEmbedding {
+            interleaved: attrs.interleaved(),
+            num_heads: attrs.num_heads().as_usize(),
+            rotary_embedding_dim: attrs.rotary_embedding_dim().as_usize(),
+        })
+    }
+);
 impl_read_op!(Round);
+impl_read_op!(
+    Scatter,
+    attrs_as_scatter_elements_attrs,
+    |attrs: sg::ScatterElementsAttrs| {
+        Ok(ops::Scatter {
+            axis: attrs.axis() as isize,
+        })
+    }
+);
 impl_read_op!(
     ScatterElements,
     attrs_as_scatter_elements_attrs,
@@ -983,6 +1095,7 @@ impl ReadOp for ops::Shape {
 impl_read_op!(Sigmoid);
 impl_read_op!(Sign);
 impl_read_op!(Sin);
+impl_read_op!(Sinh);
 impl_read_op!(Size);
 impl_read_op!(Slice);
 impl_read_op!(
@@ -1052,6 +1165,18 @@ impl_read_op!(Trilu, attrs_as_trilu_attrs, |attrs: sg::TriluAttrs| {
     })
 });
 impl_read_op!(Unsqueeze);
+impl_read_op!(
+    Upsample,
+    attrs_as_upsample_attrs,
+    |attrs: sg::UpsampleAttrs| {
+        let mode = match attrs.mode() {
+            sg::ResizeMode::Nearest => ResizeMode::Nearest,
+            sg::ResizeMode::Linear => ResizeMode::Linear,
+            _ => ResizeMode::Nearest,
+        };
+        Ok(ops::Upsample { mode })
+    }
+);
 impl_read_op!(Where);
 impl_read_op!(Xor);
 

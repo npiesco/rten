@@ -17,7 +17,7 @@ png = "0.18"
 serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
-rten = { path = "../", version = "0.24.0", features = ["all-ops", "mmap"] }
+rten = { path = "../", version = "0.25.0", features = ["all-ops", "mmap"] }
 rten-generate = { path = "../rten-generate", features=["text-decoder"] }
 rten-imageio = { path = "../rten-imageio" }
 rten-imageproc = { path = "../rten-imageproc" }
@@ -30,7 +30,6 @@ smallvec = { workspace = true }
 # Allows use of `..Default::default()` for future compatibility even when not
 # currently needed.
 needless_update = "allow"
-manual_repeat_n = "allow"  # TODO - Address existing failures
 uninlined_format_args = "allow"
 
 [package.metadata.release]

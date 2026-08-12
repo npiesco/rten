@@ -225,6 +225,29 @@ def read_pads(attr_reader: AttributeReader, attrs: PadAttrs) -> None:
         attrs.pads = pads
 
 
+def read_rnn_attrs(
+    attr_reader: AttributeReader, direction, default_activations: list[str]
+) -> None:
+    """
+    Check the attributes which are common to all RNN operators.
+
+    `default_activations` are the activation functions the operator uses for one
+    direction, in the order the ONNX spec lists them.
+    """
+    attr_reader.check_attr("activation_alpha", "floats", [])
+    attr_reader.check_attr("activation_beta", "floats", [])
+
+    # Only the default activations are supported. A bidirectional operator
+    # repeats the list once per direction.
+    n_directions = 2 if direction == sg.RNNDirection.Bidirectional else 1
+    attr_reader.check_attr(
+        "activations", "strings", ([], default_activations * n_directions)
+    )
+
+    attr_reader.check_attr("clip", "float", 0.0)
+    attr_reader.check_attr("layout", "int", 0)
+
+
 def read_strides(
     attr_reader: AttributeReader,
 ):
@@ -239,12 +262,15 @@ def read_strides(
 
 def read_dilations(
     attr_reader: AttributeReader,
+    default: list[int] | None = None,
 ):
     """
     Read a dilation specification from an ONNX operator.
+
+    :param default: Value to return if the operator has no "dilations" attribute
     """
-    dilations = attr_reader.get_attr("dilations", "ints", [1, 1])
-    if len(dilations) not in [1, 2]:
+    dilations = attr_reader.get_attr("dilations", "ints", default)
+    if dilations is not None and len(dilations) not in [1, 2]:
         raise ConversionError('"dilations" attribute must have 1 or 2 values')
     return dilations
 
@@ -346,6 +372,20 @@ def op_node_from_onnx_operator(
             attrs.keepDims = bool(attr_reader.get_attr("keepdims", "int", 1))
             attr_reader.check_attr("select_last_index", "int", 0)
 
+        case "Attention":
+            attrs = sg.AttentionAttrsT()
+            attrs.isCausal = attr_reader.get_bool_attr("is_causal", False)
+            attrs.qNumHeads = attr_reader.get_attr("q_num_heads", "int", None)
+            attrs.kvNumHeads = attr_reader.get_attr("kv_num_heads", "int", None)
+            attrs.scale = attr_reader.get_attr("scale", "float", None)
+            attrs.softcap = attr_reader.get_attr("softcap", "float", 0.0)
+
+            # These attributes only affect the unsupported `qk_matmul_output`
+            # debug output, or select a softmax precision (we always use the
+            # input type), so accept but ignore them.
+            attr_reader.ignore_attr("qk_matmul_output_mode")
+            attr_reader.ignore_attr("softmax_precision")
+
         case "AveragePool":
             kernel_shape = attr_reader.require_attr("kernel_shape", "ints")
             check_ints_length("kernel_shape", kernel_shape, [1, 2])
@@ -367,6 +407,9 @@ def op_node_from_onnx_operator(
             # Ignore attributes which are valid only if training_mode=1, which
             # is unsupported.
             attr_reader.ignore_attr("momentum")
+
+            # `spatial` was removed in opset 9.
+            attr_reader.check_attr("spatial", "int", 1)
 
         case "Cast":
             attrs = sg.CastAttrsT()
@@ -426,7 +469,7 @@ def op_node_from_onnx_operator(
 
         case "Conv" | "ConvInteger":
             attrs = sg.ConvAttrsT()
-            attrs.dilations = read_dilations(attr_reader)
+            attrs.dilations = read_dilations(attr_reader, [1, 1])
             attrs.groups = attr_reader.get_attr("group", "int", 1)
             read_pads(attr_reader, attrs)
             attrs.strides = read_strides(attr_reader)
@@ -438,7 +481,7 @@ def op_node_from_onnx_operator(
             attrs = sg.ConvTransposeAttrsT()
             attrs.strides = read_strides(attr_reader)
 
-            attr_reader.check_attr("dilations", "ints", ([1], [1, 1]))
+            attrs.dilations = read_dilations(attr_reader)
             attrs.groups = attr_reader.get_attr("group", "int", 1)
 
             # The kernel shape is inferred at runtime from the input weight tensor.
@@ -450,8 +493,22 @@ def op_node_from_onnx_operator(
             read_pads(attr_reader, attrs)
 
         case "CumSum":
-            attr_reader.check_attr("exclusive", "int", 0)
-            attr_reader.check_attr("reverse", "int", 0)
+            attrs = sg.CumSumAttrsT()
+            attrs.exclusive = attr_reader.get_bool_attr("exclusive", False)
+            attrs.reverse = attr_reader.get_bool_attr("reverse", False)
+
+        case "DFT":
+            attrs = sg.DFTAttrsT()
+            attrs.inverse = attr_reader.get_bool_attr("inverse", False)
+            attrs.onesided = attr_reader.get_bool_attr("onesided", False)
+            # `axis` was an attribute in opset 17 and became an optional input
+            # (index 2) in opset 20. Promote the attribute to a constant input.
+            #
+            # Known issue: If a pre-opset-20 model omits the attribute, its
+            # default of 1 is not applied here (the runtime will use the
+            # opset-20 default of -2). The two defaults coincide for the
+            # common case of rank-3 inputs.
+            attr_reader.generate_input_from_attr(2, "axis", "int")
 
         case "DequantizeLinear":
             attrs = sg.DequantizeLinearAttrsT()
@@ -465,6 +522,9 @@ def op_node_from_onnx_operator(
         case "Dropout":
             attrs = sg.DropoutAttrsT()
             attrs.seed = attr_reader.get_attr("seed", "int", None)
+
+            # `ratio` was an attribute until opset 12, when it became an input.
+            attr_reader.generate_input_from_attr(1, "ratio", "float")
 
         case "Einsum":
             attrs = sg.EinsumAttrsT()
@@ -522,6 +582,8 @@ def op_node_from_onnx_operator(
                 attr_reader.get_attr("linear_before_reset", "int", 0)
             )
 
+            read_rnn_attrs(attr_reader, attrs.direction, ["Sigmoid", "Tanh"])
+
         case "HardSigmoid":
             attrs = sg.HardSigmoidAttrsT()
             attrs.alpha = attr_reader.get_attr("alpha", "float", 0.2)
@@ -561,7 +623,7 @@ def op_node_from_onnx_operator(
 
         case "LogSoftmax":
             attrs = sg.SoftmaxAttrsT()
-            attrs.axis = attr_reader.get_attr("axis", "int", 0)
+            attrs.axis = attr_reader.get_attr("axis", "int", -1)
 
         case "Loop":
             attrs = sg.LoopAttrsT()
@@ -571,6 +633,11 @@ def op_node_from_onnx_operator(
             )
             attrs.body = DummyGraphT(body, None)
 
+        case "LpNormalization":
+            attrs = sg.LpNormalizationAttrsT()
+            attrs.axis = attr_reader.get_attr("axis", "int", -1)
+            attrs.p = attr_reader.get_attr("p", "int", 2)
+
         case "LSTM":
             attrs = sg.LSTMAttrsT()
             attrs.direction = attr_reader.get_enum_attr(
@@ -578,12 +645,8 @@ def op_node_from_onnx_operator(
             )
             attrs.hiddenSize = attr_reader.require_attr("hidden_size", "int")
 
-            attr_reader.check_attr("activation_alpha", "floats", [])
-            attr_reader.check_attr("activation_beta", "floats", [])
-            attr_reader.check_attr("activations", "strings", [])
-            attr_reader.check_attr("clip", "float", 0.0)
+            read_rnn_attrs(attr_reader, attrs.direction, ["Sigmoid", "Tanh", "Tanh"])
             attr_reader.check_attr("input_forget", "int", 0)
-            attr_reader.check_attr("layout", "int", 0)
 
         case "MaxPool":
             attrs = sg.MaxPoolAttrsT()
@@ -600,6 +663,18 @@ def op_node_from_onnx_operator(
         case "Mod":
             attrs = sg.ModAttrsT()
             attrs.fmod = bool(attr_reader.get_attr("fmod", "int", 0))
+
+        case "Multinomial":
+            attrs = sg.MultinomialAttrsT()
+            # Only int32 and int64 output types are supported. RTen represents
+            # both as int32. The default is int32.
+            attr_reader.check_attr(
+                "dtype",
+                "int",
+                (TensorProto.DataType.INT32, TensorProto.DataType.INT64),
+            )
+            attrs.sampleSize = attr_reader.get_attr("sample_size", "int", 1)
+            attrs.seed = attr_reader.get_attr("seed", "float", None)
 
         case "NonMaxSuppression":
             attrs = sg.NonMaxSuppressionAttrsT()
@@ -640,7 +715,10 @@ def op_node_from_onnx_operator(
             attrs.high = attr_reader.get_attr("high", "float", 1.0)
 
         case (
-            "ReduceL2"
+            "ReduceL1"
+            | "ReduceL2"
+            | "ReduceLogSum"
+            | "ReduceLogSumExp"
             | "ReduceMax"
             | "ReduceMean"
             | "ReduceMin"
@@ -658,6 +736,14 @@ def op_node_from_onnx_operator(
         case "Reshape":
             attrs = sg.ReshapeAttrsT()
             attrs.allowZero = bool(attr_reader.get_attr("allowzero", "int", 0))
+
+            # `shape` was an attribute until opset 5, when it became an input.
+            attr_reader.generate_input_from_attr(1, "shape", "ints")
+
+        case "ReverseSequence":
+            attrs = sg.ReverseSequenceAttrsT()
+            attrs.batchAxis = attr_reader.get_attr("batch_axis", "int", 1)
+            attrs.timeAxis = attr_reader.get_attr("time_axis", "int", 0)
 
         case "Resize":
             attrs = sg.ResizeAttrsT()
@@ -695,6 +781,19 @@ def op_node_from_onnx_operator(
             if output_dtype is not None:
                 attrs.outputDtype = convert_data_type(output_dtype)
 
+        case "RotaryEmbedding":
+            attrs = sg.RotaryEmbeddingAttrsT()
+            attrs.interleaved = attr_reader.get_bool_attr("interleaved", False)
+            attrs.numHeads = attr_reader.get_attr("num_heads", "int", 0)
+            attrs.rotaryEmbeddingDim = attr_reader.get_attr(
+                "rotary_embedding_dim", "int", 0
+            )
+
+        case "Scatter":
+            # Deprecated alias for ScatterElements without a reduction.
+            attrs = sg.ScatterElementsAttrsT()
+            attrs.axis = attr_reader.get_attr("axis", "int", 0)
+
         case "ScatterElements":
             attrs = sg.ScatterElementsAttrsT()
             attrs.axis = attr_reader.get_attr("axis", "int", 0)
@@ -723,9 +822,16 @@ def op_node_from_onnx_operator(
             if end is not None:
                 attrs.end = end
 
+        case "Slice":
+            # In opset versions <10, `starts`, `ends` and `axes` were specified
+            # as attributes rather than inputs.
+            attr_reader.generate_input_from_attr(1, "starts", "ints")
+            attr_reader.generate_input_from_attr(2, "ends", "ints")
+            attr_reader.generate_input_from_attr(3, "axes", "ints")
+
         case "Softmax":
             attrs = sg.SoftmaxAttrsT()
-            attrs.axis = attr_reader.get_attr("axis", "int", 0)
+            attrs.axis = attr_reader.get_attr("axis", "int", -1)
 
         case "Split":
             attrs = sg.SplitAttrsT()
@@ -751,6 +857,9 @@ def op_node_from_onnx_operator(
             attrs.largest = bool(attr_reader.get_attr("largest", "int", 1))
             attrs.sorted = bool(attr_reader.get_attr("sorted", "int", 1))
 
+            # `k` was an attribute until opset 10, when it became an input.
+            attr_reader.generate_input_from_attr(1, "k", "int")
+
         case "Transpose":
             attrs = sg.TransposeAttrsT()
             attrs.perm = attr_reader.get_attr("perm", "ints", None)
@@ -761,6 +870,14 @@ def op_node_from_onnx_operator(
 
         case "Unsqueeze":
             attr_reader.generate_input_from_attr(1, "axes", "ints")
+
+        case "Upsample":
+            attrs = sg.UpsampleAttrsT()
+            attrs.mode = attr_reader.get_enum_attr("mode", sg.ResizeMode, "nearest")
+
+            # `scales` was a required attribute in opset 7 and became the second
+            # input in opset 9.
+            attr_reader.generate_input_from_attr(1, "scales", "floats")
 
     if not hasattr(sg.OperatorType, op_type):
         raise UnsupportedOperatorError(op_type)

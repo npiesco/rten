@@ -1,14 +1,16 @@
+use rten_base::bit_set::BitSet;
+use rten_shape_inference::ops as shape_ops;
 use rten_tensor::prelude::*;
 use rten_tensor::{Tensor, TensorView};
 
 use crate::buffer_pool::BufferPool;
-use crate::infer_shapes::{InferShapes, UnaryOp};
+use crate::infer_shapes::InferShapes;
 use crate::operator::{
-    IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
-    OutputTypesContext,
+    InPlaceInputs, IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType,
+    OutputTypeList, OutputTypesContext,
 };
 use crate::ops::map_value_view;
-use crate::value::{Value, ValueView};
+use crate::value::ValueView;
 
 fn identity<T: Copy>(pool: &BufferPool, src: TensorView<T>) -> Tensor<T> {
     src.to_tensor_in(pool)
@@ -31,16 +33,20 @@ impl Operator for Identity {
         map_value_view!(input, x, { identity(ctx.pool(), x).into_op_result() })
     }
 
-    fn can_run_in_place(&self) -> bool {
-        true
+    fn in_place_inputs(&self) -> BitSet<u16> {
+        BitSet::from_indices([0])
     }
 
-    fn run_in_place(&self, input: Value, _ctx: &OpRunContext) -> Result<Value, OpError> {
-        Ok(input)
+    fn run_in_place(
+        &self,
+        in_place: InPlaceInputs,
+        _ctx: &OpRunContext,
+    ) -> Result<OutputList, OpError> {
+        in_place.into_single().into_op_result()
     }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
-        Some(&UnaryOp)
+        Some(&shape_ops::Identity)
     }
 
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {

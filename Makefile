@@ -23,7 +23,10 @@ docs:
 
 .PHONY: lint
 lint:
-	cargo clippy --workspace
+	# `-D warnings` triggers non-zero exit on warnings. `-A unknown_lints` allows
+	# for compiling with an older Rust version (eg. MSRV) that doesn't know about
+	# some lints referenced in config/attributes.
+	cargo clippy --workspace -- -D warnings -A unknown_lints
 
 .PHONY: miri
 miri:
@@ -35,7 +38,7 @@ miri:
 # nightly Rust.
 .PHONY: test
 test:
-	cargo test --no-fail-fast --workspace --features all-ops,mmap,text-decoder,serde
+	cargo test --no-fail-fast --workspace --features rten/all-ops,rten/mmap,rten-generate/text-decoder,rten-tensor/serde,rten-serialize/npy,rten-serialize/npz
 
 # Default to running tests for the main crate unless otherwise specified.
 PACKAGE ?= rten

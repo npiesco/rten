@@ -27,7 +27,7 @@ mod load_error;
 mod metadata;
 
 #[cfg(feature = "onnx_format")]
-mod onnx_loader;
+pub(crate) mod onnx_loader;
 
 #[cfg(feature = "rten_format")]
 mod rten_loader;
@@ -472,6 +472,9 @@ impl Model {
     ///
     /// The input and output nodes are specified via IDs looked up via
     /// [`node_id`](Model::node_id).
+    ///
+    /// Input values are validated against the shape and dtype specified in the
+    /// model, which can be queried via [`Model::node_info`].
     pub fn run(
         &self,
         inputs: Vec<(NodeId, ValueOrView)>,
@@ -690,7 +693,7 @@ impl ModelOptions {
             optimize: true,
             prepack_weights: false,
             external_data: HashMap::new(),
-            infer_shapes: ShapeInferenceMode::Off,
+            infer_shapes: ShapeInferenceMode::On,
         }
     }
 
@@ -715,9 +718,12 @@ impl ModelOptions {
 
     /// Set whether shape and type inference is run as part of optimization.
     ///
-    /// This is an experimental option that is needed to enable certain more
-    /// complex fusions to work. It will eventually be enabled by default. See
-    /// <https://github.com/robertknight/rten/pull/1124>.
+    /// Shape inference is needed for some optimizations in order to verify that
+    /// they are safe, by checking the shape and/or type of various values. By
+    /// default shape inference is [enabled](ShapeInferenceMode::On) but will
+    /// fail gracefully if the shapes of some values cannot be inferred. To
+    /// enforce that shape inference is fully successful, [strict
+    /// mode](ShapeInferenceMode::Strict) can be enabled.
     pub fn shape_inference(&mut self, mode: ShapeInferenceMode) -> &mut Self {
         self.infer_shapes = mode;
         self
@@ -874,8 +880,14 @@ impl ModelOptions {
             OptimizeMode::On(OptimizeOptions {
                 infer_shapes: match self.infer_shapes {
                     ShapeInferenceMode::Off => None,
-                    ShapeInferenceMode::On => Some(InferShapeOptions { strict: false }),
-                    ShapeInferenceMode::Strict => Some(InferShapeOptions { strict: true }),
+                    ShapeInferenceMode::On => Some(InferShapeOptions {
+                        strict: false,
+                        ..Default::default()
+                    }),
+                    ShapeInferenceMode::Strict => Some(InferShapeOptions {
+                        strict: true,
+                        ..Default::default()
+                    }),
                 },
             })
         } else {
@@ -1369,6 +1381,17 @@ mod tests {
         let input_2d_u8 = graph_builder.add_value("input.2d.u8", None, None);
         let input_2d_i8 = graph_builder.add_value("input.2d.i8", None, None);
 
+        for input in [
+            input_node,
+            input_2d,
+            input_bool,
+            input_u8,
+            input_2d_u8,
+            input_2d_i8,
+        ] {
+            graph_builder.add_input(input);
+        }
+
         // 4D shape used as the primary input to test most operators (eg. NCHW image). A few
         // require a different shape.
         let input_shape = [1, 1, 3, 3];
@@ -1387,6 +1410,7 @@ mod tests {
                 let output_name = format!("{}_out", name);
                 let op_output_node = builder.add_value(&output_name, None, None);
                 builder.add_operator(name, op, input_nodes, &[op_output_node]);
+                builder.add_output(op_output_node);
                 op_outputs.push(output_name);
                 op_output_node
             };
@@ -1416,12 +1440,15 @@ mod tests {
 
         add_operator!(Abs, [input_node]);
         add_operator!(Acos, [input_node]);
+        add_operator!(Acosh, [input_node]);
         add_operator!(Add, [input_node, input_node]);
         add_operator!(And, [input_bool, input_bool]);
         add_operator!(ArgMax, [input_node], { axis: 3, keep_dims: false });
         add_operator!(ArgMin, [input_node], { axis: 3, keep_dims: false });
         add_operator!(Asin, [input_node]);
+        add_operator!(Asinh, [input_node]);
         add_operator!(Atan, [input_node]);
+        add_operator!(Atanh, [input_node]);
         add_operator!(AveragePool, [input_node], {
             kernel_size: [2, 2].into(),
             strides: [2, 2].into(),
@@ -1456,7 +1483,7 @@ mod tests {
         add_operator!(Concat, [input_node, input_node], { axis: 0 });
 
         let shape = graph_builder.add_constant(Tensor::from([1, 5, 10]).view());
-        add_operator!(ConstantOfShape, [shape], { value: Scalar::Int(42) });
+        add_operator!(ConstantOfShape, [shape], { value: Scalar::Int32(42) });
 
         add_operator!(Conv, [input_node, kernel], {
             dilations: vec![1, 1],
@@ -1472,11 +1499,16 @@ mod tests {
         });
         add_operator!(ConvTranspose, [input_node, kernel], {
             strides: vec![2, 2],
+            dilations: vec![2, 2],
             padding: [0, 0, 0, 0].into(),
             groups: 1,
             output_padding: None,
         });
         add_operator!(Cos, [input_node]);
+        add_operator!(Cosh, [input_node]);
+
+        let cum_sum_axis = graph_builder.add_constant(Tensor::from(0).view());
+        add_operator!(CumSum, [input_node, cum_sum_axis], { exclusive: true, reverse: true });
 
         let const_u8_val = Tensor::from([0u8, 1, 2, 3, 4]);
         let const_u8 = graph_builder.add_constant(const_u8_val.view());
@@ -1511,6 +1543,8 @@ mod tests {
                 &[input_2d].map(Some),
                 &[dropout_out, dropout_out_mask],
             );
+            graph_builder.add_output(dropout_out);
+            graph_builder.add_output(dropout_out_mask);
         }
         add_operator!(Elu, [input_node], { alpha: 1.0 });
         add_operator!(Equal, [input_node, input_node]);
@@ -1678,11 +1712,18 @@ mod tests {
                 high: 1.,
                 seed: None,
             });
+            add_operator!(Multinomial, [input_2d], {
+                sample_size: 4,
+                seed: None,
+            });
         }
 
         let range_start_node = graph_builder.add_value("range_start", None, None);
         let range_limit_node = graph_builder.add_value("range_limit", None, None);
         let range_delta_node = graph_builder.add_value("range_delta", None, None);
+        for input in [range_start_node, range_limit_node, range_delta_node] {
+            graph_builder.add_input(input);
+        }
         let range_out = add_operator!(
             Range,
             [range_start_node, range_limit_node, range_delta_node]
@@ -1719,6 +1760,16 @@ mod tests {
             keep_dims: false,
             noop_with_empty_axes: false,
         });
+        add_operator!(ReduceL1, [input_node], {
+            axes: None,
+            keep_dims: false,
+            noop_with_empty_axes: false,
+        });
+        add_operator!(ReduceL2, [input_node], {
+            axes: None,
+            keep_dims: false,
+            noop_with_empty_axes: false,
+        });
         add_operator!(Relu, [input_node]);
 
         let new_shape = graph_builder.add_constant(Tensor::from([9]).view());
@@ -1738,6 +1789,11 @@ mod tests {
 
         add_operator!(Round, [input_node]);
 
+        let upsample_scales = graph_builder.add_constant(Tensor::from([1., 1., 2., 2.]).view());
+        add_operator!(Upsample, [input_node, upsample_scales], {
+            mode: ResizeMode::Nearest
+        });
+
         add_operator!(Shape, [input_node], {
             start: Some(1),
             end: Some(-1),
@@ -1745,6 +1801,7 @@ mod tests {
         add_operator!(Sigmoid, [input_node]);
         add_operator!(Sign, [input_node]);
         add_operator!(Sin, [input_node]);
+        add_operator!(Sinh, [input_node]);
         add_operator!(Size, [input_node]);
 
         let scatter_elem_indices_val = Tensor::<i32>::zeros(&input_shape);
@@ -1755,6 +1812,25 @@ mod tests {
             ScatterElements,
             [input_node, scatter_elem_indices, scatter_elem_updates],
             { axis: 0, reduction: None }
+        );
+        add_operator!(
+            Scatter,
+            [input_node, scatter_elem_indices, scatter_elem_updates],
+            { axis: 0 }
+        );
+
+        // The standard 4D input has shape [batch=1, num_heads=1, seq=3,
+        // head_size=3]. `rotary_embedding_dim` must be even and `<= head_size`,
+        // so rotate the first 2 of the 3 head elements. The cos/sin caches have
+        // shape [max_pos, rotary_embedding_dim / 2] and are gathered by
+        // `position_ids`.
+        let rotary_cos = graph_builder.add_constant(Tensor::<f32>::zeros(&[3, 1]).view());
+        let rotary_sin = graph_builder.add_constant(Tensor::<f32>::zeros(&[3, 1]).view());
+        let rotary_pos = graph_builder.add_constant(Tensor::from([[0i32, 1, 2]]).view());
+        add_operator!(
+            RotaryEmbedding,
+            [input_node, rotary_cos, rotary_sin, rotary_pos],
+            { interleaved: false, num_heads: 1, rotary_embedding_dim: 2 }
         );
 
         let const_0 = graph_builder.add_constant(Tensor::from([0]).view());
@@ -1778,6 +1854,8 @@ mod tests {
             &[input_2d, split_splits].map(Some),
             &[split_out_1, split_out_2],
         );
+        graph_builder.add_output(split_out_1);
+        graph_builder.add_output(split_out_2);
 
         add_operator!(Sub, [input_node, input_node]);
         add_operator!(Sum, [input_node, input_node]);
@@ -1800,6 +1878,8 @@ mod tests {
             &[input_2d, topk_k].map(Some),
             &[topk_out_values, topk_out_indices],
         );
+        graph_builder.add_output(topk_out_values);
+        graph_builder.add_output(topk_out_indices);
 
         add_operator!(Transpose, [input_node], { perm: None });
 
@@ -1811,6 +1891,9 @@ mod tests {
         let where_cond = graph_builder.add_value("where_cond", None, None);
         let where_x = graph_builder.add_value("where_x", None, None);
         let where_y = graph_builder.add_value("where_y", None, None);
+        for input in [where_cond, where_x, where_y] {
+            graph_builder.add_input(input);
+        }
         let where_out = add_operator!(Where, [where_cond, where_x, where_y]);
 
         add_operator!(Xor, [input_bool, input_bool]);
@@ -1841,6 +1924,7 @@ mod tests {
                 "Dropout_out_mask",
                 "Gemm_out",
                 "MatMul_out",
+                "Multinomial_out",
                 "Range_out",
                 "Split_out_1",
                 "Split_out_2",
@@ -1910,7 +1994,7 @@ mod tests {
 
         #[cfg(feature = "random")]
         {
-            outputs.extend(["Dropout_out", "Dropout_out_mask"]);
+            outputs.extend(["Dropout_out", "Dropout_out_mask", "Multinomial_out"]);
         }
 
         let input = Tensor::from_data(&[3, 3], vec![1., 2., 3., 4., 5., 6., 7., 8., 9.]);

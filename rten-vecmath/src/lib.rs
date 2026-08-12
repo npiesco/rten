@@ -94,6 +94,7 @@
 //! let sum = Sum::new(&data).dispatch();
 //! ```
 
+mod convert;
 mod erf;
 mod exp;
 mod min_max;
@@ -124,8 +125,11 @@ pub use tanh::Tanh;
 // Normalization and reduction functions.
 pub use min_max::{MaxNum, MinMax, MinNum};
 pub use normalize::{Normalize, NormalizeOptions};
-pub use softmax::Softmax;
-pub use sum::{Sum, SumSquare, SumSquareSub};
+pub use softmax::{LogSoftmax, Softmax};
+pub use sum::{Sum, SumAbs, SumExpSub, SumSquare, SumSquareSub};
+
+// Conversion functions.
+pub use convert::{F16ToF32, F32ToF16};
 
 // Utilities
 pub use extend_init::ExtendInit;

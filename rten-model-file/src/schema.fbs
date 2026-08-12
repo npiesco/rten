@@ -142,6 +142,22 @@ enum OperatorType: ubyte {
   PRelu,
   STFT,
   GlobalMaxPool,
+  ReduceL1,
+  Acosh,
+  Asinh,
+  Atanh,
+  Cosh,
+  Sinh,
+  Multinomial,
+  ReverseSequence,
+  DFT,
+  Scatter,
+  Upsample,
+  RotaryEmbedding,
+  Attention,
+  LpNormalization,
+  ReduceLogSum,
+  ReduceLogSumExp,
 }
 
 enum RNNDirection: ubyte {
@@ -216,7 +232,7 @@ union OperatorAttrs {
   // New operator attrs. These are appended here to preserve binary compatibility
   // of existing model files.
   ModAttrs,
-  ScatterElementsAttrs,
+  ScatterElementsAttrs, // Also used for Scatter
   OneHotAttrs,
   TopKAttrs,
   HardSigmoidAttrs,
@@ -248,6 +264,14 @@ union OperatorAttrs {
   SplitToSequenceAttrs,
   GridSampleAttrs,
   STFTAttrs,
+  MultinomialAttrs,
+  ReverseSequenceAttrs,
+  DFTAttrs,
+  UpsampleAttrs,
+  RotaryEmbeddingAttrs,
+  AttentionAttrs,
+  CumSumAttrs,
+  LpNormalizationAttrs,
 }
 
 table ArgMaxAttrs {
@@ -351,6 +375,13 @@ table ConvTransposeAttrs {
   groups:uint = 1;
 
   output_padding:[uint];
+  dilations:[uint];
+}
+
+// Attributes are optional for backwards compatibility.
+table CumSumAttrs {
+  exclusive:bool;
+  reverse:bool;
 }
 
 table DequantizeLinearAttrs {
@@ -372,6 +403,11 @@ table FlattenAttrs {
 table LayerNormalizationAttrs {
   axis:int;
   epsilon:float;
+}
+
+table LpNormalizationAttrs {
+  axis:int = -1;
+  p:uint = 2;
 }
 
 table LoopAttrs {
@@ -444,6 +480,11 @@ table MaxPoolAttrs {
 
 table ModAttrs {
   fmod:bool;
+}
+
+table MultinomialAttrs {
+  sample_size:int;
+  seed:float = null;
 }
 
 enum NMSBoxOrder: ubyte {
@@ -534,6 +575,25 @@ table ScatterNDAttrs {
   reduction:ScatterReduction;
 }
 
+table UpsampleAttrs {
+  mode:ResizeMode;
+}
+
+table RotaryEmbeddingAttrs {
+  interleaved:bool;
+  num_heads:uint;
+  rotary_embedding_dim:uint;
+}
+
+table AttentionAttrs {
+  is_causal:bool;
+  // Query / key-value head counts. Required for 3D inputs, unset for 4D inputs.
+  q_num_heads:uint = null;
+  kv_num_heads:uint = null;
+  scale:float = null;
+  softcap:float;
+}
+
 table SequenceEmptyAttrs {
   dtype:DataType = null;
 }
@@ -559,6 +619,16 @@ table SplitToSequenceAttrs {
 
 table STFTAttrs {
   onesided:bool = true;
+}
+
+table ReverseSequenceAttrs {
+  batch_axis:int = 1;
+  time_axis:int = 0;
+}
+
+table DFTAttrs {
+  inverse:bool = false;
+  onesided:bool = false;
 }
 
 table TopKAttrs {

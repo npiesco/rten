@@ -1,13 +1,14 @@
+use std::any::TypeId;
+
 use rayon::prelude::*;
-use rten_base::byte_cast::{Pod, cast_pod_vec};
+use rten_base::byte_cast::{FromByteArray, cast_vec};
 use rten_gemm::{
-    BiasVector, BlockQuantizedError, BlockQuantizedGemm, BlockQuantizedMatrix, ComputeMode,
-    GemmExecutor, GemmInT, GemmInputA, GemmInputB, GemmOptions, GemmOutT, GemmUninitOptions,
-    PackedBMatrix, QuantParams,
+    BiasVector, GemmExecutor, GemmInT, GemmInputA, GemmInputB, GemmOptions, GemmOutT,
+    GemmUninitOptions, PackedBMatrix, QuantParams,
 };
 use rten_shape_inference::ops as shape_ops;
 use rten_tensor::prelude::*;
-use rten_tensor::{CowNdTensor, Matrix, NdTensorView, Tensor, TensorView};
+use rten_tensor::{CowTensor, Matrix, NdTensorView, Tensor, TensorView};
 use rten_vecmath::ExtendInit;
 use smallvec::SmallVec;
 
@@ -19,6 +20,7 @@ use crate::operator::{
 };
 use crate::ops::binary_elementwise::broadcast_shapes;
 use crate::ops::layout::expand_to;
+use crate::shift_cast::ShiftCast;
 use crate::value::{DataType, ValueType, ValueView};
 
 /// Compute the General Matrix Multiplication (GEMM) `c = alpha * (ab) + beta * c`.
@@ -50,7 +52,7 @@ where
     let [b_rows, _b_cols] = b.shape();
 
     if a_cols != b_rows {
-        return Err(OpError::IncompatibleInputShapes(
+        return Err(OpError::incompatible_input_shapes(
             "Columns of first matrix does not match rows of second matrix",
         ));
     }
@@ -61,7 +63,7 @@ where
     let output = match c {
         Some(c) if beta != OutT::zero() => {
             if !c.can_broadcast_to(out_shape) {
-                return Err(OpError::IncompatibleInputShapes(
+                return Err(OpError::incompatible_input_shapes(
                     "Cannot broadcast c to output shape",
                 ));
             }
@@ -218,7 +220,7 @@ where
     GemmExecutor<LhsT, RhsT, OutT>: Default,
 {
     if a.ndim() < 1 || b.ndim() < 1 {
-        return Err(OpError::InvalidValue("Inputs must have >= 1 dimensions"));
+        return Err(OpError::invalid_value("Inputs must have >= 1 dimensions"));
     }
 
     // Expand vector inputs to matrices. This follows the rules of `numpy.matmul`.
@@ -239,7 +241,7 @@ where
     let b_cols = b.size(b.ndim() - 1);
 
     if a_cols != b_rows {
-        return Err(OpError::IncompatibleInputShapes(
+        return Err(OpError::incompatible_input_shapes(
             "Columns of first matrix does not match rows of second matrix",
         ));
     }
@@ -250,8 +252,9 @@ where
     let num_a_matrices: usize = a_prefix.iter().product();
     let num_b_matrices: usize = b_prefix.iter().product();
 
-    let out_prefix = broadcast_shapes(a_prefix, b_prefix)
-        .ok_or(OpError::IncompatibleInputShapes("Cannot broadcast shapes"))?;
+    let out_prefix = broadcast_shapes(a_prefix, b_prefix).ok_or(
+        OpError::incompatible_input_shapes("Cannot broadcast shapes"),
+    )?;
     let out_shape = &[out_prefix.as_slice(), &[a_rows, b_cols]].concat();
 
     // A batched matrix multiplication with `[A, M, K] x [K, N]`, where `A` can
@@ -498,6 +501,10 @@ impl Operator for FusedMatMul {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::CopyFromInput(0)].into())
     }
+
+    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
+        None
+    }
 }
 
 /// Normalize a zero point input by converting it to a vector.
@@ -512,16 +519,65 @@ pub fn zero_point_to_vec<T>(
         Some(zp) if zp.ndim() == 0 => Ok(Some(zp.broadcast([expected_len]))),
         Some(zp) if zp.ndim() == 1 => {
             if zp.size(0) != expected_len {
-                Err(OpError::InvalidValue("Zero point has incorrect size"))
+                Err(OpError::invalid_value("Zero point has incorrect size"))
             } else {
                 Ok(Some(zp.nd_view()))
             }
         }
-        Some(_) => Err(OpError::UnsupportedValue(
+        Some(_) => Err(OpError::unsupported_value(
             "Only scalar or vector zero points are supported",
         )),
         None => Ok(None),
     }
+}
+
+/// Convert an int8 or uint8 tensor and its zero-point vector to `u8` by
+/// shifting the values using [`ShiftCast`].
+///
+/// This is a cheap no-op cast if the tensor is already `u8`.
+///
+/// This is needed for preparing the LHS operand of an int8 matmul as the GEMM
+/// implementation currently only supports `u8 x i8 -> i32`.
+pub(crate) fn shift_cast_gemm_lhs_to_u8<'a, T>(
+    pool: &BufferPool,
+    tensor: TensorView<'a, T>,
+    zero_point: Vec<T>,
+) -> (CowTensor<'a, u8>, Vec<u8>)
+where
+    T: Copy + Default + Into<i16> + ShiftCast<u8> + 'static,
+    TensorView<'a, T>: ShiftCast<CowTensor<'a, u8>>,
+    Vec<T>: ShiftCast<Vec<u8>>,
+{
+    if TypeId::of::<T>() == TypeId::of::<i8>() {
+        let gemm = GemmExecutor::<u8, i8, i32>::default();
+        if gemm.may_saturate() {
+            // When the source type is `i8` and the GEMM may saturate (x64
+            // without VNNI), values are instead shifted by the minimum amount
+            // needed to avoid underflow when converting `i8 -> i16 -> u8`, so
+            // the post-shift values stay as close as possible to the `u7`
+            // safe range `[0, 127]`. To avoid the saturation hazard entirely,
+            // the model should be converted with `reduce_range` enabled
+            // (see https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html#when-and-why-do-i-need-to-try-u8u8).
+            // Saturation may still occur for inputs outside the safe range,
+            // but this strategy limits the amount, which is better than the
+            // alternative of underflow when converting full-range `i8`
+            // directly to `u8`.
+            let min: i16 = tensor
+                .iter()
+                .copied()
+                .fold(0i16, |acc, x| acc.min(x.into()));
+            let shift = -min;
+            let cast: Tensor<u8> =
+                tensor.map_in(pool, |v| (<T as Into<i16>>::into(*v) + shift) as u8);
+            let zero_cast: Vec<u8> = zero_point
+                .into_iter()
+                .map(|v| (v.into() + shift) as u8)
+                .collect();
+            return (cast.into_cow(), zero_cast);
+        }
+    }
+    // No-op cast when `T` is already `u8`, otherwise a regular sign flip.
+    (tensor.shift_cast_in(pool), zero_point.shift_cast())
 }
 
 pub fn matmul_integer<LhsT, RhsT>(
@@ -530,12 +586,13 @@ pub fn matmul_integer<LhsT, RhsT>(
     b: TensorView<RhsT>,
     a_zero_point: Option<TensorView<LhsT>>,
     b_zero_point: Option<TensorView<RhsT>>,
-    packed_b: Option<&PackedBMatrix<RhsT>>,
+    packed_b: Option<&PackedBMatrix<i8>>,
 ) -> Result<Tensor<i32>, OpError>
 where
-    LhsT: GemmInT,
-    RhsT: GemmInT,
-    GemmExecutor<LhsT, RhsT, i32>: Default,
+    LhsT: Copy + Default + Into<i16> + ShiftCast<u8> + 'static,
+    RhsT: Copy + Default + ShiftCast<i8> + 'static,
+    for<'a> TensorView<'a, LhsT>: ShiftCast<CowTensor<'a, u8>>,
+    for<'a> TensorView<'a, RhsT>: ShiftCast<CowTensor<'a, i8>>,
 {
     let a_rows = if a.ndim() > 1 {
         a.size(a.ndim() - 2)
@@ -548,26 +605,45 @@ where
         1
     };
 
-    let a_zero = zero_point_to_vec(a_zero_point, a_rows)?.map(|zp| zp.to_contiguous());
-    let a_quant = a_zero.as_ref().map(|zp| QuantParams {
-        zero_point: zp.data(),
-    });
+    let a_zero = zero_point_to_vec(a_zero_point, a_rows)?
+        .map(|zp| zp.to_vec())
+        .unwrap_or_else(|| vec![LhsT::default(); a_rows]);
+    let b_zero = zero_point_to_vec(b_zero_point, b_cols)?
+        .map(|zp| zp.to_vec())
+        .unwrap_or_else(|| vec![RhsT::default(); b_cols]);
 
-    let b_zero = zero_point_to_vec(b_zero_point, b_cols)?.map(|zp| zp.to_contiguous());
-    let b_quant = b_zero.as_ref().map(|zp| QuantParams {
-        zero_point: zp.data(),
-    });
+    let (a_cast, a_zero_cast) = shift_cast_gemm_lhs_to_u8(pool, a, a_zero);
+    let a_cast = a_cast.auto_return(pool);
+
+    let b_cast = b.shift_cast_in(pool).auto_return(pool);
+    let b_zero_cast: Vec<i8> = b_zero.shift_cast();
+
+    // Pre-packed B can only be used when the original RHS is i8. For other
+    // RHS types we shift cast to i8 and ignore any prepacked data, since
+    // prepacking only happens for i8 RHS inputs.
+    let packed_b = if TypeId::of::<RhsT>() == TypeId::of::<i8>() {
+        packed_b
+    } else {
+        None
+    };
+
+    let a_quant = QuantParams {
+        zero_point: a_zero_cast.as_slice(),
+    };
+    let b_quant = QuantParams {
+        zero_point: b_zero_cast.as_slice(),
+    };
 
     matmul_impl(
         pool,
-        a,
-        b,
+        a_cast.view(),
+        b_cast.view(),
         packed_b,
         MatmulStrategy::Auto,
         None,
         None,
-        a_quant,
-        b_quant,
+        Some(a_quant),
+        Some(b_quant),
     )
 }
 
@@ -602,12 +678,9 @@ impl Operator for MatMulInteger {
 
         match (a, b) {
             (ValueView::UInt8Tensor(a), ValueView::Int8Tensor(b)) => matmul_integer!(a, b),
-
-            // GEMM doesn't support other int8 signed-ness combinations yet.
-            (ValueView::Int8Tensor(_), ValueView::Int8Tensor(_)) => Err(OpError::UnsupportedType),
-            (ValueView::Int8Tensor(_), ValueView::UInt8Tensor(_)) => Err(OpError::UnsupportedType),
-            (ValueView::UInt8Tensor(_), ValueView::UInt8Tensor(_)) => Err(OpError::UnsupportedType),
-
+            (ValueView::UInt8Tensor(a), ValueView::UInt8Tensor(b)) => matmul_integer!(a, b),
+            (ValueView::Int8Tensor(a), ValueView::Int8Tensor(b)) => matmul_integer!(a, b),
+            (ValueView::Int8Tensor(a), ValueView::UInt8Tensor(b)) => matmul_integer!(a, b),
             _ => Err(OpError::UnsupportedType),
         }
     }
@@ -633,33 +706,70 @@ impl Operator for MatMulInteger {
     }
 }
 
+/// Scale factor applied to the integer output of a quantized operator when
+/// converting it to float.
+#[derive(Clone, Debug)]
+pub enum OutputScale<'a> {
+    /// Scale which is applied to every element.
+    Scalar(f32),
+    /// Scale which is applied per-column (ie. along the last axis).
+    Vector(NdTensorView<'a, f32, 1>),
+}
+
+impl<'a> OutputScale<'a> {
+    /// Extract the scale from an operator input.
+    ///
+    /// The input must be a scalar or vector. A vector with a single element is
+    /// treated as a scalar, since it broadcasts against all columns.
+    fn from_view(scale: TensorView<'a, f32>) -> Result<Self, OpError> {
+        match scale.ndim() {
+            0 => Ok(OutputScale::Scalar(scale.item().copied().unwrap())),
+            1 if scale.size(0) == 1 => Ok(OutputScale::Scalar(scale.item().copied().unwrap())),
+            1 => Ok(OutputScale::Vector(scale.into_rank().unwrap())),
+            _ => Err(OpError::invalid_value("scale should have rank 0 or 1")),
+        }
+    }
+}
+
 /// Cast elements in `data` to f32 and scale by the per-column scales in `scale`.
-fn cast_scale(
+pub fn cast_scale(
     pool: &BufferPool,
     mut data: Tensor<i32>,
-    scale: NdTensorView<f32, 1>,
+    scale: OutputScale,
 ) -> Result<Tensor<f32>, OpError> {
-    if data.size(data.ndim() - 1) != scale.size(0) {
-        return Err(OpError::IncompatibleInputShapes(
-            "Scale length does not match tensor columns",
-        ));
-    }
+    match scale {
+        OutputScale::Vector(scale) => {
+            if data.size(data.ndim() - 1) != scale.size(0) {
+                return Err(OpError::incompatible_input_shapes(
+                    "Scale length does not match tensor columns",
+                ));
+            }
 
-    let scale = scale.to_contiguous_in(pool);
-    let scale_data = scale.data();
+            let scale = scale.to_contiguous_in(pool);
+            let scale_data = scale.data();
 
-    // Convert i32 elements to f32 in-place and multiply by column scale.
-    let output_data = data.data_mut().expect("should be contiguous");
-    output_data.par_chunks_mut(scale.len()).for_each(|chunk| {
-        for (el, scale) in chunk.iter_mut().zip(scale_data) {
-            let scaled = *el as f32 * scale;
-            *el = scaled.cast_bytes();
+            // Convert i32 elements to f32 in-place and multiply by column scale.
+            let output_data = data.data_mut().expect("should be contiguous");
+            output_data.par_chunks_mut(scale.len()).for_each(|chunk| {
+                for (el, scale) in chunk.iter_mut().zip(scale_data) {
+                    let scaled = *el as f32 * scale;
+                    *el = scaled.cast_bytes();
+                }
+            });
         }
-    });
+        OutputScale::Scalar(scale) => {
+            // Convert i32 elements to f32 in-place and multiply by column scale.
+            let output_data = data.data_mut().expect("should be contiguous");
+            output_data.par_iter_mut().for_each(|el| {
+                let scaled = *el as f32 * scale;
+                *el = scaled.cast_bytes();
+            });
+        }
+    }
 
     // Transmute tensor from i32 to f32.
     let shape = data.shape().to_vec();
-    let data = cast_pod_vec::<i32, f32>(data.into_data()).unwrap();
+    let data = cast_vec::<i32, f32>(data.into_data()).unwrap();
     Ok(Tensor::from_data(&shape, data))
 }
 
@@ -678,8 +788,9 @@ impl Operator for MatMulIntegerToFloat {
     }
 
     fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
+        let scale: TensorView<f32> = ctx.inputs().require_as(4)?;
+        let scale = OutputScale::from_view(scale)?;
         let output: Tensor<i32> = self.matmul.run(ctx)?.remove(0).try_into().unwrap();
-        let scale = ctx.inputs().require_as(4)?;
         cast_scale(ctx.pool(), output, scale).into_op_result()
     }
 
@@ -694,183 +805,17 @@ impl Operator for MatMulIntegerToFloat {
     fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
         Some([OutputType::Fixed(ValueType::Tensor(DataType::Float))].into())
     }
-}
-
-fn matmul_nbits(
-    pool: &BufferPool,
-    lhs: TensorView<f32>,
-    rhs: NdTensorView<u8, 3>,
-    scales: NdTensorView<f32, 2>,
-    bits: u8,
-    accuracy: AccuracyLevel,
-) -> Result<Tensor<f32>, OpError> {
-    if lhs.ndim() < 2 {
-        return Err(OpError::InvalidValue("A input must have at least 2 dims"));
-    }
-
-    let batch_dims = &lhs.shape()[..lhs.ndim() - 2];
-    let rows = lhs.size(lhs.ndim() - 2);
-    let lhs_cols = lhs.size(lhs.ndim() - 1);
-
-    let rhs = rhs.to_contiguous_in(pool);
-    let scales = scales.to_contiguous_in(pool);
-
-    let b_mat = BlockQuantizedMatrix::new(rhs.view(), scales.view(), bits).map_err(|err| {
-        OpError::UnsupportedValue(match err {
-            BlockQuantizedError::UnsupportedBlockSize => "Unsupported K block size",
-            BlockQuantizedError::UnsupportedElementSize => "Unsupported bits-per-element",
-        })
-    })?;
-
-    let batch_len = batch_dims.iter().product();
-    let out_shape: SmallVec<[usize; 4]> = batch_dims
-        .iter()
-        .copied()
-        .chain([rows, b_mat.cols()])
-        .collect();
-    let out_len = out_shape.iter().product();
-    let mut out_data = pool.alloc(out_len);
-
-    if lhs_cols != b_mat.rows() {
-        return Err(OpError::IncompatibleInputShapes(
-            "Columns of first matrix does not match rows of second matrix",
-        ));
-    }
-
-    // For vector-matrix products use an optimized implementation. Otherwise use
-    // the standard GEMM implementation which handles block-quantized inputs via
-    // a custom packing function, but otherwise uses the same logic as for
-    // regular matmuls.
-    if rows == 1 {
-        let compute = match accuracy {
-            AccuracyLevel::Int8 => ComputeMode::Int8,
-            AccuracyLevel::Float => ComputeMode::Float,
-        };
-        let gemm = if BlockQuantizedGemm::is_compute_optimized(compute) {
-            BlockQuantizedGemm::new().with_compute(compute)
-        } else {
-            BlockQuantizedGemm::new()
-        };
-
-        let lhs = lhs
-            .reshaped_in(pool, [batch_len, rows, lhs_cols])
-            .auto_return(pool);
-        out_data.extend_init(|uninit_out_data| {
-            gemm.batched_gemm_uninit(&mut uninit_out_data[..out_len], lhs.view(), b_mat)
-                .unwrap()
-        });
-    } else {
-        let lhs = lhs
-            .reshaped_in(pool, [batch_len * rows, lhs_cols])
-            .auto_return(pool);
-
-        let gemm = GemmExecutor::default();
-        out_data.extend_init(|uninit_out_data| {
-            gemm.gemm_uninit(
-                &mut uninit_out_data[..out_len],
-                GemmInputA::Unpacked(lhs.view()),
-                GemmInputB::BlockQuantized(b_mat),
-                GemmUninitOptions::default(),
-            )
-            .unwrap()
-        });
-    }
-
-    Ok(Tensor::from_data(out_shape.as_slice(), out_data))
-}
-
-/// Specifies whether the LHS input may be quantized.
-///
-/// Using [`Int8`](Self::Int8) quantization can significantly improve
-/// performance but may reduce accuracy. The accuracy level that is used may
-/// be higher than requested if an optimized implementation of the requested
-/// level is not available on the current platform.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum AccuracyLevel {
-    /// Do not quantize the LHS input.
-    Float,
-    /// Quantize the LHS to 8-bit integers using blockwise quantization with
-    /// the same quantization as the RHS.
-    Int8,
-}
-
-/// Matrix multiplication of un-quantized LHS by block-quantized RHS.
-///
-/// See https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md#com.microsoft.MatMulNBits.
-#[derive(Debug)]
-pub struct MatMulNBits {
-    pub bits: u8,
-    pub block_size: usize,
-    pub accuracy_level: AccuracyLevel,
-}
-
-impl Operator for MatMulNBits {
-    fn name(&self) -> &str {
-        "MatMulNBits"
-    }
-
-    fn max_inputs(&self) -> Option<usize> {
-        Some(3)
-    }
-
-    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
-        let lhs: TensorView<f32> = ctx.inputs().require_as(0)?;
-        let rhs: NdTensorView<u8, 3> = ctx.inputs().require_as(1)?;
-
-        // Current spec requires scales to be 2D, but earlier versions used 1D
-        // scales. See https://github.com/microsoft/onnxruntime/pull/24828.
-        let scales: TensorView<f32> = ctx.inputs().require_as(2)?;
-
-        let scales: CowNdTensor<f32, 2> = match scales.ndim() {
-            2 => scales
-                .to_contiguous_in(ctx.pool())
-                .into_inner()
-                .try_into()
-                .unwrap(),
-            1 => {
-                let k = lhs.ndim().checked_sub(1).map(|d| lhs.size(d)).unwrap_or(1);
-                let k_blocks = k.checked_div(self.block_size).unwrap_or(0);
-                let rhs_cols = rhs.size(0);
-
-                if scales.len() != rhs_cols * k_blocks {
-                    return Err(OpError::InvalidValue(
-                        "Expected 1D `scales` size to match columns * block_size",
-                    ));
-                }
-                scales.reshaped([rhs_cols, k_blocks])
-            }
-            _ => {
-                return Err(OpError::InvalidValue(
-                    "Expected `scales` to have one or two dims",
-                ));
-            }
-        };
-
-        if ctx.inputs().len() > 3 {
-            return Err(OpError::UnsupportedValue(
-                "zero_points, g_idx and bias inputs are unsupported",
-            ));
-        }
-
-        matmul_nbits(
-            ctx.pool(),
-            lhs,
-            rhs,
-            scales.view(),
-            self.bits,
-            self.accuracy_level,
-        )
-        .into_op_result()
-    }
-
-    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
-        Some([OutputType::Fixed(ValueType::Tensor(DataType::Float))].into())
-    }
 
     fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
-        Some(&shape_ops::MatMulNBits)
+        None
     }
 }
+
+#[cfg(feature = "contrib")]
+pub use contrib::{AccuracyLevel, MatMulNBits};
+
+#[cfg(feature = "contrib")]
+mod contrib;
 
 #[cfg(test)]
 mod tests {
@@ -878,23 +823,23 @@ mod tests {
 
     use rten_bench::run_bench;
     use rten_gemm::{
-        BiasVector, BlockQuantizedMatrix, GemmExecutor, GemmInT, GemmInputA, GemmInputB,
-        GemmOptions, GemmOutT, QuantParams,
+        BiasVector, GemmExecutor, GemmInT, GemmInputA, GemmInputB, GemmOptions, GemmOutT,
+        QuantParams, ReducedRangeRng,
     };
     use rten_tensor::prelude::*;
     use rten_tensor::rng::XorShiftRng;
-    use rten_tensor::test_util::{expect_equal, expect_equal_with_tolerance};
-    use rten_tensor::{NdTensor, NdTensorView, Tensor, TensorView};
+    use rten_tensor::test_util::expect_equal;
+    use rten_tensor::{NdTensorView, Tensor, TensorView};
     use rten_testing::TestCases;
 
     use crate::buffer_pool::AutoReturn;
     use crate::buffer_pool::BufferPool;
-    use crate::operator::{InputList, Operator, OperatorExt};
+    use crate::operator::{InputList, Operator, OutputMask};
     use crate::ops::binary_elementwise::broadcast_shapes;
 
     use super::{
-        AccuracyLevel, FusedMatMul, MatMul, MatMulInteger, MatMulNBits, MatmulStrategy, OpError,
-        OpRunContext, cast_scale, gemm, matmul, matmul_fused, matmul_impl, matmul_integer,
+        FusedMatMul, MatMul, MatMulInteger, MatmulStrategy, OpError, OpRunContext, OutputScale,
+        cast_scale, gemm, matmul, matmul_fused, matmul_impl, matmul_integer,
     };
 
     fn gemm_tensors(c: &mut Tensor, a: &Tensor, b: &Tensor, alpha: f32, beta: f32) {
@@ -1006,22 +951,27 @@ mod tests {
     #[test]
     fn test_cast_scale() {
         #[derive(Debug)]
-        struct Case {
+        struct Case<'a> {
             input: Tensor<i32>,
-            scales: NdTensor<f32, 1>,
+            scales: OutputScale<'a>,
             expected: Result<Tensor<f32>, OpError>,
         }
 
         let cases = [
             Case {
                 input: [[1, 2], [3, 4]].into(),
-                scales: [2., 3.].into(),
+                scales: OutputScale::Vector(NdTensorView::from(&[2., 3.])),
                 expected: Ok([[2., 6.], [6., 12.]].into()),
             },
             Case {
                 input: [[1, 2], [3, 4]].into(),
-                scales: [2., 3., 4.].into(),
-                expected: Err(OpError::IncompatibleInputShapes(
+                scales: OutputScale::Scalar(2.),
+                expected: Ok([[2., 4.], [6., 8.]].into()),
+            },
+            Case {
+                input: [[1, 2], [3, 4]].into(),
+                scales: OutputScale::Vector(NdTensorView::from(&[2., 3., 4.])),
+                expected: Err(OpError::incompatible_input_shapes(
                     "Scale length does not match tensor columns",
                 )),
             },
@@ -1029,7 +979,7 @@ mod tests {
 
         cases.test_each(|case| {
             let pool = BufferPool::new();
-            let result = cast_scale(&pool, case.input.clone(), case.scales.view());
+            let result = cast_scale(&pool, case.input.clone(), case.scales.clone());
             assert_eq!(result, case.expected);
         });
     }
@@ -1125,7 +1075,7 @@ mod tests {
 
         assert_eq!(
             result.err(),
-            Some(OpError::IncompatibleInputShapes(
+            Some(OpError::incompatible_input_shapes(
                 "Cannot broadcast c to output shape"
             ))
         );
@@ -1137,7 +1087,7 @@ mod tests {
 
         assert_eq!(
             result.err(),
-            Some(OpError::IncompatibleInputShapes(
+            Some(OpError::incompatible_input_shapes(
                 "Columns of first matrix does not match rows of second matrix",
             ))
         );
@@ -1279,7 +1229,7 @@ mod tests {
                 inputs.push(bias.view());
             }
 
-            let ctx = OpRunContext::new(&pool, &inputs);
+            let ctx = OpRunContext::new(&pool, &inputs, OutputMask::all_used(1));
             let mut result = op.run(&ctx).unwrap();
             let result: Tensor<f32> = result.remove(0).try_into().unwrap();
 
@@ -1344,24 +1294,24 @@ mod tests {
             Case {
                 a_shape: &[],
                 b_shape: &[10, 8],
-                error: OpError::InvalidValue("Inputs must have >= 1 dimensions"),
+                error: OpError::invalid_value("Inputs must have >= 1 dimensions"),
             },
             Case {
                 a_shape: &[3, 10],
                 b_shape: &[],
-                error: OpError::InvalidValue("Inputs must have >= 1 dimensions"),
+                error: OpError::invalid_value("Inputs must have >= 1 dimensions"),
             },
             Case {
                 a_shape: &[3, 10],
                 b_shape: &[11, 8],
-                error: OpError::IncompatibleInputShapes(
+                error: OpError::incompatible_input_shapes(
                     "Columns of first matrix does not match rows of second matrix",
                 ),
             },
             Case {
                 a_shape: &[2, 3, 10],
                 b_shape: &[3, 10, 8],
-                error: OpError::IncompatibleInputShapes("Cannot broadcast shapes"),
+                error: OpError::incompatible_input_shapes("Cannot broadcast shapes"),
             },
         ];
 
@@ -1486,7 +1436,7 @@ mod tests {
                 b: Tensor::from([[5, 6], [7, 8]]),
                 a_zero_point: Some(Tensor::from([1, 2, 4])),
                 b_zero_point: Some(Tensor::from([3, 4])),
-                expected_err: Some(OpError::InvalidValue("Zero point has incorrect size")),
+                expected_err: Some(OpError::invalid_value("Zero point has incorrect size")),
             },
             // Non-scalar zero points
             Case {
@@ -1494,7 +1444,7 @@ mod tests {
                 b: Tensor::from([[2, 2], [2, 2]]),
                 a_zero_point: Some(Tensor::from([[2, 2], [2, 2]])),
                 b_zero_point: None,
-                expected_err: Some(OpError::UnsupportedValue(
+                expected_err: Some(OpError::unsupported_value(
                     "Only scalar or vector zero points are supported",
                 )),
             },
@@ -1503,7 +1453,7 @@ mod tests {
                 b: Tensor::from([[2, 2], [2, 2]]),
                 a_zero_point: None,
                 b_zero_point: Some(Tensor::from([[2, 2], [2, 2]])),
-                expected_err: Some(OpError::UnsupportedValue(
+                expected_err: Some(OpError::unsupported_value(
                     "Only scalar or vector zero points are supported",
                 )),
             },
@@ -1521,7 +1471,7 @@ mod tests {
                 b: Tensor::zeros(&[3, 1]),
                 a_zero_point: None,
                 b_zero_point: None,
-                expected_err: Some(OpError::IncompatibleInputShapes(
+                expected_err: Some(OpError::incompatible_input_shapes(
                     "Columns of first matrix does not match rows of second matrix",
                 )),
             },
@@ -1531,7 +1481,7 @@ mod tests {
                 b: Tensor::zeros(&[3, 1]),
                 a_zero_point: None,
                 b_zero_point: None,
-                expected_err: Some(OpError::InvalidValue("Inputs must have >= 1 dimensions")),
+                expected_err: Some(OpError::invalid_value("Inputs must have >= 1 dimensions")),
             },
             // RHS is a scalar
             Case {
@@ -1539,14 +1489,16 @@ mod tests {
                 b: Tensor::zeros(&[]),
                 a_zero_point: None,
                 b_zero_point: None,
-                expected_err: Some(OpError::InvalidValue("Inputs must have >= 1 dimensions")),
+                expected_err: Some(OpError::invalid_value("Inputs must have >= 1 dimensions")),
             },
             Case {
                 a: Tensor::zeros(&[2, 2, 2]),
                 b: Tensor::zeros(&[3, 2, 2]),
                 a_zero_point: None,
                 b_zero_point: None,
-                expected_err: Some(OpError::IncompatibleInputShapes("Cannot broadcast shapes")),
+                expected_err: Some(OpError::incompatible_input_shapes(
+                    "Cannot broadcast shapes",
+                )),
             },
         ];
 
@@ -1611,7 +1563,7 @@ mod tests {
         };
         let inputs =
             InputList::from(&[a.view().into(), b.view().into()]).with_prepacked(&get_prepacked);
-        let ctx = OpRunContext::new(&pool, &inputs);
+        let ctx = OpRunContext::new(&pool, &inputs, OutputMask::all_used(1));
         let mut result = op.run(&ctx).unwrap();
         let result: Tensor<i32> = result.remove(0).try_into().unwrap();
 
@@ -1620,182 +1572,185 @@ mod tests {
         Ok(())
     }
 
-    fn reference_matmul_nbits(
-        lhs: TensorView<f32>,
-        rhs: NdTensorView<u8, 3>,
-        scales: NdTensorView<f32, 2>,
-        n_bits: u8,
-    ) -> Tensor<f32> {
-        let batch_dims = &lhs.shape()[..lhs.ndim() - 2];
-        let batch_len: usize = batch_dims.iter().product();
-
-        let m = lhs.size(lhs.ndim() - 2);
-        let k = lhs.size(lhs.ndim() - 1);
-        let [n, _k_blocks, _block_size] = rhs.shape();
-
-        let rhs = rhs.to_contiguous();
-        let scales = scales.to_contiguous();
-        let bqm = BlockQuantizedMatrix::new(rhs.view(), scales.view(), n_bits).unwrap();
-
-        let out_shape: Vec<usize> = batch_dims.iter().copied().chain([m, n]).collect();
-        let mut out = Tensor::zeros(&out_shape);
-        let gemm = GemmExecutor::default();
-
-        gemm.gemm(
-            out.data_mut().unwrap(),
-            GemmInputA::Unpacked(lhs.reshaped([batch_len * m, k]).view()),
-            GemmInputB::BlockQuantized(bqm),
-            GemmOptions::default(),
-        )
-        .unwrap();
-
-        out
-    }
-
-    #[test]
-    fn test_matmul_nbits() {
-        #[derive(Clone, Debug)]
-        struct Case {
-            batch_dims: Vec<usize>,
-            m: usize,
-            accuracy_level: AccuracyLevel,
-            tolerance: Option<f32>,
+    /// Reference matmul that performs the integer multiply-add in `i32` and
+    /// supports any combination of input types where `i32: From<LhsT> +
+    /// From<RhsT>`. Used to validate the optimized [`matmul_integer`] for
+    /// type combinations that the underlying GEMM does not support directly.
+    fn reference_matmul_integer<LhsT, RhsT>(
+        mut a: TensorView<LhsT>,
+        mut b: TensorView<RhsT>,
+        a_zero: Option<TensorView<LhsT>>,
+        b_zero: Option<TensorView<RhsT>>,
+    ) -> Tensor<i32>
+    where
+        LhsT: Copy + Default,
+        RhsT: Copy + Default,
+        i32: From<LhsT> + From<RhsT>,
+    {
+        let a_is_vec = a.ndim() == 1;
+        if a_is_vec {
+            a.insert_axis(0);
+        }
+        let b_is_vec = b.ndim() == 1;
+        if b_is_vec {
+            b.insert_axis(1);
         }
 
-        let cases = [
-            // Vector-matrix product
-            Case {
-                batch_dims: [2].into(),
-                m: 1,
-                accuracy_level: AccuracyLevel::Float,
-                tolerance: None,
-            },
-            Case {
-                batch_dims: [2].into(),
-                m: 1,
-                accuracy_level: AccuracyLevel::Int8,
-                tolerance: Some(0.1),
-            },
-            // Matrix-matrix product
-            Case {
-                batch_dims: [2].into(),
-                m: 4,
-                accuracy_level: AccuracyLevel::Float,
-                tolerance: None,
-            },
-            Case {
-                batch_dims: [2].into(),
-                m: 4,
-                accuracy_level: AccuracyLevel::Int8,
-                // MatMulNBits currently falls back to float compute for
-                // matrix-matrix products, so no tolerance is required.
-                tolerance: None,
-            },
-            // Matrix-matrix product with 2 batch dims.
-            Case {
-                batch_dims: [2, 2].into(),
-                m: 4,
-                accuracy_level: AccuracyLevel::Float,
-                tolerance: None,
-            },
-            // Matrix-matrix product with 0 batch dims.
-            Case {
-                batch_dims: [].into(),
-                m: 4,
-                accuracy_level: AccuracyLevel::Float,
-                tolerance: None,
-            },
-        ];
+        let a_rows = a.size(a.ndim() - 2);
+        let a_cols = a.size(a.ndim() - 1);
+        let b_cols = b.size(b.ndim() - 1);
 
-        cases.test_each_clone(|case| {
-            let Case {
-                batch_dims,
-                m,
-                accuracy_level,
-                tolerance,
-            } = case;
+        let a_zero_v: Vec<i32> = a_zero
+            .map(|zp| {
+                zp.broadcast([a_rows])
+                    .iter()
+                    .map(|&v| i32::from(v))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![0; a_rows]);
+        let b_zero_v: Vec<i32> = b_zero
+            .map(|zp| {
+                zp.broadcast([b_cols])
+                    .iter()
+                    .map(|&v| i32::from(v))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![0; b_cols]);
 
-            let mut rng = XorShiftRng::new(1234);
+        let a_prefix = &a.shape()[..a.ndim() - 2];
+        let b_prefix = &b.shape()[..b.ndim() - 2];
+        let out_prefix = broadcast_shapes(a_prefix, b_prefix).unwrap();
+        let out_shape: Vec<usize> = out_prefix.iter().copied().chain([a_rows, b_cols]).collect();
+        let mut c = Tensor::<i32>::zeros(&out_shape);
 
-            let block_size = 16;
-            let block_bytes = block_size / 2;
-            let k = block_size * 2;
-            let n = 8;
-            let n_bits = 4;
+        let a_bcast: Vec<usize> = out_prefix.iter().copied().chain([a_rows, a_cols]).collect();
+        let b_bcast: Vec<usize> = out_prefix.iter().copied().chain([a_cols, b_cols]).collect();
 
-            let lhs_shape: Vec<usize> = batch_dims.iter().copied().chain([m, k]).collect();
-            let lhs = Tensor::rand(&lhs_shape, &mut rng);
-            let rhs = NdTensor::<u8, 3>::rand([n, k / block_size, block_bytes], &mut rng);
-            let scales = NdTensor::<f32, 2>::rand([n, k / block_size], &mut rng);
+        a.broadcast(a_bcast.as_slice())
+            .inner_iter::<2>()
+            .zip(b.broadcast(b_bcast.as_slice()).inner_iter::<2>())
+            .zip(c.inner_iter_mut::<2>())
+            .for_each(|((a_mat, b_mat), mut c_mat)| {
+                for i in 0..a_rows {
+                    for j in 0..b_cols {
+                        let mut acc = 0i32;
+                        for k in 0..a_cols {
+                            let av = i32::from(a_mat[[i, k]]) - a_zero_v[i];
+                            let bv = i32::from(b_mat[[k, j]]) - b_zero_v[j];
+                            acc += av * bv;
+                        }
+                        c_mat[[i, j]] = acc;
+                    }
+                }
+            });
 
-            // nb. Reference result is always computed in full precision.
-            let expected = reference_matmul_nbits(lhs.as_dyn(), rhs.view(), scales.view(), n_bits);
-
-            let op = MatMulNBits {
-                bits: n_bits,
-                block_size,
-                accuracy_level,
-            };
-
-            // With 2D scales.
-            let result: Tensor<f32> = op
-                .run_simple((lhs.view(), rhs.view(), scales.view()))
-                .unwrap();
-            if let Some(atol) = tolerance {
-                let rtol = 0.;
-                expect_equal_with_tolerance(&result, &expected, atol, rtol).unwrap();
-            } else {
-                expect_equal(&result, &expected).unwrap();
+        match (a_is_vec, b_is_vec) {
+            (true, false) => c.remove_axis(c.ndim() - 2),
+            (false, true) => c.remove_axis(c.ndim() - 1),
+            (true, true) => {
+                c.remove_axis(c.ndim() - 1);
+                c.remove_axis(c.ndim() - 1);
             }
-
-            // With 1D scales (older models)
-            let result: Tensor<f32> = op
-                .run_simple((
-                    lhs.view(),
-                    rhs.view(),
-                    scales.reshaped([scales.len()]).view(),
-                ))
-                .unwrap();
-            if let Some(atol) = tolerance {
-                let rtol = 0.;
-                expect_equal_with_tolerance(&result, &expected, atol, rtol).unwrap();
-            } else {
-                expect_equal(&result, &expected).unwrap();
-            }
-        });
-    }
-
-    #[test]
-    fn test_matmul_nbits_invalid() {
-        #[derive(Debug)]
-        struct Case {
-            lhs_shape: Vec<usize>,
-            rhs_shape: [usize; 3],
-            scales_shape: Vec<usize>,
-            expected: OpError,
+            (false, false) => {}
         }
 
-        let cases = [Case {
-            lhs_shape: [1].into(),
-            rhs_shape: [1, 1, 16],
-            scales_shape: [1, 1].into(),
-            expected: OpError::InvalidValue("A input must have at least 2 dims"),
-        }];
-
-        cases.test_each(|case| {
-            let op = MatMulNBits {
-                bits: 4,
-                block_size: 32,
-                accuracy_level: AccuracyLevel::Float,
-            };
-            let lhs = Tensor::<f32>::zeros(&case.lhs_shape);
-            let rhs = Tensor::<u8>::zeros(&case.rhs_shape);
-            let scales = Tensor::<f32>::zeros(&case.scales_shape);
-            let result: Result<Tensor<f32>, _> =
-                op.run_simple((lhs.view(), rhs.view(), scales.view()));
-            assert_eq!(result.err().unwrap(), case.expected);
-        });
+        c
     }
+
+    macro_rules! impl_matmul_integer_test {
+        ($name:ident, $lhs_ty:ty, $rhs_ty:ty) => {
+            #[test]
+            fn $name() {
+                // The LHS becomes the `u8` operand of the underlying `u8 x i8
+                // -> i32` GEMM after shift casting. To avoid `i16` saturation
+                // hazards on x64 platforms without VNNI, we restrict it to the
+                // u7/i7 safe range.
+                let mut a_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
+                let mut b_rng = XorShiftRng::new(5678);
+
+                #[derive(Debug)]
+                struct Case {
+                    a: Tensor<$lhs_ty>,
+                    b: Tensor<$rhs_ty>,
+                    a_zero_point: Option<Tensor<$lhs_ty>>,
+                    b_zero_point: Option<Tensor<$rhs_ty>>,
+                }
+
+                let cases = [
+                    // No zero points.
+                    Case {
+                        a: Tensor::rand(&[3, 4], &mut a_rng),
+                        b: Tensor::rand(&[4, 5], &mut b_rng),
+                        a_zero_point: None,
+                        b_zero_point: None,
+                    },
+                    // Scalar zero points.
+                    Case {
+                        a: Tensor::rand(&[3, 4], &mut a_rng),
+                        b: Tensor::rand(&[4, 5], &mut b_rng),
+                        a_zero_point: Some(Tensor::from(2 as $lhs_ty)),
+                        b_zero_point: Some(Tensor::from(3 as $rhs_ty)),
+                    },
+                    // Vector zero points.
+                    Case {
+                        a: Tensor::rand(&[3, 4], &mut a_rng),
+                        b: Tensor::rand(&[4, 5], &mut b_rng),
+                        a_zero_point: Some(Tensor::from([1 as $lhs_ty, 2, 3])),
+                        b_zero_point: Some(Tensor::from([1 as $rhs_ty, 2, 3, 4, 5])),
+                    },
+                    // Batched LHS with vector zero points.
+                    Case {
+                        a: Tensor::rand(&[2, 3, 4], &mut a_rng),
+                        b: Tensor::rand(&[4, 5], &mut b_rng),
+                        a_zero_point: Some(Tensor::from([1 as $lhs_ty, 2, 3])),
+                        b_zero_point: Some(Tensor::from([1 as $rhs_ty, 2, 3, 4, 5])),
+                    },
+                    // Vector LHS.
+                    Case {
+                        a: Tensor::rand(&[4], &mut a_rng),
+                        b: Tensor::rand(&[4, 5], &mut b_rng),
+                        a_zero_point: Some(Tensor::from([1 as $lhs_ty])),
+                        b_zero_point: Some(Tensor::from([1 as $rhs_ty, 2, 3, 4, 5])),
+                    },
+                    // Vector RHS.
+                    Case {
+                        a: Tensor::rand(&[3, 4], &mut a_rng),
+                        b: Tensor::rand(&[4], &mut b_rng),
+                        a_zero_point: Some(Tensor::from([1 as $lhs_ty, 2, 3])),
+                        b_zero_point: Some(Tensor::from([1 as $rhs_ty])),
+                    },
+                ];
+
+                cases.test_each(|case| {
+                    let pool = BufferPool::new();
+                    let result = matmul_integer(
+                        &pool,
+                        case.a.view(),
+                        case.b.view(),
+                        case.a_zero_point.as_ref().map(|t| t.view()),
+                        case.b_zero_point.as_ref().map(|t| t.view()),
+                        None,
+                    )
+                    .expect("matmul_integer failed");
+
+                    let expected = reference_matmul_integer(
+                        case.a.view(),
+                        case.b.view(),
+                        case.a_zero_point.as_ref().map(|t| t.view()),
+                        case.b_zero_point.as_ref().map(|t| t.view()),
+                    );
+
+                    assert_eq!(result, expected);
+                });
+            }
+        };
+    }
+
+    // Test all the i8/u8 combinations for inputs.
+    impl_matmul_integer_test!(test_matmul_integer_u8_i8, u8, i8);
+    impl_matmul_integer_test!(test_matmul_integer_u8_u8, u8, u8);
+    impl_matmul_integer_test!(test_matmul_integer_i8_u8, i8, u8);
+    impl_matmul_integer_test!(test_matmul_integer_i8_i8, i8, i8);
 
     #[test]
     #[ignore]
