@@ -1,8 +1,8 @@
 use std::ops::Deref;
 
 use crate::layout::FromShape;
-use crate::storage::{CowData, ViewData};
-use crate::{AsView, Layout, Storage, TensorBase};
+use crate::storage::{Alloc, CowData, Storage, StorageMut, ViewData};
+use crate::{AsView, Layout, TensorBase};
 
 /// A tensor wrapper which guarantees that the tensor has a contiguous layout.
 ///
@@ -26,7 +26,7 @@ impl<T> Contiguous<T> {
     }
 }
 
-impl<S: Storage, L: Layout> Contiguous<TensorBase<S, L>> {
+impl<S: Storage, L: Clone + Layout> Contiguous<TensorBase<S, L>> {
     /// Wrap a tensor if it is contiguous, or return `None` if the tensor has
     /// a non-contiguous layout.
     pub fn new(inner: TensorBase<S, L>) -> Option<Self> {
@@ -49,6 +49,21 @@ impl<S: Storage, L: Layout> Contiguous<TensorBase<S, L>> {
         unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 
+    /// Return the tensor's underlying data as a slice.
+    ///
+    /// Unlike [`TensorBase::data_mut`] this returns a slice instead of an
+    /// option because the tensor is known to be contiguous.
+    pub fn data_mut(&mut self) -> &mut [S::Elem]
+    where
+        S: StorageMut,
+    {
+        let len = self.0.len();
+        let ptr = self.0.data_ptr_mut();
+
+        // Safety: Constructor verified that tensor is contiguous.
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+    }
+
     /// Return a contiguous view of this tensor.
     pub fn view(&self) -> Contiguous<TensorBase<ViewData<'_, S::Elem>, L>>
     where
@@ -63,12 +78,12 @@ impl<T, L: Clone + Layout> Contiguous<TensorBase<Vec<T>, L>> {
     ///
     /// This is cheap if `inner` is already contiguous, otherwise the elements
     /// are copied into a new buffer.
-    pub fn from_owned(mut inner: TensorBase<Vec<T>, L>) -> Self
+    pub fn from_owned<A: Alloc>(mut inner: TensorBase<Vec<T>, L>, alloc: A) -> Self
     where
         L: FromShape,
         T: Clone,
     {
-        inner.make_contiguous();
+        inner.make_contiguous_in(alloc);
         Self(inner)
     }
 
@@ -112,5 +127,19 @@ mod tests {
         let tensor = NdTensor::<f32, 2>::zeros([3, 4]);
         let wrapped = Contiguous::new(tensor).unwrap();
         assert_eq!(wrapped.view().shape(), [3, 4]);
+    }
+
+    #[test]
+    fn test_contiguous_data() {
+        let tensor = NdTensor::<f32, 2>::from([[1., 2.], [3., 4.]]);
+        let wrapped = Contiguous::new(tensor).unwrap();
+        assert_eq!(wrapped.data(), &[1., 2., 3., 4.]);
+    }
+
+    #[test]
+    fn test_contiguous_data_mut() {
+        let tensor = NdTensor::<f32, 2>::from([[1., 2.], [3., 4.]]);
+        let mut wrapped = Contiguous::new(tensor).unwrap();
+        assert_eq!(wrapped.data_mut(), &[1., 2., 3., 4.]);
     }
 }

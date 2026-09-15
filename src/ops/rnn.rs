@@ -1,19 +1,21 @@
 use std::iter::Rev;
+use std::mem::MaybeUninit;
 use std::ops::Range;
 
-use rten_gemm::{GemmExecutor, GemmInputA, GemmInputB, GemmOptions};
+use rayon::prelude::*;
+use rten_gemm::{BiasVector, GemmExecutor, GemmInputA, GemmInputB, GemmOptions, GemmUninitOptions};
 use rten_shape_inference::ops as shape_ops;
+use rten_simd::SimdUnaryOp;
 use rten_tensor::prelude::*;
-use rten_tensor::{NdTensor, Tensor, TensorView};
+use rten_tensor::{NdTensor, NdTensorView, NdTensorViewMut, Tensor, TensorView};
+use rten_vecmath as vecmath;
 
 use crate::buffer_pool::{AutoReturn, BufferPool};
 use crate::infer_shapes::{InferShapes, impl_infer_shapes};
 use crate::operator::{
     IntoOpResult, OpError, OpRunContext, Operator, OutputList, OutputType, OutputTypeList,
-    OutputTypesContext, static_dims,
+    OutputTypesContext, check_eq,
 };
-use crate::ops::binary_elementwise::{add_in_place, mul_in_place};
-use crate::ops::unary_elementwise::{sigmoid, tanh};
 use crate::value::{DataType, ValueType};
 
 /// Direction that an RNN operator will traverse the input sequence in.
@@ -78,21 +80,54 @@ fn sequence_for_dir(op_dirs: Direction, dir: usize, seq_len: usize) -> Sequence 
 
 /// Like [`std::iter::zip`], but combines 3 iterators.
 fn zip3<T1, T2, T3>(
-    a: impl Iterator<Item = T1>,
-    b: impl Iterator<Item = T2>,
-    c: impl Iterator<Item = T3>,
+    a: impl IntoIterator<Item = T1>,
+    b: impl IntoIterator<Item = T2>,
+    c: impl IntoIterator<Item = T3>,
 ) -> impl Iterator<Item = (T1, T2, T3)> {
-    a.zip(b.zip(c)).map(|(a, (b, c))| (a, b, c))
+    a.into_iter()
+        .zip(b.into_iter().zip(c))
+        .map(|(a, (b, c))| (a, b, c))
 }
 
 /// Like [`std::iter::zip`], but combines 4 iterators.
 fn zip4<T1, T2, T3, T4>(
-    a: impl Iterator<Item = T1>,
-    b: impl Iterator<Item = T2>,
-    c: impl Iterator<Item = T3>,
-    d: impl Iterator<Item = T4>,
+    a: impl IntoIterator<Item = T1>,
+    b: impl IntoIterator<Item = T2>,
+    c: impl IntoIterator<Item = T3>,
+    d: impl IntoIterator<Item = T4>,
 ) -> impl Iterator<Item = (T1, T2, T3, T4)> {
-    zip3(a, b, c.zip(d)).map(|(a, b, (c, d))| (a, b, c, d))
+    zip3(a, b, c.into_iter().zip(d)).map(|(a, b, (c, d))| (a, b, c, d))
+}
+
+/// Compute the input projection `input @ input_weights + input_bias` for every
+/// gate and timestep in a single GEMM.
+///
+/// `input_mat` has shape `[seq_len * batch, input_size]` and `input_weights`
+/// has shape `[input_size, n_gates * hidden_size]`. The result has shape
+/// `[seq_len, batch, n_gates * hidden_size]`.
+fn input_projection(
+    pool: &BufferPool,
+    gemm: &GemmExecutor,
+    input_mat: NdTensorView<f32, 2>,
+    input_weights: NdTensorView<f32, 2>,
+    input_bias: Option<&[f32]>,
+    seq_len: usize,
+    batch: usize,
+) -> NdTensor<f32, 3> {
+    let mut output = NdTensor::uninit_in(pool, [seq_len, batch, input_weights.size(1)]);
+    gemm.gemm_uninit(
+        output.data_mut().unwrap(),
+        GemmInputA::Unpacked(input_mat),
+        GemmInputB::Unpacked(input_weights),
+        GemmUninitOptions {
+            bias: input_bias.map(BiasVector::Row),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Safety: `gemm_uninit` initialized every element of `output`.
+    unsafe { output.assume_init() }
 }
 
 /// Sequence length threshold for prepacking weights.
@@ -103,20 +138,6 @@ fn zip4<T1, T2, T3, T4>(
 ///
 /// TODO: This value was chosen because it seemed reasonable. It needs tuning.
 const PREPACK_MIN_SEQ_LEN: usize = 5;
-
-/// Gated Recurrent Unit operator.
-#[derive(Debug)]
-#[allow(clippy::upper_case_acronyms)]
-pub struct GRU {
-    pub direction: Direction,
-
-    #[allow(unused)] // Currently inferred from operator inputs.
-    pub hidden_size: usize,
-
-    /// When computing the output of the hidden gate, apply the linear
-    /// transformation before multiplying by the output of the reset gate.
-    pub linear_before_reset: bool,
-}
 
 /// Compute the output for a single GRU layer.
 ///
@@ -138,11 +159,11 @@ pub struct GRU {
 pub fn gru(
     pool: &BufferPool,
     direction: Direction,
-    input: TensorView,
-    weights: TensorView,
-    recurrent_weights: TensorView,
-    bias: Option<TensorView>,
-    initial_hidden: Option<TensorView>,
+    input: NdTensorView<f32, 3>,
+    weights: NdTensorView<f32, 3>,
+    recurrent_weights: NdTensorView<f32, 3>,
+    bias: Option<NdTensorView<f32, 2>>,
+    initial_hidden: Option<NdTensorView<f32, 3>>,
     linear_before_reset: bool,
 ) -> Result<Vec<Tensor>, OpError> {
     // PyTorch and cuDNN only support the `linear_before_reset=true` case, as
@@ -157,174 +178,206 @@ pub fn gru(
         ));
     }
 
-    let input = static_dims!(input, 3, "seq, batch, input")?;
-    let weights = static_dims!(weights, 3, "dir, hidden x 3, input")?;
-    let recurrent_weights = static_dims!(recurrent_weights, 3)?;
-    let bias = bias
-        .map(|bias| static_dims!(bias, 2, "dir, hidden x 6"))
-        .transpose()?;
+    let [seq_len, batch, input_size] = input.shape();
 
-    let [seq_len, batch, _input_size] = input.shape();
-    let [_directions, hidden_x3, _input_size] = weights.shape();
-
-    let initial_hidden = initial_hidden
-        .map(|initial_hidden| static_dims!(initial_hidden, 3))
-        .transpose()?;
-
-    let num_directions = direction.num_directions();
+    let hidden_x3 = weights.size(1);
+    if !hidden_x3.is_multiple_of(3) {
+        return Err(OpError::invalid_value(
+            "weights dim 1 must be 3 * hidden_size",
+        ));
+    }
     let hidden_size = hidden_x3 / 3;
+    let num_directions = direction.num_directions();
+
+    check_eq!(
+        weights.shape(),
+        [num_directions, hidden_size * 3, input_size]
+    )?;
+    check_eq!(
+        recurrent_weights.shape(),
+        [num_directions, hidden_size * 3, hidden_size]
+    )?;
+
+    if let Some(bias) = bias.as_ref() {
+        check_eq!(bias.shape(), [num_directions, hidden_size * 6])?;
+    }
+
+    if let Some(initial_hidden) = initial_hidden.as_ref() {
+        check_eq!(initial_hidden.shape(), [num_directions, batch, hidden_size])?;
+    }
+
+    let input_mat = input
+        .reshaped_in(pool, [seq_len * batch, input_size])
+        .auto_return(pool);
+    // Contiguous bias needed so per-gate slices can be passed to GEMM.
+    let bias = bias.map(|b| b.to_contiguous());
 
     let mut hidden = initial_hidden
         .map(|t| t.to_tensor_in(pool))
         .unwrap_or_else(|| NdTensor::zeros_in(pool, [num_directions, batch, hidden_size]));
-    let mut hidden_seq = NdTensor::zeros_in(pool, [seq_len, num_directions, batch, hidden_size]);
-
-    // Indices of gates in the concatenated weight and bias tensors.
-    const UPDATE_GATE: usize = 0;
-    const RESET_GATE: usize = 1;
-    const HIDDEN_GATE: usize = 2;
-
-    let n_gates = 3;
-    let mut gates = NdTensor::zeros_in(pool, [batch, n_gates * hidden_size]).auto_return(pool);
-    let gate_range = |gate| (gate * hidden_size)..((gate + 1) * hidden_size);
-
-    // Scratch space for output of `hidden_state @ hidden_weights` matmul.
-    let mut hidden_scratch =
-        NdTensor::zeros_in(pool, [batch, n_gates * hidden_size]).auto_return(pool);
+    let mut hidden_seq = NdTensor::uninit_in(pool, [seq_len, num_directions, batch, hidden_size]);
 
     let gemm = GemmExecutor::new();
-    for dir in 0..num_directions {
-        let prepack = seq_len >= PREPACK_MIN_SEQ_LEN;
 
-        let input_weights = weights.slice(dir).transposed();
-        let packed_input_weights =
-            prepack.then(|| gemm.prepack_b_in(pool, input_weights).auto_return(pool));
-        let input_weights = packed_input_weights
-            .as_ref()
-            .map(|packed| GemmInputB::Packed(packed))
-            .unwrap_or(GemmInputB::Unpacked(input_weights));
+    // From the ONNX spec, the intermediate values are computed as:
+    //
+    //   zt = f(Xt*(Wz^T) + Ht-1*(Rz^T) + Wbz + Rbz)
+    //   rt = f(Xt*(Wr^T) + Ht-1*(Rr^T) + Wbr + Rbr)
+    //
+    //   If `linear_before_reset` is true:
+    //     ht = tanh(dot(input, hidden_w) + rt * (dot(hidden, rec_hidden_w) + rec_hidden_bias) + hidden_bias)
+    //   Else:
+    //     ht = tanh(dot(input, hidden_w) + dot((rt * hidden), rec_hidden_w) + rec_hidden_bias + hidden_bias)
+    //
+    //   Ht = (1 - zt) (.) ht + zt (.) (Ht-1)
+    //
+    // Where:
+    //
+    //  - `zt`, `rt` and `ht` are the update, reset and hidden gates
+    //  - `Xt`, `Ht` are the input and hidden states at time `t`
+    //  - `W{z,r,h}` and `R{z,r,h}` are the input and recurrent weights
+    //  - `Wb{z,r,h}` and `Rb{z,r,h}` are the input and recurrent biases
+    //  - `f` and `g` are activations. f=sigmoid, g=tanh
+    //
+    // In the `linear_before_reset=true` case, which is all we currently
+    // support, the matrix multiplications for all gates can be combined into
+    // two: one for `input @ input_weights`, one for `hidden @ hidden_weights`.
 
-        let hidden_weights = recurrent_weights.slice(dir).transposed();
-        let packed_hidden_weights =
-            prepack.then(|| gemm.prepack_b_in(pool, hidden_weights).auto_return(pool));
-        let hidden_weights = packed_hidden_weights
-            .as_ref()
-            .map(|packed| GemmInputB::Packed(packed))
-            .unwrap_or(GemmInputB::Unpacked(hidden_weights));
+    hidden
+        .axis_iter_mut(0)
+        .into_par_iter()
+        .zip(hidden_seq.axis_iter_mut(1))
+        .enumerate()
+        .for_each(|(dir, (mut hidden, mut hidden_seq))| {
+            let n_gates = 3;
+            let input_bias = bias
+                .as_ref()
+                .map(|b| b.slice((dir, ..(n_gates * hidden_size))).data().unwrap());
 
-        let input_bias = bias
-            .as_ref()
-            .map(|b| b.slice((dir, ..(n_gates * hidden_size))));
-        let hidden_bias = bias
-            .as_ref()
-            .map(|b| b.slice((dir, (n_gates * hidden_size)..)));
-
-        for seq in sequence_for_dir(direction, dir, seq_len) {
-            let in_item = input.slice([seq]);
-            let hidden_item = hidden.slice([dir]);
-
-            // From the ONNX spec, the intermediate values are computed as:
-            //
-            //   zt = f(Xt*(Wz^T) + Ht-1*(Rz^T) + Wbz + Rbz)
-            //   rt = f(Xt*(Wr^T) + Ht-1*(Rr^T) + Wbr + Rbr)
-            //
-            //   If `linear_before_reset` is true:
-            //     ht = tanh(dot(input, hidden_w) + rt * (dot(hidden, rec_hidden_w) + rec_hidden_bias) + hidden_bias)
-            //   Else:
-            //     ht = tanh(dot(input, hidden_w) + dot((rt * hidden), rec_hidden_w) + rec_hidden_bias + hidden_bias)
-            //
-            //   Ht = (1 - zt) (.) ht + zt (.) (Ht-1)
-            //
-            // Where:
-            //
-            //  - `zt`, `rt` and `ht` are the update, reset and hidden gates
-            //  - `Xt`, `Ht` are the input and hidden states at time `t`
-            //  - `W{z,r,h}` and `R{z,r,h}` are the input and recurrent weights
-            //  - `Wb{z,r,h}` and `Rb{z,r,h}` are the input and recurrent biases
-            //  - `f` and `g` are activations. f=sigmoid, g=tanh
-            //
-            // In the `linear_before_reset=true` case, which is all we currently
-            // support, the matrix multiplications for all gates can be
-            // combined into two: one for `input @ input_weights`, one for
-            // `hidden @ hidden_weights`.
-
-            // Compute `input @ weights + bias` for all gates.
-            gemm.gemm(
-                gates.data_mut().expect("expected contiguous input"),
-                GemmInputA::Unpacked(in_item),
-                input_weights,
-                GemmOptions::default(),
+            // Compute input projection for all timesteps at once.
+            let mut input_proj = input_projection(
+                pool,
+                &gemm,
+                input_mat.view(),
+                weights.slice(dir).transposed(),
+                input_bias,
+                seq_len,
+                batch,
             )
-            .unwrap();
-            if let Some(input_bias) = input_bias {
-                add_in_place(gates.as_dyn_mut(), input_bias.as_dyn());
+            .auto_return(pool);
+
+            let prepack = seq_len >= PREPACK_MIN_SEQ_LEN;
+            let hidden_weights = recurrent_weights.slice(dir).transposed();
+            let packed_hidden_weights =
+                prepack.then(|| gemm.prepack_b_in(pool, hidden_weights).auto_return(pool));
+            let hidden_weights = packed_hidden_weights
+                .as_ref()
+                .map(|packed| GemmInputB::Packed(packed))
+                .unwrap_or(GemmInputB::Unpacked(hidden_weights));
+
+            // Scratch space for output of `hidden_state @ hidden_weights` matmul.
+            let mut hidden_scratch =
+                NdTensor::zeros_in(pool, [batch, n_gates * hidden_size]).auto_return(pool);
+            let hidden_bias = bias
+                .as_ref()
+                .map(|b| b.slice((dir, (n_gates * hidden_size)..)).data().unwrap());
+
+            for seq in sequence_for_dir(direction, dir, seq_len) {
+                // Compute `hidden @ hidden_weights + hidden_bias` for all gates.
+                gemm.gemm(
+                    hidden_scratch.data_mut().unwrap(),
+                    GemmInputA::Unpacked(hidden.view()),
+                    hidden_weights,
+                    GemmOptions {
+                        bias: hidden_bias.map(BiasVector::Row),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+                let gates = input_proj.slice_mut([seq]);
+                let hidden_seq = hidden_seq.slice_mut([seq]);
+                gru_step(
+                    hidden_size,
+                    gates,
+                    hidden_scratch.view(),
+                    hidden.view_mut(),
+                    hidden_seq,
+                );
             }
+        });
 
-            // Compute `hidden @ hidden_weights + hidden_bias` for all gates.
-            gemm.gemm(
-                hidden_scratch.data_mut().unwrap(),
-                GemmInputA::Unpacked(hidden_item),
-                hidden_weights,
-                GemmOptions::default(),
-            )
-            .unwrap();
-            if let Some(hidden_bias) = hidden_bias {
-                add_in_place(hidden_scratch.as_dyn_mut(), hidden_bias.as_dyn());
-            }
-
-            // Combine inputs for reset and update gates and apply activation.
-            let mut update_reset_gates = gates.slice_mut((
-                ..,
-                gate_range(UPDATE_GATE).start..gate_range(RESET_GATE).end,
-            ));
-            let hidden_scratch_reset_update_gates = hidden_scratch.slice((
-                ..,
-                gate_range(UPDATE_GATE).start..gate_range(RESET_GATE).end,
-            ));
-            add_in_place(
-                update_reset_gates.as_dyn_mut(),
-                hidden_scratch_reset_update_gates.as_dyn(),
-            );
-
-            // Copy gates before applying activation because `sigmoid_in_place`
-            // and `tanh_in_place` are slow with non-contiguous tensors, and
-            // `update_reset_gates` will be non-contiguous if the batch size is
-            // > 1. See https://github.com/robertknight/rten/issues/192.
-            //
-            // Note `gate_range` can be still used because the update and reset
-            // gates are in the same positions in the `update_reset_gates` slice
-            // as `gates`.
-            let update_reset_gates = sigmoid(pool, update_reset_gates.as_dyn()).auto_return(pool);
-            let update_reset_gates = update_reset_gates.nd_view::<2>();
-            let update_gate = update_reset_gates.slice((.., gate_range(UPDATE_GATE)));
-            let reset_gate = update_reset_gates.slice((.., gate_range(RESET_GATE)));
-
-            // Combine inputs for hidden gate and apply activation.
-            let mut hidden_gate_recurrent = hidden_scratch.slice_mut((.., gate_range(HIDDEN_GATE)));
-            mul_in_place(hidden_gate_recurrent.as_dyn_mut(), reset_gate.as_dyn());
-
-            let mut hidden_gate = gates.slice_mut((.., gate_range(HIDDEN_GATE)));
-            add_in_place(hidden_gate.as_dyn_mut(), hidden_gate_recurrent.as_dyn());
-
-            // See note above about `sigmoid_in_place`.
-            let hidden_gate = tanh(pool, hidden_gate.as_dyn()).auto_return(pool);
-
-            // Compute next hidden state
-            let mut hidden_item = hidden.slice_mut([dir]);
-
-            for (hidden, update, hidden_gate) in zip3(
-                hidden_item.iter_mut(),
-                update_gate.iter(),
-                hidden_gate.iter(),
-            ) {
-                *hidden = (1. - update) * hidden_gate + update * (*hidden);
-            }
-
-            hidden_seq.slice_mut([seq, dir]).copy_from(&hidden_item);
-        }
-    }
+    // Safety: The loop above wrote to every element of `hidden_seq`.
+    let hidden_seq = unsafe { hidden_seq.assume_init() };
 
     Ok([hidden_seq.into_dyn(), hidden.into_dyn()].into())
+}
+
+/// Compute one GRU timestep for a batch of inputs, updating the hidden state
+/// in place and writing a copy of the new hidden state to `out`.
+///
+/// `gates` has shape `[batch, 3 * hidden_size]` and contains the input
+/// projection `Xt @ W^T + Wb` for this timestep, with the update, reset and
+/// hidden gates concatenated along the last dimension. It is also used as
+/// scratch space. `hidden_scratch` has the same shape and contains the
+/// recurrent projection `Ht-1 @ R^T + Rb`. `hidden` and `out` have shape
+/// `[batch, hidden_size]`.
+///
+/// All inputs must be contiguous in the last dimension.
+fn gru_step(
+    hidden_size: usize,
+    mut gates: NdTensorViewMut<f32, 2>,
+    hidden_scratch: NdTensorView<f32, 2>,
+    mut hidden: NdTensorViewMut<f32, 2>,
+    mut out: NdTensorViewMut<MaybeUninit<f32>, 2>,
+) {
+    for (mut gates, scratch, mut hidden, mut out) in zip4(
+        gates.lanes_mut(1),
+        hidden_scratch.lanes(1),
+        hidden.lanes_mut(1),
+        out.lanes_mut(1),
+    ) {
+        // Inputs are expected to be contiguous in the last dimension.
+        let gates = gates.as_slice_mut().unwrap();
+        let scratch = scratch.as_slice().unwrap();
+        let hidden = hidden.as_slice_mut().unwrap();
+        let out = out.as_slice_mut().unwrap();
+
+        // zt = sigmoid(Xt*(Wz^T) + Wbz + Ht-1*(Rz^T) + Rbz), rt likewise.
+        let (update_reset, hidden_gate) = gates.split_at_mut(2 * hidden_size);
+        let (scratch_update_reset, scratch_hidden) = scratch.split_at(2 * hidden_size);
+        for (x, s) in update_reset.iter_mut().zip(scratch_update_reset) {
+            *x += s;
+        }
+        vecmath::Sigmoid {}.map_mut(update_reset);
+        let (update, reset) = update_reset.split_at(hidden_size);
+
+        // ht = tanh(Xt*(Wh^T) + Wbh + rt (.) (Ht-1*(Rh^T) + Rbh))
+        for (x, s, r) in zip3(hidden_gate.iter_mut(), scratch_hidden, reset) {
+            *x += r * s;
+        }
+        vecmath::Tanh {}.map_mut(hidden_gate);
+
+        // Ht = (1 - zt) (.) ht + zt (.) Ht-1
+        for (hidden, update, hidden_gate, out) in zip4(hidden, update, hidden_gate, out) {
+            *hidden = (1. - *update) * *hidden_gate + update * (*hidden);
+            out.write(*hidden);
+        }
+    }
+}
+
+/// Gated Recurrent Unit operator.
+#[derive(Debug)]
+#[allow(clippy::upper_case_acronyms)]
+pub struct GRU {
+    pub direction: Direction,
+
+    #[allow(unused)] // Currently inferred from operator inputs.
+    pub hidden_size: usize,
+
+    /// When computing the output of the hidden gate, apply the linear
+    /// transformation before multiplying by the output of the reset gate.
+    pub linear_before_reset: bool,
 }
 
 impl Operator for GRU {
@@ -382,16 +435,6 @@ impl_infer_shapes!(
     }
 );
 
-/// Long Short-Term Memory operator.
-#[derive(Debug)]
-#[allow(clippy::upper_case_acronyms)]
-pub struct LSTM {
-    pub direction: Direction,
-
-    #[allow(unused)]
-    pub hidden_size: usize, // Currently inferred from operator inputs.
-}
-
 /// Compute the output for a single LSTM layer.
 ///
 /// `input` has shape [sequence_length, batch, input_size].
@@ -413,57 +456,49 @@ pub struct LSTM {
 pub fn lstm(
     pool: &BufferPool,
     direction: Direction,
-    input: TensorView,
-    weights: TensorView,
-    recurrent_weights: TensorView,
-    bias: Option<TensorView>,
-    initial_hidden: Option<TensorView>,
-    initial_cell: Option<TensorView>,
+    input: NdTensorView<f32, 3>,
+    weights: NdTensorView<f32, 3>,
+    recurrent_weights: NdTensorView<f32, 3>,
+    bias: Option<NdTensorView<f32, 2>>,
+    initial_hidden: Option<NdTensorView<f32, 3>>,
+    initial_cell: Option<NdTensorView<f32, 3>>,
 ) -> Result<Vec<Tensor>, OpError> {
-    // TODO - Add validation of the sizes of individual dimensions in the inputs.
-    let input = static_dims!(input, 3, "seq, batch, input")?;
-    let [seq_len, batch, _input_size] = input.shape();
-
-    let weights = static_dims!(weights, 3, "dir, hidden x 4, input")?;
-    let [_directions, hidden_x4, _input_size] = weights.shape();
-
-    let recurrent_weights = static_dims!(recurrent_weights, 3, "dir, hidden x 4, hidden")?;
-
+    let [seq_len, batch, input_size] = input.shape();
     let num_directions = direction.num_directions();
-    let hidden_size = hidden_x4 / 4;
 
-    if weights.size(1) % 4 != 0 {
+    let hidden_x4 = weights.size(1);
+    if !hidden_x4.is_multiple_of(4) {
         return Err(OpError::invalid_value(
             "weights dim 1 must be 4 * hidden_size",
         ));
     }
+    let hidden_size = hidden_x4 / 4;
+    check_eq!(
+        weights.shape(),
+        [num_directions, hidden_size * 4, input_size]
+    )?;
+    check_eq!(
+        recurrent_weights.shape(),
+        [num_directions, hidden_size * 4, hidden_size]
+    )?;
 
-    let bias = bias.map(|bias| static_dims!(bias, 2)).transpose()?;
-    if let Some(bias) = bias.as_ref()
-        && bias.size(1) % 8 != 0
-    {
-        return Err(OpError::invalid_value("bias dim 1 must be 8 * hidden_size"));
+    if let Some(bias) = bias.as_ref() {
+        check_eq!(bias.shape(), [num_directions, hidden_size * 8])?;
     }
 
-    let initial_hidden = initial_hidden
-        .map(|initial_hidden| static_dims!(initial_hidden, 3))
-        .transpose()?;
-    let initial_cell = initial_cell
-        .map(|initial_cell| static_dims!(initial_cell, 3))
-        .transpose()?;
+    if let Some(initial_hidden) = initial_hidden.as_ref() {
+        check_eq!(initial_hidden.shape(), [num_directions, batch, hidden_size])?;
+    }
 
-    // Contiguous input and bias needed to allow reshaping below.
-    let input = input.to_contiguous_in(pool).auto_return(pool);
+    if let Some(initial_cell) = initial_cell.as_ref() {
+        check_eq!(initial_cell.shape(), [num_directions, batch, hidden_size])?;
+    }
+
+    let input_mat = input
+        .reshaped_in(pool, [seq_len * batch, input_size])
+        .auto_return(pool);
+    // Contiguous bias needed so per-gate slices can be passed to GEMM.
     let bias = bias.map(|t| t.to_contiguous());
-
-    // Indices of gates in the concatenated weight and bias tensors.
-    const INPUT_GATE: usize = 0;
-    const OUTPUT_GATE: usize = 1;
-    const FORGET_GATE: usize = 2;
-    const CELL_GATE: usize = 3;
-
-    let n_gates = 4;
-    let mut gates = NdTensor::zeros_in(pool, [batch, n_gates * hidden_size]);
 
     let mut cell = initial_cell
         .map(|t| t.to_tensor_in(pool))
@@ -472,128 +507,173 @@ pub fn lstm(
         .map(|t| t.to_tensor_in(pool))
         .unwrap_or_else(|| NdTensor::zeros_in(pool, [num_directions, batch, hidden_size]));
 
-    let mut hidden_seq =
-        NdTensor::<f32, 4>::zeros_in(pool, [seq_len, num_directions, batch, hidden_size]);
+    let mut hidden_seq = NdTensor::uninit_in(pool, [seq_len, num_directions, batch, hidden_size]);
 
     let gemm = GemmExecutor::new();
 
-    let gate_range = |gate| (gate * hidden_size)..((gate + 1) * hidden_size);
+    // From the ONNX spec, the intermediate values are computed as:
+    //
+    // - it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi)
+    // - ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf)
+    // - ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc)
+    // - Ct = ft (.) Ct-1 + it (.) ct
+    // - ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
+    // - Ht = ot (.) h(Ct)
+    //
+    // Where:
+    //
+    //  - `it`, `ft`, `ct` and `ot` are the input, forget, cell and output gates
+    //  - `Xt`, `Ht` and `Ct` are the input, hidden state and cell state at time `t`
+    //  - `W{i,o,f,c}` and `R{i,o,f,c}` are the input and recurrent gate weights
+    //  - `Wb{i,o,f,c}` and `Rb{i,o,f,c}` are the input and recurrent gate biases
+    //  - `P{i,o,f,c}` are peephole weights. These are not currently
+    //    supported.
+    //  - `f`, `g` and `h` are activations. `f`=sigmoid, `g` and `h`
+    //    are tanh.
+    //
+    // The matrix multiplications for all gates are combined into two: one for
+    // `input @ input_weights`, one for `hidden @ hidden_weights`.
 
-    for dir in 0..num_directions {
-        let prepack = seq_len >= PREPACK_MIN_SEQ_LEN;
+    hidden
+        .axis_iter_mut(0)
+        .into_par_iter()
+        .zip(cell.axis_iter_mut(0))
+        .zip(hidden_seq.axis_iter_mut(1))
+        .enumerate()
+        .for_each(|(dir, ((mut hidden, mut cell), mut hidden_seq))| {
+            let n_gates = 4;
+            let input_bias = bias
+                .as_ref()
+                .map(|b| b.slice((dir, ..(n_gates * hidden_size))).data().unwrap());
+            let hidden_bias = bias
+                .as_ref()
+                .map(|b| b.slice((dir, (n_gates * hidden_size)..)).data().unwrap());
 
-        let input_weights = weights.slice(dir).transposed();
-        let packed_input_weights =
-            prepack.then(|| gemm.prepack_b_in(pool, input_weights).auto_return(pool));
-        let input_weights = packed_input_weights
-            .as_ref()
-            .map(|packed| GemmInputB::Packed(packed))
-            .unwrap_or(GemmInputB::Unpacked(input_weights));
-
-        let hidden_weights = recurrent_weights.slice(dir).transposed();
-        let packed_hidden_weights =
-            prepack.then(|| gemm.prepack_b_in(pool, hidden_weights).auto_return(pool));
-        let hidden_weights = packed_hidden_weights
-            .as_ref()
-            .map(|packed| GemmInputB::Packed(packed))
-            .unwrap_or(GemmInputB::Unpacked(hidden_weights));
-
-        let input_bias = bias
-            .as_ref()
-            .map(|b| b.slice((dir, ..(n_gates * hidden_size))));
-        let hidden_bias = bias
-            .as_ref()
-            .map(|b| b.slice((dir, (n_gates * hidden_size)..)));
-
-        for seq in sequence_for_dir(direction, dir, seq_len) {
-            // From the ONNX spec, the intermediate values are computed as:
-            //
-            // - it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi)
-            // - ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf)
-            // - ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc)
-            // - Ct = ft (.) Ct-1 + it (.) ct
-            // - ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
-            // - Ht = ot (.) h(Ct)
-            //
-            // Where:
-            //
-            //  - `it`, `ft`, `ct` and `ot` are the input, forget, cell and output gates
-            //  - `Xt`, `Ht` and `Ct` are the input, hidden state and cell state at time `t`
-            //  - `W{i,o,f,c}` and `R{i,o,f,c}` are the input and recurrent gate weights
-            //  - `Wb{i,o,f,c}` and `Rb{i,o,f,c}` are the input and recurrent gate biases
-            //  - `P{i,o,f,c}` are peephole weights. These are not currently
-            //    supported.
-            //  - `f`, `g` and `h` are activations. `f`=sigmoid, `g` and `h`
-            //    are tanh.
-            let in_item = input.slice([seq]);
-            let hidden_item = hidden.slice([dir]);
-
-            // Update input, output, forget and cell gates.
-            gemm.gemm(
-                gates.data_mut().expect("expected contiguous input"),
-                GemmInputA::Unpacked(in_item),
-                input_weights,
-                GemmOptions::default(),
+            // Compute input projection for all timesteps at once.
+            let mut input_proj = input_projection(
+                pool,
+                &gemm,
+                input_mat.view(),
+                weights.slice(dir).transposed(),
+                input_bias,
+                seq_len,
+                batch,
             )
-            .unwrap();
-            if let Some(input_bias) = input_bias {
-                add_in_place(gates.as_dyn_mut(), input_bias.as_dyn());
+            .auto_return(pool);
+
+            let prepack = seq_len >= PREPACK_MIN_SEQ_LEN;
+            let hidden_weights = recurrent_weights.slice(dir).transposed();
+            let packed_hidden_weights =
+                prepack.then(|| gemm.prepack_b_in(pool, hidden_weights).auto_return(pool));
+            let hidden_weights = packed_hidden_weights
+                .as_ref()
+                .map(|packed| GemmInputB::Packed(packed))
+                .unwrap_or(GemmInputB::Unpacked(hidden_weights));
+
+            for seq in sequence_for_dir(direction, dir, seq_len) {
+                // Add `hidden @ hidden_weights + hidden_bias` into the input
+                // projection to get the summed inputs for all gates.
+                let mut gates = input_proj.slice_mut([seq]);
+                gemm.gemm(
+                    gates.data_mut().unwrap(),
+                    GemmInputA::Unpacked(hidden.view()),
+                    hidden_weights,
+                    GemmOptions {
+                        beta: 1.,
+                        bias: hidden_bias.map(BiasVector::Row),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+                lstm_step(
+                    hidden_size,
+                    gates,
+                    hidden.view_mut(),
+                    cell.view_mut(),
+                    hidden_seq.slice_mut([seq]),
+                );
             }
+        });
 
-            gemm.gemm(
-                gates.data_mut().expect("expected contiguous input"),
-                GemmInputA::Unpacked(hidden_item),
-                hidden_weights,
-                GemmOptions {
-                    beta: 1.,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            if let Some(hidden_bias) = hidden_bias {
-                add_in_place(gates.as_dyn_mut(), hidden_bias.as_dyn());
-            }
-
-            // Copy gates to work around `tanh_in_place` and `sigmoid_in_place`
-            // being slow for non-contiguous inputs. See notes in GRU op.
-            let iof_gates = gates.slice((
-                ..,
-                gate_range(INPUT_GATE).start..gate_range(FORGET_GATE).end,
-            ));
-            let iof_gates = sigmoid(pool, iof_gates.as_dyn()).auto_return(pool);
-            let iof_gates = iof_gates.nd_view::<2>();
-
-            let input_gate = iof_gates.slice((.., gate_range(INPUT_GATE)));
-            let out_gate = iof_gates.slice((.., gate_range(OUTPUT_GATE)));
-            let forget_gate = iof_gates.slice((.., gate_range(FORGET_GATE)));
-
-            let cell_gate = gates.slice((.., gate_range(CELL_GATE)));
-            let cell_gate = tanh(pool, cell_gate.as_dyn()).auto_return(pool);
-
-            // Update cell and hidden state
-            let mut cell_item = cell.slice_mut([dir]);
-
-            for (cell, forget_gate, input_gate, cell_gate) in zip4(
-                cell_item.iter_mut(),
-                forget_gate.iter(),
-                input_gate.iter(),
-                cell_gate.iter(),
-            ) {
-                *cell = forget_gate * *cell + input_gate * cell_gate;
-            }
-
-            let mut hidden_item = hidden.slice_mut([dir]);
-            for (hidden, out_gate, cell) in
-                zip3(hidden_item.iter_mut(), out_gate.iter(), cell_item.iter())
-            {
-                *hidden = out_gate * cell.tanh()
-            }
-
-            hidden_seq.slice_mut([seq, dir]).copy_from(&hidden_item);
-        }
-    }
+    // Safety: The loop above wrote to every element of `hidden_seq`.
+    let hidden_seq = unsafe { hidden_seq.assume_init() };
 
     Ok([hidden_seq.into_dyn(), hidden.into_dyn(), cell.into_dyn()].into())
+}
+
+/// Compute one LSTM timestep for a batch of inputs, updating the hidden and
+/// cell states in place and writing a copy of the new hidden state to `out`.
+///
+/// `gates` has shape `[batch, 4 * hidden_size]` and contains the summed input
+/// and recurrent projections `Xt @ W^T + Wb + Ht-1 @ R^T + Rb` for this
+/// timestep, with the input, output, forget and cell gates concatenated along
+/// the last dimension. It is also used as scratch space. `hidden`, `cell` and
+/// `out` have shape `[batch, hidden_size]`.
+///
+/// All inputs must be contiguous in the last dimension.
+fn lstm_step(
+    hidden_size: usize,
+    mut gates: NdTensorViewMut<f32, 2>,
+    mut hidden: NdTensorViewMut<f32, 2>,
+    mut cell: NdTensorViewMut<f32, 2>,
+    mut out: NdTensorViewMut<MaybeUninit<f32>, 2>,
+) {
+    for (mut gates, mut hidden, mut cell, mut out) in zip4(
+        gates.lanes_mut(1),
+        hidden.lanes_mut(1),
+        cell.lanes_mut(1),
+        out.lanes_mut(1),
+    ) {
+        // Inputs are expected to be contiguous in the last dimension.
+        let gates = gates.as_slice_mut().unwrap();
+        let hidden = hidden.as_slice_mut().unwrap();
+        let cell = cell.as_slice_mut().unwrap();
+        let out = out.as_slice_mut().unwrap();
+
+        // it = sigmoid(Xt*(Wi^T) + Wbi + Ht-1*(Ri^T) + Rbi), ot and ft likewise.
+        let (iof_gates, cell_gate) = gates.split_at_mut(3 * hidden_size);
+        vecmath::Sigmoid {}.map_mut(iof_gates);
+        let (input_gate, of_gates) = iof_gates.split_at(hidden_size);
+        let (out_gate, forget_gate) = of_gates.split_at(hidden_size);
+
+        // ct = tanh(Xt*(Wc^T) + Wbc + Ht-1*(Rc^T) + Rbc)
+        vecmath::Tanh {}.map_mut(cell_gate);
+
+        // Ct = ft (.) Ct-1 + it (.) ct
+        for (cell, forget, input, cell_gate) in zip4(
+            cell.iter_mut(),
+            forget_gate.iter(),
+            input_gate.iter(),
+            cell_gate.iter(),
+        ) {
+            *cell = forget * *cell + input * cell_gate;
+        }
+
+        // Ht = ot (.) tanh(Ct). The cell gate is no longer needed, so reuse it
+        // as scratch space for computing `tanh(Ct)`.
+        cell_gate.copy_from_slice(cell);
+        vecmath::Tanh {}.map_mut(cell_gate);
+        for (hidden, out_gate, tanh_cell, out) in zip4(
+            hidden.iter_mut(),
+            out_gate.iter(),
+            cell_gate.iter(),
+            out.iter_mut(),
+        ) {
+            *hidden = out_gate * tanh_cell;
+            out.write(*hidden);
+        }
+    }
+}
+
+/// Long Short-Term Memory operator.
+#[derive(Debug)]
+#[allow(clippy::upper_case_acronyms)]
+pub struct LSTM {
+    pub direction: Direction,
+
+    #[allow(unused)]
+    pub hidden_size: usize, // Currently inferred from operator inputs.
 }
 
 impl Operator for LSTM {
@@ -666,6 +746,7 @@ mod tests {
     use serde_json::Value;
 
     use crate::buffer_pool::BufferPool;
+    use crate::operator::OpError;
     use crate::ops::{Direction, concat, gru, lstm, split};
 
     /// Read a float tensor from a JSON value.
@@ -787,22 +868,22 @@ mod tests {
                 Op::Lstm => lstm(
                     &pool,
                     dir,
-                    input.as_dyn(),
-                    weights.as_dyn(),
-                    recurrent_weights.as_dyn(),
-                    case.with_bias.then_some(bias.as_dyn()),
-                    case.with_hidden_init.then_some(initial_hidden.as_dyn()),
-                    case.with_initial_cell.then_some(initial_cell.as_dyn()),
+                    input.view(),
+                    weights.view(),
+                    recurrent_weights.view(),
+                    case.with_bias.then_some(bias.view()),
+                    case.with_hidden_init.then_some(initial_hidden.view()),
+                    case.with_initial_cell.then_some(initial_cell.view()),
                 )
                 .expect("lstm op failed"),
                 Op::Gru => gru(
                     &pool,
                     dir,
-                    input.as_dyn(),
-                    weights.as_dyn(),
-                    recurrent_weights.as_dyn(),
-                    case.with_bias.then_some(bias.as_dyn()),
-                    case.with_hidden_init.then_some(initial_hidden.as_dyn()),
+                    input.view(),
+                    weights.view(),
+                    recurrent_weights.view(),
+                    case.with_bias.then_some(bias.view()),
+                    case.with_hidden_init.then_some(initial_hidden.view()),
                     true, /* linear_before_reset */
                 )
                 .expect("gru op failed"),
@@ -1059,22 +1140,22 @@ mod tests {
                 Op::Lstm => lstm(
                     &pool,
                     case.dir,
-                    data.input.view(),
-                    data.weights.view(),
-                    data.hidden_weights.view(),
-                    data.bias.as_ref().map(|b| b.view()),
-                    data.initial_hidden.as_ref().map(|ih| ih.view()),
-                    data.initial_cell.as_ref().map(|ic| ic.view()),
+                    data.input.nd_view(),
+                    data.weights.nd_view(),
+                    data.hidden_weights.nd_view(),
+                    data.bias.as_ref().map(|b| b.nd_view()),
+                    data.initial_hidden.as_ref().map(|ih| ih.nd_view()),
+                    data.initial_cell.as_ref().map(|ic| ic.nd_view()),
                 )
                 .expect("LSTM op failed"),
                 Op::Gru => gru(
                     &pool,
                     case.dir,
-                    data.input.view(),
-                    data.weights.view(),
-                    data.hidden_weights.view(),
-                    data.bias.as_ref().map(|b| b.view()),
-                    data.initial_hidden.as_ref().map(|ih| ih.view()),
+                    data.input.nd_view(),
+                    data.weights.nd_view(),
+                    data.hidden_weights.nd_view(),
+                    data.bias.as_ref().map(|b| b.nd_view()),
+                    data.initial_hidden.as_ref().map(|ih| ih.nd_view()),
                     true, /* linear_before_reset */
                 )
                 .expect("GRU op failed"),
@@ -1085,5 +1166,242 @@ mod tests {
         })
     }
 
-    // TODO - Add tests for incorrect input shapes
+    #[test]
+    fn test_rnn_ops_invalid_input_shapes() {
+        const SEQ_LEN: usize = 5;
+        const BATCH: usize = 2;
+        const HIDDEN: usize = 3;
+        const FEATURES: usize = 4;
+
+        /// Shapes of the inputs to an RNN operator.
+        #[derive(Debug)]
+        struct Shapes {
+            input: [usize; 3],
+            weights: [usize; 3],
+            recurrent_weights: [usize; 3],
+            bias: [usize; 2],
+            initial_hidden: [usize; 3],
+            initial_cell: [usize; 3],
+        }
+
+        /// Return valid input shapes for an RNN operator.
+        fn valid_shapes(op: Op, dir: Direction) -> Shapes {
+            let n_gates = match op {
+                Op::Gru => 3,
+                Op::Lstm => 4,
+            };
+            let dirs = dir.num_directions();
+            Shapes {
+                input: [SEQ_LEN, BATCH, FEATURES],
+                weights: [dirs, n_gates * HIDDEN, FEATURES],
+                recurrent_weights: [dirs, n_gates * HIDDEN, HIDDEN],
+                bias: [dirs, 2 * n_gates * HIDDEN],
+                initial_hidden: [dirs, BATCH, HIDDEN],
+                initial_cell: [dirs, BATCH, HIDDEN],
+            }
+        }
+
+        fn weights_err(op: Op) -> OpError {
+            OpError::incompatible_input_shapes(match op {
+                Op::Lstm => "weights.shape() != [num_directions, hidden_size * 4, input_size]",
+                Op::Gru => "weights.shape() != [num_directions, hidden_size * 3, input_size]",
+            })
+        }
+
+        fn rec_weights_err(op: Op) -> OpError {
+            OpError::incompatible_input_shapes(match op {
+                Op::Lstm => {
+                    "recurrent_weights.shape() != [num_directions, hidden_size * 4, hidden_size]"
+                }
+                Op::Gru => {
+                    "recurrent_weights.shape() != [num_directions, hidden_size * 3, hidden_size]"
+                }
+            })
+        }
+
+        fn bias_err(op: Op) -> OpError {
+            OpError::incompatible_input_shapes(match op {
+                Op::Lstm => "bias.shape() != [num_directions, hidden_size * 8]",
+                Op::Gru => "bias.shape() != [num_directions, hidden_size * 6]",
+            })
+        }
+
+        fn initial_hidden_err(_op: Op) -> OpError {
+            OpError::incompatible_input_shapes(
+                "initial_hidden.shape() != [num_directions, batch, hidden_size]",
+            )
+        }
+
+        fn initial_cell_err(_op: Op) -> OpError {
+            OpError::incompatible_input_shapes(
+                "initial_cell.shape() != [num_directions, batch, hidden_size]",
+            )
+        }
+
+        #[derive(Debug)]
+        struct Case {
+            /// Operators the case applies to.
+            ops: &'static [Op],
+
+            dir: Direction,
+
+            /// Change applied to a set of otherwise-valid input shapes.
+            invalidate: fn(&mut Shapes),
+
+            /// Error expected for a given operator.
+            expected: fn(Op) -> OpError,
+        }
+
+        let cases = &[
+            // Weight dim 1 is not a multiple of the number of gates.
+            Case {
+                ops: &[Op::Lstm],
+                dir: Direction::Forward,
+                invalidate: |s| s.weights[1] += 1,
+                expected: |_| OpError::invalid_value("weights dim 1 must be 4 * hidden_size"),
+            },
+            Case {
+                ops: &[Op::Gru],
+                dir: Direction::Forward,
+                invalidate: |s| s.weights[1] += 1,
+                expected: |_| OpError::invalid_value("weights dim 1 must be 3 * hidden_size"),
+            },
+            // Inputs disagree with the `direction` attribute.
+            Case {
+                ops: &[Op::Lstm, Op::Gru],
+                dir: Direction::Bidirectional,
+                invalidate: |s| s.weights[0] = 1,
+                expected: weights_err,
+            },
+            Case {
+                ops: &[Op::Lstm, Op::Gru],
+                dir: Direction::Forward,
+                invalidate: |s| s.recurrent_weights[0] = 2,
+                expected: rec_weights_err,
+            },
+            Case {
+                ops: &[Op::Lstm, Op::Gru],
+                dir: Direction::Forward,
+                invalidate: |s| s.bias[0] = 2,
+                expected: bias_err,
+            },
+            Case {
+                ops: &[Op::Lstm, Op::Gru],
+                dir: Direction::Forward,
+                invalidate: |s| s.initial_hidden[0] = 2,
+                expected: initial_hidden_err,
+            },
+            Case {
+                ops: &[Op::Lstm],
+                dir: Direction::Forward,
+                invalidate: |s| s.initial_cell[0] = 2,
+                expected: initial_cell_err,
+            },
+            // Inputs disagree about the input size.
+            Case {
+                ops: &[Op::Lstm, Op::Gru],
+                dir: Direction::Forward,
+                invalidate: |s| s.weights[2] += 1,
+                expected: weights_err,
+            },
+            // Inputs disagree about the hidden size.
+            Case {
+                ops: &[Op::Lstm],
+                dir: Direction::Forward,
+                invalidate: |s| s.recurrent_weights[1] += 4,
+                expected: rec_weights_err,
+            },
+            Case {
+                ops: &[Op::Gru],
+                dir: Direction::Forward,
+                invalidate: |s| s.recurrent_weights[1] += 3,
+                expected: rec_weights_err,
+            },
+            Case {
+                ops: &[Op::Lstm, Op::Gru],
+                dir: Direction::Forward,
+                invalidate: |s| s.recurrent_weights[2] += 1,
+                expected: rec_weights_err,
+            },
+            Case {
+                ops: &[Op::Lstm],
+                dir: Direction::Forward,
+                invalidate: |s| s.bias[1] += 8,
+                expected: bias_err,
+            },
+            Case {
+                ops: &[Op::Gru],
+                dir: Direction::Forward,
+                invalidate: |s| s.bias[1] += 6,
+                expected: bias_err,
+            },
+            Case {
+                ops: &[Op::Lstm, Op::Gru],
+                dir: Direction::Forward,
+                invalidate: |s| s.initial_hidden[2] += 1,
+                expected: initial_hidden_err,
+            },
+            Case {
+                ops: &[Op::Lstm],
+                dir: Direction::Forward,
+                invalidate: |s| s.initial_cell[2] += 1,
+                expected: initial_cell_err,
+            },
+            // Inputs disagree about the batch size.
+            Case {
+                ops: &[Op::Lstm, Op::Gru],
+                dir: Direction::Forward,
+                invalidate: |s| s.initial_hidden[1] += 1,
+                expected: initial_hidden_err,
+            },
+            Case {
+                ops: &[Op::Lstm],
+                dir: Direction::Forward,
+                invalidate: |s| s.initial_cell[1] += 1,
+                expected: initial_cell_err,
+            },
+        ];
+
+        cases.test_each(|case| {
+            for &op in case.ops {
+                let pool = BufferPool::new();
+
+                let mut shapes = valid_shapes(op, case.dir);
+                (case.invalidate)(&mut shapes);
+
+                let input = NdTensor::zeros(shapes.input);
+                let weights = NdTensor::zeros(shapes.weights);
+                let recurrent_weights = NdTensor::zeros(shapes.recurrent_weights);
+                let bias = NdTensor::zeros(shapes.bias);
+                let initial_hidden = NdTensor::zeros(shapes.initial_hidden);
+                let initial_cell = NdTensor::zeros(shapes.initial_cell);
+
+                let result = match op {
+                    Op::Lstm => lstm(
+                        &pool,
+                        case.dir,
+                        input.view(),
+                        weights.view(),
+                        recurrent_weights.view(),
+                        Some(bias.view()),
+                        Some(initial_hidden.view()),
+                        Some(initial_cell.view()),
+                    ),
+                    Op::Gru => gru(
+                        &pool,
+                        case.dir,
+                        input.view(),
+                        weights.view(),
+                        recurrent_weights.view(),
+                        Some(bias.view()),
+                        Some(initial_hidden.view()),
+                        true, /* linear_before_reset */
+                    ),
+                };
+
+                let expected = (case.expected)(op);
+                assert_eq!(result.err().as_ref(), Some(&expected), "op {:?}", op);
+            }
+        })
+    }
 }

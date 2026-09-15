@@ -22,7 +22,8 @@ use crate::layout::{
 use crate::overlap::may_have_internal_overlap;
 use crate::slice_range::{IntoSliceItems, SliceItem};
 use crate::storage::{
-    Alloc, CowData, GlobalAlloc, IntoStorage, Storage, StorageMut, ViewData, ViewMutData,
+    Alloc, CastStorage, CowData, GlobalAlloc, IntoStorage, Storage, StorageMut, ViewData,
+    ViewMutData,
 };
 use crate::type_num::IndexCount;
 use crate::{Contiguous, RandomSource};
@@ -746,6 +747,21 @@ impl<S: Storage, L: Layout> TensorBase<S, L> {
     pub fn data_ptr(&self) -> *const S::Elem {
         self.data.as_ptr()
     }
+
+    /// Reinterpret the bytes of this tensor as type `U`.
+    ///
+    /// Types `T` and `U` must be `Copy` types with the same size and alignment,
+    /// with no padding and for which any bit pattern is valid.
+    pub fn bit_cast<U>(self) -> TensorBase<<S as CastStorage<U>>::Output, L>
+    where
+        S: CastStorage<U>,
+    {
+        let TensorBase { data, layout } = self;
+        TensorBase {
+            data: data.bit_cast(),
+            layout,
+        }
+    }
 }
 
 impl<S: StorageMut, L: Clone + Layout> TensorBase<S, L> {
@@ -838,6 +854,11 @@ impl<S: StorageMut, L: Clone + Layout> TensorBase<S, L> {
             // Safety: We verified the layout is contiguous.
             data.to_slice_mut()
         })
+    }
+
+    /// Return a raw pointer to the tensor's underlying data.
+    pub fn data_ptr_mut(&mut self) -> *mut S::Elem {
+        self.data.as_mut_ptr()
     }
 
     /// Index the tensor along a given axis.
@@ -1354,10 +1375,22 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
         T: Clone,
         L: FromShape,
     {
+        self.make_contiguous_in(GlobalAlloc::default())
+    }
+
+    /// Variant of [`make_contiguous`](Self::make_contiguous) which takes an
+    /// allocator.
+    pub fn make_contiguous_in<A: Alloc>(&mut self, alloc: A)
+    where
+        T: Clone,
+        L: FromShape,
+    {
         if self.is_contiguous() {
             return;
         }
-        self.data = self.to_vec();
+        let new_data = self.to_vec_in(&alloc);
+        let old_data = std::mem::replace(&mut self.data, new_data);
+        alloc.dealloc(old_data);
         self.layout = L::from_shape(self.layout.shape());
     }
 
@@ -1370,7 +1403,17 @@ impl<T, L: Clone + Layout> TensorBase<Vec<T>, L> {
         T: Clone,
         L: FromShape,
     {
-        Contiguous::from_owned(self)
+        self.into_contiguous_in(GlobalAlloc::default())
+    }
+
+    /// Variant of [`into_contiguous`](Self::into_contiguous) which takes an
+    /// allocator.
+    pub fn into_contiguous_in<A: Alloc>(self, alloc: A) -> Contiguous<Self>
+    where
+        T: Clone,
+        L: FromShape,
+    {
+        Contiguous::from_owned(self, alloc)
     }
 
     /// Create a new tensor with a given shape and elements populated using
@@ -1505,6 +1548,13 @@ impl<'a, T, L: Layout> TensorBase<CowData<'a, T>, L> {
             }
             CowData::Borrowed(_) => None,
         }
+    }
+
+    /// Return true if this tensor owns its data.
+    ///
+    /// If true, [`into_owned`](Self::into_owned) will not copy.
+    pub fn is_owned(&self) -> bool {
+        matches!(self.data, CowData::Owned(_))
     }
 
     /// Convert this copy-on-write tensor into an owned tensor.

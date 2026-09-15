@@ -34,6 +34,10 @@ impl Alloc for FakeAlloc {
         *self.count.borrow_mut() += 1;
         Vec::with_capacity(capacity)
     }
+
+    fn dealloc<T>(&self, buf: Vec<T>) {
+        std::mem::drop(buf)
+    }
 }
 
 #[test]
@@ -299,6 +303,35 @@ fn test_axis_iter_mut() {
 
     assert!(rows.next().is_none());
     assert_eq!(tensor.to_vec(), [2, 4, -6, -8]);
+}
+
+#[test]
+fn test_bit_cast() {
+    // Owned
+    let tensor = NdTensor::from([[1i32, 2], [3, 4]]);
+    let unsigned_tensor = tensor.bit_cast::<u32>();
+    assert_eq!(unsigned_tensor, NdTensor::from([[1u32, 2], [3, 4]]));
+
+    // View
+    let tensor = NdTensor::from([[1i32, 2], [3, 4]]);
+    let unsigned_tensor = tensor.view().bit_cast::<u32>();
+    assert_eq!(unsigned_tensor, NdTensor::from([[1u32, 2], [3, 4]]).view());
+
+    // Cow (borrowed)
+    let tensor = NdTensor::from([[1i32, 2], [3, 4]]);
+    let unsigned_tensor = tensor.as_cow().bit_cast::<u32>();
+    assert_eq!(
+        unsigned_tensor,
+        NdTensor::from([[1u32, 2], [3, 4]]).as_cow()
+    );
+
+    // Cow (owned)
+    let tensor = NdTensor::from([[1i32, 2], [3, 4]]);
+    let unsigned_tensor = tensor.into_cow().bit_cast::<u32>();
+    assert_eq!(
+        unsigned_tensor,
+        NdTensor::from([[1u32, 2], [3, 4]]).into_cow()
+    );
 }
 
 #[test]
@@ -928,6 +961,13 @@ fn test_into_dyn() {
     let dyn_tensor = tensor.into_dyn();
     assert_eq!(dyn_tensor.shape(), &[2, 2]);
     assert_eq!(dyn_tensor.data(), Some([1., 2., 3., 4.].as_slice()));
+}
+
+#[test]
+fn test_is_owned() {
+    let tensor = NdTensor::from_data([2, 2], vec![1, 2, 3, 4]);
+    assert!(!tensor.as_cow().is_owned());
+    assert!(tensor.into_cow().is_owned());
 }
 
 #[test]
