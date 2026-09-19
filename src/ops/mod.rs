@@ -148,7 +148,7 @@ pub use conv::{conv, conv_integer};
 pub use conv_transpose::conv_transpose;
 pub use einsum::einsum;
 pub use gather::{gather, gather_elements, gather_nd};
-pub use generate::{constant_of_shape, onehot, range};
+pub use generate::{onehot, range};
 pub use layout::{DepthToSpaceMode, depth_to_space, expand, flatten, reshape, squeeze};
 pub use matmul::{gemm, matmul};
 pub use non_max_suppression::{BoxOrder, non_max_suppression};
@@ -412,6 +412,54 @@ macro_rules! check_value {
 }
 
 use check_value;
+
+/// Extract a typed tensor view from a [`ValueView`] and pass it to a block.
+///
+/// This is like [`map_view`] except that all tensor types of a common bit-width
+/// are mapped to a common type. The block can access a variable `$dtype`
+/// containing the actual data type.
+macro_rules! map_view_as_bits {
+    ($input:expr, $typed_input:ident, $dtype:ident, $block:tt) => {{
+        use crate::value::{BitsView, ValueType};
+        let $dtype = match $input.dtype() {
+            ValueType::Tensor(dtype) => Ok(dtype),
+            ValueType::Sequence(_) => Err(OpError::UnsupportedType),
+        }?;
+        let bits = $input.into_bits().ok_or(OpError::UnsupportedType)?;
+        match bits {
+            #[allow(unused_mut)]
+            BitsView::X32(mut $typed_input) => $block,
+            #[allow(unused_mut)]
+            BitsView::X8(mut $typed_input) => $block,
+        }
+    }};
+}
+
+use map_view_as_bits;
+
+/// Extract a typed owned tensor from a [`Value`] and pass it to a block.
+///
+/// This is like [`map_value`] except that all tensor types of a common
+/// bit-width are mapped to a common type, in the same way as
+/// [`map_view_as_bits`].
+macro_rules! map_value_as_bits {
+    ($input:expr, $typed_input:ident, $dtype:ident, $block:tt) => {{
+        use crate::value::{Bits, ValueType};
+        let $dtype = match $input.dtype() {
+            ValueType::Tensor(dtype) => Ok(dtype),
+            ValueType::Sequence(_) => Err(OpError::UnsupportedType),
+        }?;
+        let bits = $input.into_bits().ok_or(OpError::UnsupportedType)?;
+        match bits {
+            #[allow(unused_mut)]
+            Bits::X32(mut $typed_input) => $block,
+            #[allow(unused_mut)]
+            Bits::X8(mut $typed_input) => $block,
+        }
+    }};
+}
+
+use map_value_as_bits;
 
 #[cfg(test)]
 mod tests {
