@@ -537,6 +537,13 @@ pub unsafe trait BitOps<T: Elem>: Copy {
 /// - Add, subtract and multiply
 /// - Comparison (equality, less than, greater than etc.)
 ///
+/// # Overflow handling
+///
+/// For signed integer types, operations such as add and multiply can overflow.
+/// For Rust scalar types, expressions such as `a + b` will panic on overflow in
+/// debug builds and wrap in release builds. On SIMD types these operations
+/// always wrap.
+///
 /// # Safety
 ///
 /// Implementations must ensure they can only be constructed if the
@@ -682,12 +689,17 @@ pub trait IntOps<T: Elem>: NumOps<T> {
 
 /// Operations on SIMD vectors with signed integer elements.
 pub trait SignedIntOps<T: Elem>: IntOps<T> {
-    /// Compute the absolute value of `x`
+    /// Compute the absolute value of `x`.
+    ///
+    /// If the absolute value cannot be represented in type `T`, the operation
+    /// wraps.
     fn abs(self, x: Self::Simd) -> Self::Simd {
         self.select(self.neg(x), x, self.lt(x, self.zero()))
     }
 
     /// Return `-x`.
+    ///
+    /// If `-x` cannot be represented in type `T`, the operation wraps.
     fn neg(self, x: Self::Simd) -> Self::Simd {
         self.sub(self.zero(), x)
     }
@@ -1274,11 +1286,14 @@ mod tests {
                     test_simd_op!(isa, {
                         let ops = isa.$elem();
 
-                        let vals = [-1, 0, 1];
+                        let vals = [-1, 0, 1, $elem::MIN];
                         for v in vals {
                             let x = ops.splat(v);
                             let y = ops.abs(x);
-                            let expected = ops.splat(v.abs());
+
+                            // Use `v.unsigned_abs()` rather than `v.abs()` to
+                            // wrap rather than panic in debug builds for `$elem::MIN`.
+                            let expected = ops.splat(v.unsigned_abs() as $elem);
                             assert_simd_eq!(y, expected);
                         }
                     })
@@ -1349,9 +1364,15 @@ mod tests {
                     test_simd_op!(isa, {
                         let ops = isa.$elem();
 
+                        // Value where `neg` does not wrap.
                         let x = ops.splat(3 as $elem);
-
                         let expected = ops.splat(-3 as $elem);
+                        let actual = ops.neg(x);
+                        assert_simd_eq!(actual, expected);
+
+                        // Value where `neg` wraps.
+                        let x = ops.splat($elem::MIN);
+                        let expected = ops.splat($elem::MIN.wrapping_neg());
                         let actual = ops.neg(x);
                         assert_simd_eq!(actual, expected);
                     })
