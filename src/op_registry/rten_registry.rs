@@ -553,10 +553,11 @@ impl ReadOp for ops::CumSum {
     }
 
     fn read(op: &sg::OperatorNode, _ctx: &dyn OpLoadContext) -> Result<Self, ReadOpError> {
-        // CumSum attributes are optional for backwards compatibility.
-        let attrs = op.attrs_as_cum_sum_attrs();
-        let exclusive = attrs.map(|a| a.exclusive()).unwrap_or(false);
-        let reverse = attrs.map(|a| a.reverse()).unwrap_or(false);
+        let attrs = op
+            .attrs_as_cum_sum_attrs()
+            .ok_or(ReadOpError::AttrsMissingError)?;
+        let exclusive = attrs.exclusive();
+        let reverse = attrs.reverse();
         Ok(ops::CumSum { exclusive, reverse })
     }
 }
@@ -854,9 +855,10 @@ impl ReadOp for ops::Pad {
     }
 
     fn read(op: &sg::OperatorNode, _ctx: &dyn OpLoadContext) -> Result<Self, ReadOpError> {
-        // Pad attributes are optional for backwards compatibility.
-        let attrs = op.attrs_as_pad_attrs();
-        let mode = match attrs.map(|a| a.mode()).unwrap_or(sg::PadMode::Constant) {
+        let attrs = op
+            .attrs_as_pad_attrs()
+            .ok_or(ReadOpError::AttrsMissingError)?;
+        let mode = match attrs.mode() {
             sg::PadMode::Constant => PadMode::Constant,
             sg::PadMode::Reflect => PadMode::Reflect,
             sg::PadMode::Edge => PadMode::Edge,
@@ -1084,10 +1086,11 @@ impl ReadOp for ops::Shape {
     }
 
     fn read(op: &sg::OperatorNode, _ctx: &dyn OpLoadContext) -> Result<Self, ReadOpError> {
-        // Shape attributes are optional for backwards compatibility
-        let attrs = op.attrs_as_shape_attrs();
-        let start = attrs.and_then(|a| a.start());
-        let end = attrs.and_then(|a| a.end());
+        let attrs = op
+            .attrs_as_shape_attrs()
+            .ok_or(ReadOpError::AttrsMissingError)?;
+        let start = attrs.start();
+        let end = attrs.end();
         Ok(ops::Shape { start, end })
     }
 }
