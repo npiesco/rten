@@ -514,7 +514,7 @@ unsafe impl Kernel<u8, i8, i32> for Avx2Int8Kernel {
     }
 
     fn may_saturate(&self) -> bool {
-        true
+        false
     }
 
     fn im2col_row_count_step(&self) -> usize {
@@ -698,13 +698,19 @@ unsafe impl Int8DotProduct for Avx2Isa {
     #[inline]
     fn dot_product(self, a: Self::X8, b: Self::X8, c: Self::I32) -> Self::I32 {
         use core::arch::x86_64::{
-            _mm256_add_epi32, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_set1_epi16,
+            _mm256_add_epi32, _mm256_and_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+            _mm256_set1_epi8, _mm256_set1_epi16,
         };
 
         unsafe {
-            let tmp = _mm256_maddubs_epi16(a.0, b.0);
-            let tmp = _mm256_madd_epi16(tmp, _mm256_set1_epi16(1));
-            _mm256_add_epi32(c.0, tmp).into()
+            // Split unsigned inputs so each pairwise product sum fits in i16.
+            // Widen both sums before adding to preserve the full u8/i8 range.
+            let low = _mm256_and_si256(a.0, _mm256_set1_epi8(0x7f));
+            let high = _mm256_and_si256(a.0, _mm256_set1_epi8(i8::MIN));
+            let ones = _mm256_set1_epi16(1);
+            let low = _mm256_madd_epi16(_mm256_maddubs_epi16(low, b.0), ones);
+            let high = _mm256_madd_epi16(_mm256_maddubs_epi16(high, b.0), ones);
+            _mm256_add_epi32(c.0, _mm256_add_epi32(low, high)).into()
         }
     }
 }
@@ -740,7 +746,7 @@ unsafe impl Kernel<u8, i8, i32> for Avx512Int8Kernel {
     }
 
     fn may_saturate(&self) -> bool {
-        self.vnni_dot.is_none()
+        false
     }
 
     fn im2col_row_count_step(&self) -> usize {
@@ -971,13 +977,19 @@ unsafe impl Int8DotProduct for Avx512Isa {
     #[inline]
     fn dot_product(self, a: I8x64, b: I8x64, c: I32x16) -> I32x16 {
         use core::arch::x86_64::{
-            _mm512_add_epi32, _mm512_madd_epi16, _mm512_maddubs_epi16, _mm512_set1_epi16,
+            _mm512_add_epi32, _mm512_and_si512, _mm512_madd_epi16, _mm512_maddubs_epi16,
+            _mm512_set1_epi8, _mm512_set1_epi16,
         };
 
         unsafe {
-            let tmp = _mm512_maddubs_epi16(a.0, b.0);
-            let tmp = _mm512_madd_epi16(tmp, _mm512_set1_epi16(1));
-            _mm512_add_epi32(c.0, tmp).into()
+            // Split unsigned inputs so each pairwise product sum fits in i16.
+            // Widen both sums before adding to preserve the full u8/i8 range.
+            let low = _mm512_and_si512(a.0, _mm512_set1_epi8(0x7f));
+            let high = _mm512_and_si512(a.0, _mm512_set1_epi8(i8::MIN));
+            let ones = _mm512_set1_epi16(1);
+            let low = _mm512_madd_epi16(_mm512_maddubs_epi16(low, b.0), ones);
+            let high = _mm512_madd_epi16(_mm512_maddubs_epi16(high, b.0), ones);
+            _mm512_add_epi32(c.0, _mm512_add_epi32(low, high)).into()
         }
     }
 }
@@ -1057,6 +1069,30 @@ fn detect_avx512_vnni() -> bool {
 #[cfg(test)]
 mod tests {
     use super::detect_avx512_vnni;
+
+    #[test]
+    fn test_avx512_non_vnni_dot_full_range() {
+        use super::{Avx512Isa, Int8DotProduct};
+        use rten_simd::Isa;
+        use rten_simd::ops::{BitOps, NumOps};
+
+        let Some(isa) = Avx512Isa::new() else {
+            return;
+        };
+        for unsigned in [0_u8, 127, 128, 255] {
+            for signed in [i8::MIN, -1, 0, i8::MAX] {
+                let result = isa.dot_product(
+                    isa.i8().splat(unsigned as i8),
+                    isa.i8().splat(signed),
+                    isa.i32().zero(),
+                );
+                assert_eq!(
+                    isa.i32().sum(result),
+                    64 * i32::from(unsigned) * i32::from(signed)
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_vnni_detect() {

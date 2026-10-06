@@ -241,7 +241,7 @@ where
 {
     GemmExecutor::<L, R, O>::kernel_types()
         .into_iter()
-        .filter_map(|kern_type| GemmExecutor::<L, R, O>::with_kernel(kern_type))
+        .filter_map(GemmExecutor::<L, R, O>::with_kernel)
 }
 
 // Simplest possible test case for easy debugging.
@@ -426,6 +426,55 @@ fn test_gemm_u8i8_i32() -> Result<(), Box<dyn Error>> {
         test_gemm_various_input_sizes(Some(&gemm), None, Some(&mut || rng.next()))?;
     }
     Ok(())
+}
+
+#[test]
+fn test_gemm_u8i8_i32_full_range() {
+    for gemm in all_gemms::<u8, i8, i32>() {
+        for (m, n, k) in [(1, 19, 4), (6, 16, 9), (7, 33, 1029)] {
+            let a = NdTensor::from_data([m, k], vec![255; m * k]);
+            let b = NdTensor::from_data(
+                [k, n],
+                (0..k * n)
+                    .map(|i| if i % n % 2 == 0 { 127 } else { -128 })
+                    .collect::<Vec<i8>>(),
+            );
+            for (a_zero, b_zero) in [(0, 0), (128, -4)] {
+                let a_zeros = vec![a_zero; m];
+                let b_zeros = vec![b_zero; n];
+                let result = run_matmul(
+                    a.view(),
+                    b.view(),
+                    Some(GemmOpts {
+                        a_quant: Some(QuantParams {
+                            zero_point: &a_zeros,
+                        }),
+                        b_quant: Some(QuantParams {
+                            zero_point: &b_zeros,
+                        }),
+                        ..Default::default()
+                    }),
+                    Some(&gemm),
+                )
+                .unwrap();
+                for r in 0..m {
+                    for c in 0..n {
+                        let expected: i32 = (0..k)
+                            .map(|depth| {
+                                (i32::from(a[[r, depth]]) - i32::from(a_zero))
+                                    * (i32::from(b[[depth, c]]) - i32::from(b_zero))
+                            })
+                            .sum();
+                        assert_eq!(
+                            result[[r, c]],
+                            expected,
+                            "full-range GEMM at ({r}, {c}), shape ({m}, {n}, {k})"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -1036,7 +1085,7 @@ fn test_gemm_f32_with_block_quantized_rhs() {
             block_size,
         } = case;
 
-        let n_bits = 4 as u8;
+        let n_bits = 4_u8;
         let elements_per_byte = 8 / n_bits.as_usize();
         let block_bytes = block_size / elements_per_byte;
 
@@ -1350,8 +1399,7 @@ where
         //   `fma_units` is 2. For a 3.4Ghz CPU this would give a max
         //   theoretical peak of 3.4 * 8 * 2 * 2 = 108.8 GFLOPS.
 
-        let flops =
-            (2 * m as u64 * n as u64 * k as u64 * iters as u64) as f32 / duration.as_secs_f32();
+        let flops = (2 * m as u64 * n as u64 * k as u64 * iters) as f32 / duration.as_secs_f32();
         let gflops = flops / (10f32).powi(9);
         let duration_ms = duration.as_secs_f64() * 1000.0;
 

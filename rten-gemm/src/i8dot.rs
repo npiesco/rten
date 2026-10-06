@@ -296,7 +296,8 @@ mod x86_64 {
             acc: <Self::Isa as Isa>::I32,
         ) -> <Self::Isa as Isa>::I32 {
             use std::arch::x86_64::{
-                _mm256_add_epi32, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_set1_epi16,
+                _mm256_add_epi32, _mm256_and_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+                _mm256_set1_epi8, _mm256_set1_epi16,
             };
 
             #[target_feature(enable = "avx2")]
@@ -308,9 +309,12 @@ mod x86_64 {
                 b: <Avx2Isa as Isa>::I8,
                 acc: <Avx2Isa as Isa>::I32,
             ) -> <Avx2Isa as Isa>::I32 {
-                let tmp = _mm256_maddubs_epi16(a.0, b.0);
-                let tmp = _mm256_madd_epi16(tmp, _mm256_set1_epi16(1));
-                _mm256_add_epi32(acc.0, tmp).into()
+                let low = _mm256_and_si256(a.0, _mm256_set1_epi8(0x7f));
+                let high = _mm256_and_si256(a.0, _mm256_set1_epi8(i8::MIN));
+                let ones = _mm256_set1_epi16(1);
+                let low = _mm256_madd_epi16(_mm256_maddubs_epi16(low, b.0), ones);
+                let high = _mm256_madd_epi16(_mm256_maddubs_epi16(high, b.0), ones);
+                _mm256_add_epi32(acc.0, _mm256_add_epi32(low, high)).into()
             }
             // Safety: Constructor checks "avx2" feature is supported.
             unsafe { dot(a, b, acc) }
@@ -363,6 +367,24 @@ mod tests {
             acc += (*x as i32) * (*y as i32);
         }
         acc
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx2_int8_dot_full_range() {
+        let Some(_) = super::x86_64::Avx2Int8DotIsa::new() else {
+            return;
+        };
+        for unsigned in [0_u8, 127, 128, 255] {
+            for signed in [i8::MIN, -1, 0, i8::MAX] {
+                let a = vec![unsigned as i8; 65];
+                let b = vec![signed; 65];
+                assert_eq!(
+                    VecDot::new(&a, &b).eval(super::x86_64::Avx2Int8DotIsa::new().unwrap()),
+                    65 * i32::from(unsigned) * i32::from(signed)
+                );
+            }
+        }
     }
 
     #[test]
