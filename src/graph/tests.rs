@@ -2139,3 +2139,65 @@ fn test_remove_nodes() {
 
     assert!(g.get_source_node(out_id).is_none());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_run_options_lazy_thread_pool() -> std::io::Result<()> {
+    use std::fs;
+    use std::process::Command;
+
+    const CHILD: &str = "RTEN_TEST_RUN_OPTIONS_LAZY_THREAD_POOL";
+    if std::env::var_os(CHILD).is_some() {
+        let pool = Arc::new(crate::ThreadPool::with_num_threads(1).expect("private pool"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        pool.run(|| {
+            rayon::spawn(move || {
+                let _ = tx.send(());
+            });
+        });
+        let _ = rx.recv();
+        let opts = RunOptions::default().with_thread_pool(Some(pool));
+        let _ = opts.thread_pool();
+
+        let pid = std::process::id().to_string();
+        let mut rten_threads = Vec::new();
+        for _ in 0..100 {
+            rten_threads.clear();
+            for entry in fs::read_dir("/proc/self/task")? {
+                let entry = entry?;
+                if entry.file_name() == pid.as_str() {
+                    continue;
+                }
+                if let Ok(comm) = fs::read_to_string(entry.path().join("comm")) {
+                    let name = comm.trim().to_string();
+                    if name.starts_with("rten-") {
+                        rten_threads.push(name);
+                    }
+                }
+            }
+            if !rten_threads.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // If the fallback is lazy, only the private pool's single worker thread ("rten-0") exists.
+        // If the fallback eagerly called threading::thread_pool(), global pool workers ("rten-1", etc.) would exist.
+        assert_eq!(
+            rten_threads.len(),
+            1,
+            "private pool must not initialize global pool workers: {rten_threads:?}"
+        );
+        return Ok(());
+    }
+
+    let status = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "graph::tests::test_run_options_lazy_thread_pool",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .status()?;
+    assert!(status.success(), "child process failed: {status}");
+    Ok(())
+}
