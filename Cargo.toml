@@ -91,6 +91,10 @@ serde_json = { workspace = true }
 [lib]
 crate-type = ["lib", "cdylib"]
 
+[[test]]
+name = "thread_lifetime"
+path = "tests/thread_lifetime.rs"
+
 [features]
 default = ["contrib", "onnx_format"]
 

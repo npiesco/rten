@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use rten::{
@@ -565,9 +566,16 @@ fn main() {
         println!("Running model with random inputs...");
     }
 
-    let thread_pool = args
-        .num_threads
-        .map(|nt| ThreadPool::with_num_threads(nt.as_usize()).into());
+    let thread_pool = match args.num_threads {
+        Some(nt) => match ThreadPool::with_num_threads(nt.as_usize()) {
+            Ok(pool) => Some(Arc::new(pool)),
+            Err(err) => {
+                eprintln!("Failed to create thread pool: {err}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
     let run_opts = RunOptions::default()
         .with_timing(profile_mode != ProfileMode::None)
         .with_timing_by_shape(profile_mode == ProfileMode::Detailed)

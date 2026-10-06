@@ -208,7 +208,7 @@ pub mod onnx_builder;
 /// use std::sync::Arc;
 /// use rten::{ThreadPool, RunOptions};
 ///
-/// let pool = ThreadPool::with_num_threads(1);
+/// let pool = ThreadPool::with_num_threads(1).expect("native thread pool");
 /// let options = RunOptions::default()
 ///   .with_thread_pool(Some(Arc::new(pool)));
 ///

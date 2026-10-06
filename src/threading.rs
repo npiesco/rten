@@ -1,16 +1,83 @@
 use std::env;
-use std::sync::OnceLock;
+use std::error::Error;
+use std::io;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{self, JoinHandle};
 
 use rten_base::num::AsUsize;
 
 /// A wrapper around the Rayon thread pool used to run models.
 ///
-/// On platforms where threads are not supported (eg. WebAssembly) this runs
-/// operations directly on the main thread.
+/// Explicit construction fails if the requested native threads cannot be
+/// created. The implicit global pool retains Rayon's unsupported-target
+/// behavior on platforms without native threads (eg. WebAssembly).
 #[derive(Debug)]
 pub struct ThreadPool {
-    /// The wrapped thread pool, or None if we failed to construct one.
+    /// None only for the implicit unsupported-target fallback or during drop.
     pool: Option<rayon::ThreadPool>,
+    workers: WorkerThreads,
+}
+
+#[derive(Debug, Default)]
+struct WorkerThreads(Vec<JoinHandle<()>>);
+
+impl WorkerThreads {
+    fn join(handles: Vec<JoinHandle<()>>) -> thread::Result<()> {
+        let mut failure = None;
+        for handle in handles {
+            if let Err(error) = handle.join()
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for WorkerThreads {
+    fn drop(&mut self) {
+        let handles = std::mem::take(&mut self.0);
+        if handles
+            .iter()
+            .any(|handle| handle.thread().id() == thread::current().id())
+        {
+            // An asynchronous Rayon job may release the last pool owner.
+            // Retain every native join on another thread until that job exits.
+            let pending = Arc::new(Mutex::new(handles));
+            let owned = Arc::clone(&pending);
+            let reaper = thread::Builder::new()
+                .name("rten-pool-reaper".into())
+                .spawn(move || {
+                    let handles = std::mem::take(
+                        &mut *owned
+                            .lock()
+                            .expect("private thread retirement is not poisoned"),
+                    );
+                    if Self::join(handles).is_err() {
+                        eprintln!("RTen private worker panicked during deferred retirement");
+                        std::process::abort();
+                    }
+                });
+            if let Err(error) = reaper {
+                eprintln!("RTen could not retain self-owned worker retirement: {error}");
+                std::process::abort();
+            }
+        } else if let Err(error) = Self::join(handles) {
+            if thread::panicking() {
+                eprintln!("RTen private worker also panicked during owner unwinding");
+            } else {
+                std::panic::resume_unwind(error);
+            }
+        }
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.pool.take());
+        drop(std::mem::take(&mut self.workers));
+    }
 }
 
 impl ThreadPool {
@@ -27,13 +94,42 @@ impl ThreadPool {
     }
 
     /// Create a thread pool with a given number of threads.
-    pub fn with_num_threads(num_threads: usize) -> ThreadPool {
+    ///
+    /// Dropping the pool from outside its workers joins their native threads.
+    /// A last owner released by an asynchronous job transfers those joins to
+    /// a retirement thread, which can wait for the releasing worker itself.
+    /// If construction fails, already-created workers are joined before the
+    /// original error is returned; there is no smaller or implicit global pool.
+    pub fn with_num_threads(num_threads: usize) -> Result<ThreadPool, rayon::ThreadPoolBuildError> {
+        let mut workers = WorkerThreads::default();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|index| format!("rten-{}", index))
+            .spawn_handler(|worker| {
+                let mut builder = thread::Builder::new();
+                if let Some(name) = worker.name() {
+                    builder = builder.name(name.to_owned());
+                }
+                if let Some(stack_size) = worker.stack_size() {
+                    builder = builder.stack_size(stack_size);
+                }
+                workers.0.push(builder.spawn(move || worker.run())?);
+                Ok(())
+            })
             .build();
 
-        ThreadPool { pool: pool.ok() }
+        match pool {
+            Ok(pool) => Ok(ThreadPool {
+                pool: Some(pool),
+                workers,
+            }),
+            Err(error) => {
+                // Rayon requests termination when build fails. Join the actual
+                // native threads before returning the construction error.
+                drop(workers);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -88,7 +184,20 @@ pub fn thread_pool() -> &'static ThreadPool {
             physical_cpus
         };
 
-        ThreadPool::with_num_threads(num_threads.as_usize())
+        ThreadPool::with_num_threads(num_threads.as_usize()).unwrap_or_else(|error| {
+            if error
+                .source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .is_some_and(|source| source.kind() == io::ErrorKind::Unsupported)
+            {
+                ThreadPool {
+                    pool: None,
+                    workers: WorkerThreads::default(),
+                }
+            } else {
+                panic!("RTen global thread pool creation failed: {error}");
+            }
+        })
     })
 }
 
