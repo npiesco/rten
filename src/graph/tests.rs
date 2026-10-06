@@ -2201,3 +2201,88 @@ fn test_run_options_lazy_thread_pool() -> std::io::Result<()> {
     assert!(status.success(), "child process failed: {status}");
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_prepack_weights_with_pool() -> std::io::Result<()> {
+    use std::fs;
+    use std::process::Command;
+
+    const CHILD: &str = "RTEN_TEST_PREPACK_WEIGHTS_WITH_POOL";
+    if std::env::var_os(CHILD).is_some() {
+        let pool = Arc::new(crate::ThreadPool::with_num_threads(1).expect("private pool"));
+        let mut graph = Graph::new();
+        let mut cache = WeightCache::new();
+
+        let input = graph.add_value(Some("input"), None, None);
+        let weights = graph.add_constant(None, Tensor::<f32>::zeros(&[10, 7]).into_arc());
+        let (_, matmul_out) =
+            graph.add_simple_op("MatMul", MatMulExpectPacked::new(), &[input, weights]);
+
+        let mut subgraph = Graph::new();
+        let sg_input = subgraph.add_value(Some("sg-input"), None, None);
+        let sg_weights = subgraph.add_constant(None, Tensor::<f32>::zeros(&[7, 5]).into_arc());
+        let (_, sg_matmul_out) = subgraph.add_simple_op(
+            "sg-MatMul",
+            MatMulExpectPacked::new(),
+            &[sg_input, sg_weights],
+        );
+        subgraph.set_input_ids(&[sg_input]);
+        subgraph.set_output_ids(&[sg_matmul_out]);
+
+        let (subgraph_op, subgraph_out) =
+            graph.add_simple_op("Subgraph", Subgraph { graph: subgraph }, &[matmul_out]);
+        graph.set_input_ids(&[input]);
+        graph.set_output_ids(&[subgraph_out]);
+
+        graph.prepack_weights_with_pool(&mut cache, &pool);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(weights).is_some());
+        assert!(
+            cache
+                .get_subgraph_caches(subgraph_op)
+                .map(|caches| &caches[0])
+                .and_then(|sg_cache| sg_cache.get(sg_weights))
+                .is_some()
+        );
+
+        let pid = std::process::id().to_string();
+        let mut rten_threads = Vec::new();
+        for _ in 0..100 {
+            rten_threads.clear();
+            for entry in fs::read_dir("/proc/self/task")? {
+                let entry = entry?;
+                if entry.file_name() == pid.as_str() {
+                    continue;
+                }
+                if let Ok(comm) = fs::read_to_string(entry.path().join("comm")) {
+                    let name = comm.trim().to_string();
+                    if name.starts_with("rten-") {
+                        rten_threads.push(name);
+                    }
+                }
+            }
+            if !rten_threads.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            rten_threads.len(),
+            1,
+            "caller pool prepacking must not initialize global pool workers: {rten_threads:?}"
+        );
+        return Ok(());
+    }
+
+    let status = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "graph::tests::test_prepack_weights_with_pool",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .status()?;
+    assert!(status.success(), "child process failed: {status}");
+    Ok(())
+}

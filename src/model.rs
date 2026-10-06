@@ -296,6 +296,16 @@ pub struct Model {
 }
 
 impl Model {
+    /// Pre-pack constant weights after loading, using only the caller's pool.
+    ///
+    /// This retains additional packed weight storage for subsequent runs.
+    /// Unlike load-time prepacking, parsing temporaries have already been
+    /// released when this method is called after a load operation returns.
+    pub fn prepack_weights(&mut self, thread_pool: &crate::ThreadPool) {
+        self.graph
+            .prepack_weights_with_pool(&mut self.weight_cache, thread_pool);
+    }
+
     /// Load a serialized model from a `.onnx` or `.rten` file.
     ///
     /// This method reads the entire file into memory. For large models (hundreds

@@ -486,13 +486,22 @@ impl Graph {
     /// and the compute node, which would prevent prepacking. Graph optimization
     /// can eliminate these. A common example is when weights are transposed.
     pub fn prepack_weights(&self, cache: &mut WeightCache) {
+        self.prepack_weights_with_pool(cache, threading::thread_pool());
+    }
+
+    /// Pre-pack constant inputs using the caller's pool, including in subgraphs.
+    pub fn prepack_weights_with_pool(
+        &self,
+        cache: &mut WeightCache,
+        thread_pool: &threading::ThreadPool,
+    ) {
         enum Entry {
             Cache((NodeId, PrepackedInput)),
             SubgraphCache((NodeId, Vec<WeightCache>)),
         }
 
         // Traverse operators and prepack in parallel.
-        let entries: Vec<Entry> = threading::thread_pool().run(|| {
+        let entries: Vec<Entry> = thread_pool.run(|| {
             self.nodes
                 .par_iter()
                 .filter_map(|(node_id, node)| match node {
@@ -536,7 +545,7 @@ impl Graph {
                     if let Some(sg_op) = op_node.operator().as_subgraph_op() {
                         subgraph_caches.extend(sg_op.subgraphs().into_iter().map(|subgraph| {
                             let mut subgraph_cache = WeightCache::new();
-                            subgraph.prepack_weights(&mut subgraph_cache);
+                            subgraph.prepack_weights_with_pool(&mut subgraph_cache, thread_pool);
                             subgraph_cache
                         }));
                     }
