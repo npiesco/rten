@@ -412,6 +412,54 @@ where
 }
 
 #[test]
+fn test_gemm_f32_rounding_is_consistent_across_kernels() {
+    for gemm in all_gemms::<f32, f32, f32>() {
+        for m in [1, 8] {
+            let a = NdTensor::from_data([m, 2], [-1.0, 1.0 + f32::EPSILON].repeat(m));
+            let b = NdTensor::from_data(
+                [2, 33],
+                [vec![1.0; 33], vec![1.0 - f32::EPSILON; 33]].concat(),
+            );
+            for transpose in [false, true] {
+                let transposed = b.transposed().to_tensor();
+                let b = if transpose {
+                    transposed.transposed()
+                } else {
+                    b.view()
+                };
+                let result = run_matmul(a.view(), b, None, Some(&gemm)).unwrap();
+                for (index, value) in result.iter().enumerate() {
+                    assert_eq!(
+                        *value, 0.0,
+                        "matrix product must round multiplication before addition at {index}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_gemm_f32_reduction_order_is_consistent_across_kernels() {
+    let reference = GemmExecutor::<f32>::with_kernel(F32KernelType::Generic).unwrap();
+    let mut rng = XorShiftRng::new(1234);
+    for m in [1, 8] {
+        for k in [65, 257, 576] {
+            let a = NdTensor::<f32, 2>::rand([m, k], &mut rng);
+            let b = NdTensor::<f32, 2>::rand([k, 33], &mut rng);
+            let transposed = b.transposed().to_tensor();
+            for b in [b.view(), transposed.transposed()] {
+                let expected = run_matmul(a.view(), b, None, Some(&reference)).unwrap();
+                for gemm in all_gemms::<f32, f32, f32>() {
+                    let actual = run_matmul(a.view(), b, None, Some(&gemm)).unwrap();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn test_gemm_f32() -> Result<(), Box<dyn Error>> {
     for gemm in all_gemms::<f32, f32, f32>() {
         test_gemm_various_input_sizes(Some(&gemm), None, None)?;

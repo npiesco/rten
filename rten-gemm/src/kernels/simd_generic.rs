@@ -6,6 +6,9 @@ use rten_tensor::{Matrix, MatrixLayout, Storage};
 
 use super::{Int8DotProduct, Lhs, MatVecOutput};
 
+// Float matrix products round multiplication before addition, matching the
+// generic and strict WASM kernels. Keep optimized SIMD tiles on each backend.
+
 /// Compute an output block of a vector-matrix product ("gemv" in BLAS APIs).
 ///
 /// Multiple output columns are computed at a time, using `NR_REGS` SIMD
@@ -20,7 +23,9 @@ pub fn simd_gemv<I: Isa, const NR_REGS: usize>(
 ) {
     // Handle cases where `b` does not have unit stride.
     if b.row_stride() == 1 {
-        return simd_gemv_transposed(isa, out, a, b, alpha);
+        // Transposed GEMV reduces along SIMD lanes. Fix its four-lane order
+        // so matrix products do not depend on the selected instruction set.
+        return simd_gemv_transposed(rten_simd::isa::GenericIsa::new(), out, a, b, alpha);
     } else if b.col_stride() != 1 {
         return simd_gemv_fallback(out, a, b, alpha);
     }
@@ -50,7 +55,7 @@ pub fn simd_gemv<I: Isa, const NR_REGS: usize>(
                 let b_elts = unsafe {
                     ops.load_ptr(b_ptr.add(k * b_row_stride + b_tile.start + i * ops.len()))
                 };
-                acc[i] = ops.mul_add(a_elts, b_elts, acc[i]);
+                acc[i] = ops.add(ops.mul(a_elts, b_elts), acc[i]);
             }
         });
 
@@ -81,7 +86,7 @@ pub fn simd_gemv<I: Isa, const NR_REGS: usize>(
             for i in 0..NR_REGS {
                 let out_tile_ptr = get_out_tile_ptr(i);
                 let out_tile = unsafe { ops.load_ptr(out_tile_ptr as *mut f32) };
-                let out_tile = ops.mul_add(out_tile, beta_vec, acc[i]);
+                let out_tile = ops.add(ops.mul(out_tile, beta_vec), acc[i]);
                 unsafe { ops.store_ptr(out_tile, out_tile_ptr as *mut f32) };
             }
         }
@@ -131,7 +136,7 @@ fn simd_gemv_transposed<I: Isa>(
             for i in 0..COL_TILE {
                 let b_col_ptr = unsafe { b_ptr.add((col_tile.start + i) * b_col_stride) };
                 let b_tile = unsafe { ops.load_ptr(b_col_ptr.add(depth_tile.start)) };
-                acc[i] = ops.mul_add(a_tile, b_tile, acc[i]);
+                acc[i] = ops.add(ops.mul(a_tile, b_tile), acc[i]);
             }
         }
 
@@ -141,7 +146,7 @@ fn simd_gemv_transposed<I: Isa>(
             for i in 0..COL_TILE {
                 let b_col_ptr = unsafe { b_ptr.add((col_tile.start + i) * b_col_stride) };
                 let bk = unsafe { *b_col_ptr.add(k) };
-                acc[i] = ak.mul_add(bk, acc[i]);
+                acc[i] += ak * bk;
             }
         }
 
@@ -174,7 +179,7 @@ fn simd_gemv_transposed<I: Isa>(
 /// for rows and columns.
 ///
 /// This doesn't benefit from SIMD operations. It is at least inlined so it
-/// can benefit from the kernel's instruction set (eg. for FMA operations).
+/// can benefit from the kernel's instruction set.
 #[inline(always)]
 fn simd_gemv_fallback(out: MatVecOutput<f32>, a: &[f32], b: Matrix, alpha: f32) {
     assert_eq!(a.len(), b.rows());
@@ -184,7 +189,7 @@ fn simd_gemv_fallback(out: MatVecOutput<f32>, a: &[f32], b: Matrix, alpha: f32) 
         let mut acc = 0.;
         for (k, ak) in (0..a.len()).zip(a.iter()) {
             let bk = unsafe { *b.get_unchecked([k, col]) };
-            acc = ak.mul_add(bk, acc);
+            acc += ak * bk;
         }
         acc *= alpha;
         if out.beta == 0. {
@@ -342,7 +347,7 @@ pub unsafe fn simd_gemm<I: Isa, const MR: usize, const NR_REGS: usize, const ROW
             let a_broadcast = ops.splat(a_val);
 
             for j in 0..NR_REGS {
-                tmp[i][j] = ops.mul_add(a_broadcast, b_rows[j], tmp[i][j]);
+                tmp[i][j] = ops.add(ops.mul(a_broadcast, b_rows[j]), tmp[i][j]);
             }
         }
     });
@@ -365,7 +370,7 @@ pub unsafe fn simd_gemm<I: Isa, const MR: usize, const NR_REGS: usize, const ROW
         let a_broadcast = ops.splat(a_val);
 
         for j in 0..NR_REGS {
-            tmp[i][j] = ops.mul_add(a_broadcast, b_rows[j], tmp[i][j]);
+            tmp[i][j] = ops.add(ops.mul(a_broadcast, b_rows[j]), tmp[i][j]);
         }
     }
 
@@ -410,7 +415,7 @@ pub unsafe fn simd_gemm<I: Isa, const MR: usize, const NR_REGS: usize, const ROW
             for j in 0..NR_REGS {
                 let out_ptr = get_out_ptr(i, j);
                 let out_val = ops.mul(unsafe { ops.load_ptr(out_ptr) }, beta_broadcast);
-                let out_val = ops.mul_add(tmp[i][j], alpha_broadcast, out_val);
+                let out_val = ops.add(ops.mul(tmp[i][j], alpha_broadcast), out_val);
                 unsafe { ops.store_ptr(out_val, out_ptr) };
             }
         }
@@ -418,13 +423,7 @@ pub unsafe fn simd_gemm<I: Isa, const MR: usize, const NR_REGS: usize, const ROW
 }
 
 /// Variant of [`simd_gemm`] for architectures (Arm) which can efficiently
-/// broadcast a lane from a vector to a new vector used as an operand for
-/// FMA.
-///
-/// On Arm, the combination of broadcast lane + FMA will be fused into
-/// FMLA by element [^1].
-///
-/// [^1]: https://developer.arm.com/documentation/dui0801/g/A64-SIMD-Vector-Instructions/FMLA--vector--by-element-?lang=en
+/// broadcast a lane from a vector used as a multiplication operand.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub unsafe fn simd_gemm_broadcast_lane<
@@ -483,11 +482,10 @@ pub unsafe fn simd_gemm_broadcast_lane<
                 b_rows[i] = unsafe { ops.load_ptr(b_ptr.add(b_off + i * v_len)) };
             }
             for i in 0..ROWS {
-                // On Arm, the `broadcast_lane` and `mul_add` operations can be
-                // fused into a single FMLA (by element) operation.
+                // Use Arm's lane broadcast while retaining separate multiply/add rounding.
                 let a_broadcast = ops.broadcast_lane::<$k_offset>(a_tiles[i]);
                 for j in 0..NR_REGS {
-                    tmp[i][j] = ops.mul_add(a_broadcast, b_rows[j], tmp[i][j]);
+                    tmp[i][j] = ops.add(ops.mul(a_broadcast, b_rows[j]), tmp[i][j]);
                 }
             }
         };
@@ -556,7 +554,7 @@ pub unsafe fn simd_gemm_broadcast_lane<
             for j in 0..NR_REGS {
                 let out_ptr = get_out_ptr(i, j);
                 let out_val = ops.mul(unsafe { ops.load_ptr(out_ptr) }, beta_broadcast);
-                let out_val = ops.mul_add(tmp[i][j], alpha_broadcast, out_val);
+                let out_val = ops.add(ops.mul(tmp[i][j], alpha_broadcast), out_val);
                 unsafe { ops.store_ptr(out_val, out_ptr) };
             }
         }
