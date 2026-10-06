@@ -13,6 +13,8 @@ use rten_simd::{Isa, SimdIterable, SimdOp};
 /// output[i] = (input[i] - pre_scale_bias) * scale * element_scale[i] + bias + element_bias[i]
 /// ```
 ///
+/// Multiplication is rounded before addition on every instruction set.
+///
 /// # Panics
 ///
 /// Dispatching the operation panics if any of the slices have different lengths.
@@ -121,7 +123,7 @@ impl<'dst> SimdOp for Normalize<'_, 'dst> {
                     #[inline(always)]
                     |x| {
                         let y = ops.sub(x, pre_scale_bias_vec);
-                        ops.mul_add(y, const_scale_vec, const_bias_vec)
+                        ops.add(ops.mul(y, const_scale_vec), const_bias_vec)
                     },
                 )
             }
@@ -162,7 +164,7 @@ impl<'dst> SimdOp for Normalize<'_, 'dst> {
                         let bias_vec = ops.add(bias_vec, const_bias_vec);
 
                         let y = ops.sub(x, pre_scale_bias_vec);
-                        ops.mul_add(y, scale_vec, bias_vec)
+                        ops.add(ops.mul(y, scale_vec), bias_vec)
                     },
                 )
             }
@@ -186,7 +188,48 @@ mod tests {
         for i in 0..data.len() {
             let x_scale = scale * element_scale.map(|es| es[i]).unwrap_or(1.);
             let x_bias = bias + element_bias.map(|eb| eb[i]).unwrap_or(0.);
-            data[i] = (data[i] - pre_scale_bias).mul_add(x_scale, x_bias)
+            data[i] = (data[i] - pre_scale_bias) * x_scale + x_bias
+        }
+    }
+
+    #[test]
+    fn test_normalize_rounding_is_consistent_across_instruction_sets() {
+        use rten_simd::Isa;
+        use rten_simd::isa::GenericIsa;
+
+        fn check<I: Isa>(isa: I) {
+            let mut input = vec![1.0 + f32::EPSILON; 65];
+            Normalize::new_mut(
+                &mut input,
+                NormalizeOptions {
+                    scale: 1.0 - f32::EPSILON,
+                    bias: -1.0,
+                    ..Default::default()
+                },
+            )
+            .eval(isa);
+            assert!(
+                input.iter().all(|x| x.to_bits() == 0),
+                "normalization must round multiplication before addition: {input:?}"
+            );
+        }
+        check(GenericIsa::new());
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let Some(isa) = rten_simd::isa::Avx2Isa::new() {
+                check(isa);
+            }
+            if let Some(isa) = rten_simd::isa::Avx512Isa::new() {
+                check(isa);
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if let Some(isa) = rten_simd::isa::ArmNeonIsa::new() {
+            check(isa);
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(isa) = rten_simd::isa::Wasm32Isa::new() {
+            check(isa);
         }
     }
 

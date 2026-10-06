@@ -118,15 +118,20 @@ fn normalize_slice<'src, 'dst>(
         NormalizeData::SrcDest((src, _dest)) => *src,
     };
 
+    // Use the same four-lane reduction order on every backend. INT8 models
+    // amplify small changes in normalization statistics at quantization boundaries.
+    let stats_isa = rten_simd::isa::GenericIsa::new();
     let (mean, variance) = match mean_normalize {
         MeanNormalize::Static { mean, variance } => (mean, variance),
         MeanNormalize::Dynamic => {
-            let mean = vecmath::Sum::new(input).dispatch() / input.len() as f32;
-            let variance = vecmath::SumSquareSub::new(input, mean).dispatch() / input.len() as f32;
+            let mean = vecmath::Sum::new(input).eval(stats_isa) / input.len() as f32;
+            let variance =
+                vecmath::SumSquareSub::new(input, mean).eval(stats_isa) / input.len() as f32;
             (mean, variance)
         }
         MeanNormalize::DynamicRootMeanSquare => {
-            let root_mean_square = vecmath::SumSquare::new(input).dispatch() / input.len() as f32;
+            let root_mean_square =
+                vecmath::SumSquare::new(input).eval(stats_isa) / input.len() as f32;
             (0., root_mean_square)
         }
     };
