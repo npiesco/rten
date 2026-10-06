@@ -68,7 +68,10 @@ impl<'dst> SimdOp for Softmax<'_, 'dst> {
         let max_val = max(ops, self.src_dest.src());
 
         // Compute `y = exp(x - max(x))` and `sum(y)`.
-        let (dest, exp_sum) = exp_sum_minus_max(isa, self.src_dest, max_val);
+        // Keep exponent rounding and the four-lane sum order consistent.
+        // Small softmax differences can cross downstream INT8 quantization boundaries.
+        let (dest, exp_sum) =
+            exp_sum_minus_max(rten_simd::isa::GenericIsa::new(), self.src_dest, max_val);
 
         // Divide by `exp_sum`.
         let exp_sum = ops.splat(exp_sum);
@@ -256,6 +259,37 @@ mod tests {
 
         for el in ys.iter_mut() {
             *el /= exp_sum;
+        }
+    }
+
+    #[test]
+    fn test_softmax_rounding_is_consistent_across_instruction_sets() {
+        use rten_simd::isa::GenericIsa;
+        let input: Vec<f32> = (0..577).map(|i| (i % 37) as f32 * 0.17 - 3.0).collect();
+        let mut expected = input.clone();
+        Softmax::new_mut(&mut expected).eval(GenericIsa::new());
+        fn check<I: rten_simd::Isa>(isa: I, input: &[f32], expected: &[f32]) {
+            let mut actual = input.to_vec();
+            Softmax::new_mut(&mut actual).eval(isa);
+            assert_eq!(actual, expected);
+        }
+        check(GenericIsa::new(), &input, &expected);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let Some(isa) = rten_simd::isa::Avx2Isa::new() {
+                check(isa, &input, &expected);
+            }
+            if let Some(isa) = rten_simd::isa::Avx512Isa::new() {
+                check(isa, &input, &expected);
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if let Some(isa) = rten_simd::isa::ArmNeonIsa::new() {
+            check(isa, &input, &expected);
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(isa) = rten_simd::isa::Wasm32Isa::new() {
+            check(isa, &input, &expected);
         }
     }
 
