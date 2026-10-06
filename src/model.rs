@@ -32,13 +32,16 @@ pub(crate) mod onnx_loader;
 #[cfg(feature = "rten_format")]
 mod rten_loader;
 
+#[cfg(feature = "rten_format")]
+mod rten_format;
+
 pub use load_error::{LoadError, LoadErrorKind};
 pub use metadata::ModelMetadata;
 
 use file_type::FileType;
 use load_error::LoadErrorImpl;
 
-#[cfg(all(test, feature = "rten_format"))]
+#[cfg(feature = "rten_format")]
 pub mod rten_builder;
 
 #[cfg(all(test, feature = "onnx_format"))]
@@ -715,19 +718,6 @@ impl ModelOptions {
         self
     }
 
-    /// Enable shape and type inference for values.
-    ///
-    /// This is equivalent to `self.shape_inference(ShapeInferenceMode::On)`.
-    #[deprecated]
-    pub fn enable_shape_inference(&mut self, enable: bool) -> &mut Self {
-        self.infer_shapes = if enable {
-            ShapeInferenceMode::On
-        } else {
-            ShapeInferenceMode::Off
-        };
-        self
-    }
-
     /// Set whether shape and type inference is run as part of optimization.
     ///
     /// Shape inference is needed for some optimizations in order to verify that
@@ -986,7 +976,7 @@ mod tests {
         create_tensor_from_view, create_value_info,
     };
     #[cfg(feature = "rten_format")]
-    use crate::model::rten_builder::{MetadataArgs, ModelBuilder, ModelFormat, OpType};
+    use crate::model::rten_builder::{MetadataArgs, ModelBuilder, OpType};
     use crate::model::{LoadErrorKind, Model, ModelOptions};
     use crate::op_registry;
     #[cfg(feature = "rten_format")]
@@ -1044,8 +1034,8 @@ mod tests {
     /// Version of [`generate_model_buffer`] which creates a model in the
     /// `.rten` format.
     #[cfg(feature = "rten_format")]
-    fn generate_rten_model_buffer(format: ModelFormat) -> Vec<u8> {
-        let mut builder = ModelBuilder::new(format);
+    fn generate_rten_model_buffer() -> Vec<u8> {
+        let mut builder = ModelBuilder::new();
         let mut graph_builder = builder.graph_builder();
 
         let const_val = Tensor::from_data(&[1, 2, 2], vec![0.5, -0.5, 0.1, -0.1]);
@@ -1211,12 +1201,7 @@ mod tests {
             },
             #[cfg(feature = "rten_format")]
             Case {
-                buffer: generate_rten_model_buffer(ModelFormat::V1),
-                opts: None,
-            },
-            #[cfg(feature = "rten_format")]
-            Case {
-                buffer: generate_rten_model_buffer(ModelFormat::V2),
+                buffer: generate_rten_model_buffer(),
                 opts: None,
             },
             // Graph optimizations disabled
@@ -1289,10 +1274,10 @@ mod tests {
 
         // This test corrupts the model buffer in ways that are specific to the
         // `.rten` format.
-        let buf = generate_rten_model_buffer(ModelFormat::V2);
+        let buf = generate_rten_model_buffer();
 
         let mut invalid_model = buf.clone();
-        let header_size = 32;
+        let header_size = super::rten_format::Header::LEN;
         invalid_model.insert(header_size, 0); // Corrupt buffer after header
 
         let mut truncated_buf = buf.clone();

@@ -24,7 +24,7 @@ In detail, the process is:
    add the table to the end of the `OperatorAttrs` union. Some existing
    operators share attributes tables. For new operators however it is
    recommended to use a separate type per operator.
-6. Run `just schema` to generate updated Rust and Python code to read the
+6. Run `make schema` to generate updated Rust and Python code to read the
    updated FlatBuffers schema
 7. If the new operator has attributes, edit
    `rten-convert/rten_convert/converter.py` and modify
@@ -53,8 +53,9 @@ feature, this error may be detected at model conversion or load time (eg. when
 an unsupported attribute has a non-default value) or only during inference (eg.
 when the input has an unsupported shape).
 
-## FlatBuffers binary compatibility
+## Current FlatBuffers contract
 
-Additions to the FlatBuffers schema for models should preserve binary
-compatibility with existing model files. This is achieved for enums, unions and
-tables by making additions at the end of the item.
+Update the current builder, loader and runtime tests together when changing
+the schema. Do not retain old attribute records, decoder branches, generation
+fields or renamed API aliases. Preserve format discrimination, graph
+verification and checked tensor ranges.

@@ -1,8 +1,6 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use rten_base::num::AsUsize;
-
 /// File type of a machine learning model.
 #[derive(Debug, PartialEq)]
 pub enum FileType {
@@ -34,8 +32,7 @@ impl FileType {
 
         // The checks here are ordered from most to least reliable.
 
-        // rten files using the v2 format and later start with a 4-byte file
-        // type identifier.
+        // RTen framing starts with a four-byte file type identifier.
         if magic == Some(*b"RTEN") {
             return Some(FileType::Rten);
         }
@@ -50,16 +47,6 @@ impl FileType {
             if is_onnx_model(ValueReader::from_buf(data)) {
                 return Some(FileType::Onnx);
             }
-        }
-
-        // rten files using the v1 format don't have a file type identifier.
-        // They are FlatBuffers messages which start with a u32 offset pointing
-        // to the root table, as described at
-        // https://flatbuffers.dev/internals/#encoding-example.
-        if let Some(root_offset) = magic.map(u32::from_le_bytes)
-            && data.len() >= root_offset.as_usize()
-        {
-            return Some(FileType::Rten);
         }
 
         None
@@ -134,7 +121,7 @@ mod tests {
                         .chain(std::iter::repeat_n(0, 128))
                         .collect()
                 },
-                expected: Some(FileType::Rten),
+                expected: None,
             },
             Case {
                 buf: b"unknown format".into(),

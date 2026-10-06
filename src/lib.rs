@@ -197,8 +197,8 @@ pub use threading::{ThreadPool, thread_pool};
 pub use timing::TimingSort;
 pub use value::{DataType, Sequence, TryFromValueError, Value, ValueOrView, ValueType, ValueView};
 
-#[deprecated = "renamed to `LoadError`"]
-pub type ModelLoadError = LoadError;
+#[cfg(feature = "rten_format")]
+pub use model::rten_builder::{GraphBuilder, MetadataArgs, ModelBuilder, OpType};
 
 /// Additional documentation on various topics.
 pub mod docs {

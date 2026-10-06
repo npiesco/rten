@@ -5,13 +5,12 @@ use std::sync::Arc;
 
 use rten_base::byte_cast::{FromByteArray, cast_slice};
 use rten_base::num::{AsUsize, LeBytes};
-use rten_model_file::header::{Header, HeaderError};
 use rten_model_file::schema as sg;
-use rten_model_file::schema::root_as_model;
 use rten_tensor::ArcTensor;
 
 use super::load_error::{LoadError, LoadErrorImpl, load_error};
 use super::metadata::{MetadataField, ModelMetadata};
+use super::rten_format::{Header, root_as_model};
 use super::{Model, ModelOptions, OptimizeMode};
 use crate::constant_storage::{ArcSlice, ArcTensorView, ConstantStorage};
 use crate::graph::{CaptureEnv, ConstantNodeData, Dimension, Graph, NodeId};
@@ -26,33 +25,15 @@ pub fn load(storage: Arc<ConstantStorage>, options: &ModelOptions) -> Result<Mod
     let registry = &options.registry;
 
     let file_data = storage.data();
-    let header = match Header::from_buf(file_data) {
-        Ok(header) => Some(header),
-        Err(HeaderError::InvalidMagic) => None,
-        Err(err) => {
-            return Err(LoadErrorImpl::InvalidHeader(Box::new(err)).into());
-        }
-    };
-
-    let model_data = if let Some(header) = header.as_ref() {
-        let (offset, len) = (header.model_offset as usize, header.model_len as usize);
-        &file_data[offset..offset + len]
-    } else {
-        file_data
-    };
+    let header =
+        Header::from_buf(file_data).map_err(|err| LoadErrorImpl::InvalidHeader(Box::new(err)))?;
+    let (offset, len) = (header.model_offset as usize, header.model_len as usize);
+    let model_data = &file_data[offset..offset + len];
 
     let model = root_as_model(model_data)
         .map_err(|err| LoadErrorImpl::ParseFailed(Box::new(err).into()))?;
 
-    if model.schema_version() != 1 {
-        let err = format!(
-            "unsupported model schema version {}",
-            model.schema_version()
-        );
-        return Err(LoadErrorImpl::ParseFailed(err.into()).into());
-    }
-
-    let tensor_data_offset = header.as_ref().map(|h| h.tensor_data_offset);
+    let tensor_data_offset = header.tensor_data_offset;
     let graph = load_graph(
         model.graph(),
         registry,
@@ -106,7 +87,7 @@ struct SubgraphOptions<'a> {
     storage: Arc<ConstantStorage>,
 
     /// Offset of tensor data within the storage.
-    tensor_data_offset: Option<u64>,
+    tensor_data_offset: u64,
 
     /// Configuration for graph optimizer.
     optimize: OptimizeMode,
@@ -120,7 +101,7 @@ fn load_graph(
     serialized_graph: sg::Graph,
     registry: &OpRegistry,
     storage: Arc<ConstantStorage>,
-    tensor_data_offset: Option<u64>,
+    tensor_data_offset: u64,
     optimize: OptimizeMode,
     capture_env: Option<&CaptureEnv>,
 ) -> Result<Graph, LoadError> {
@@ -314,16 +295,13 @@ fn add_graph_constant(
     name: Option<&str>,
     constant: sg::ConstantNode,
     storage: &Arc<ConstantStorage>,
-    tensor_data_offset: Option<u64>,
+    tensor_data_offset: u64,
 ) -> Result<NodeId, LoadError> {
     let shape: Vec<usize> = constant.shape().iter().map(|x| x.as_usize()).collect();
 
     if let Some(data_offset) = constant.data_offset() {
         // Constant data is stored outside the model buffer, in the same file.
 
-        let Some(tensor_data_offset) = tensor_data_offset else {
-            return Err(load_error!(GraphError, name, "tensor data section missing"));
-        };
         let Some(data_offset) = tensor_data_offset
             .checked_add(data_offset)
             .and_then(|offset| usize::try_from(offset).ok())
@@ -362,46 +340,11 @@ fn add_graph_constant(
         };
         Ok(graph_node)
     } else {
-        // Constant data is stored inline in model
-        let graph_node = if let Some(float_data) = constant.data_as_float_data() {
-            let const_data = constant_data_from_flatbuffers_vec(storage, float_data.data(), &shape);
-            graph.add_constant(name, const_data)
-        } else if let Some(int_data) = constant.data_as_int_32_data() {
-            let const_data = constant_data_from_flatbuffers_vec(storage, int_data.data(), &shape);
-            graph.add_constant(name, const_data)
-        } else if let Some(int8_data) = constant.data_as_int_8_data() {
-            let const_data = constant_data_from_flatbuffers_vec(storage, int8_data.data(), &shape);
-            graph.add_constant(name, const_data)
-        } else if let Some(uint8_data) = constant.data_as_uint_8_data() {
-            let const_data = constant_data_from_flatbuffers_vec(storage, uint8_data.data(), &shape);
-            graph.add_constant(name, const_data)
-        } else {
-            return Err(load_error!(
-                GraphError,
-                name,
-                "unsupported data type for inline constant"
-            ));
-        };
-        Ok(graph_node)
-    }
-}
-
-/// Convert a vector from a FlatBuffers file into data for a graph constant node.
-///
-/// If the data is correctly aligned and the system is little-endian, this will
-/// return a view, otherwise it will copy the data into an owned tensor.
-fn constant_data_from_flatbuffers_vec<'a, T: FromByteArray + flatbuffers::Follow<'a, Inner = T>>(
-    storage: &Arc<ConstantStorage>,
-    fb_vec: flatbuffers::Vector<'a, T>,
-    shape: &[usize],
-) -> ConstantNodeData<T> {
-    if let Some(elements) = cast_le_bytes(fb_vec.bytes()) {
-        let storage =
-            ArcSlice::new(storage.clone(), elements).expect("storage does not contain data");
-        ArcTensorView::from_data(shape, storage).into()
-    } else {
-        let data: Vec<T> = fb_vec.iter().collect();
-        ArcTensor::from_data(shape, Arc::new(data)).into()
+        Err(load_error!(
+            GraphError,
+            name,
+            "constant tensor data offset missing"
+        ))
     }
 }
 
@@ -424,10 +367,11 @@ fn constant_data_from_storage_offset<T: LeBytes + FromByteArray>(
     offset: usize,
     name: Option<&str>,
 ) -> Result<ConstantNodeData<T>, LoadError> {
-    let n_elements: usize = shape.iter().product();
-    let byte_len = n_elements * std::mem::size_of::<T>();
-
-    let Some(bytes) = storage.data().get(offset..offset + byte_len) else {
+    let byte_len = shape
+        .iter()
+        .try_fold(std::mem::size_of::<T>(), |len, dim| len.checked_mul(*dim));
+    let end = byte_len.and_then(|len| offset.checked_add(len));
+    let Some(bytes) = end.and_then(|end| storage.data().get(offset..end)) else {
         return Err(load_error!(GraphError, name, "invalid tensor data offset"));
     };
 

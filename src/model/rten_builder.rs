@@ -1,10 +1,10 @@
-use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, Vector, WIPOffset};
+use flatbuffers::{FlatBufferBuilder, Vector, WIPOffset};
 use rten_base::num::LeBytes;
-use rten_model_file::header::Header;
 use rten_model_file::schema as sg;
 use rten_tensor::TensorView;
 use rten_tensor::prelude::*;
 
+use super::rten_format::{Header, create_model};
 use crate::graph::{Dimension, NodeId};
 use crate::ops::{
     ArgMax, ArgMin, AveragePool, BatchNormalization, BoxOrder, Cast, CastLike, Concat,
@@ -31,7 +31,6 @@ pub struct IfArgs<'a> {
 }
 
 /// Enum of all the built-in operators
-#[allow(dead_code)] // TODO - Remove variants that are no longer used
 pub enum OpType<'a> {
     Abs,
     Acos,
@@ -63,9 +62,7 @@ pub enum OpType<'a> {
     Div,
     #[cfg(feature = "random")]
     Dropout(Dropout),
-    #[allow(dead_code)]
     DynamicQuantizeLinear,
-    #[allow(dead_code)]
     Einsum(Einsum),
     Elu(Elu),
     Equal,
@@ -77,7 +74,6 @@ pub enum OpType<'a> {
     Floor,
     Gather(Gather),
     GatherElements(GatherElements),
-    #[allow(dead_code)]
     GatherND(GatherND),
     Gelu(Gelu),
     Gemm(Gemm),
@@ -146,11 +142,8 @@ pub enum OpType<'a> {
     QuantizeLinear(QuantizeLinear),
     Scatter(Scatter),
     ScatterElements(ScatterElements),
-    #[allow(dead_code)]
     SequenceAt,
-    #[allow(dead_code)]
     SequenceEmpty(SequenceEmpty),
-    #[allow(dead_code)]
     SequenceInsert,
     Shape(Shape),
     Sigmoid,
@@ -178,59 +171,26 @@ pub enum OpType<'a> {
     Xor,
 }
 
-/// Specifies which version of the model format to generate.
-pub enum ModelFormat {
-    /// Generate the V1 format. This consists of just FlatBuffers data
-    /// containing both the model structure and tensor data.
-    V1,
-
-    /// Generate the V2 format, which consists of a header, the FlatBuffers
-    /// data containing the model structure and a tensor data segment.
-    V2,
-}
-
 /// Helpers for converting tensors to constant node data.
 pub trait ToConstantData: Sized {
     /// Return the data type identifier for this type.
     fn dtype() -> sg::ConstantDataType;
-
-    /// Create a `ConstantData` union value that stores the tensor data in the
-    /// model buffer.
-    fn create_inline_data(
-        builder: &mut FlatBufferBuilder,
-        data: &[Self],
-    ) -> (sg::ConstantData, WIPOffset<UnionWIPOffset>);
 }
 
 macro_rules! impl_to_constant_data {
-    ($type:ty, $dtype:ident, $inline_union_type:ident, $inline_args:ident) => {
+    ($type:ty, $dtype:ident) => {
         impl ToConstantData for $type {
             fn dtype() -> sg::ConstantDataType {
                 sg::ConstantDataType::$dtype
-            }
-
-            fn create_inline_data(
-                builder: &mut FlatBufferBuilder<'_>,
-                data: &[Self],
-            ) -> (sg::ConstantData, WIPOffset<UnionWIPOffset>) {
-                let data_vec = builder.create_vector(data);
-                let data = sg::$inline_union_type::create(
-                    builder,
-                    &sg::$inline_args {
-                        data: Some(data_vec),
-                    },
-                )
-                .as_union_value();
-                (sg::ConstantData::$inline_union_type, data)
             }
         }
     };
 }
 
-impl_to_constant_data!(f32, Float32, FloatData, FloatDataArgs);
-impl_to_constant_data!(i32, Int32, Int32Data, Int32DataArgs);
-impl_to_constant_data!(u8, UInt8, UInt8Data, UInt8DataArgs);
-impl_to_constant_data!(i8, Int8, Int8Data, Int8DataArgs);
+impl_to_constant_data!(f32, Float32);
+impl_to_constant_data!(i32, Int32);
+impl_to_constant_data!(u8, UInt8);
+impl_to_constant_data!(i8, Int8);
 
 enum NodeData<'a> {
     Constant(WIPOffset<sg::ConstantNode<'a>>),
@@ -273,7 +233,7 @@ fn convert_dtype(dtype: DataType) -> sg::DataType {
 /// Builder for serializing a graph or subgraph to FlatBuffers.
 pub struct GraphBuilder<'mb, 'a> {
     builder: &'mb mut FlatBufferBuilder<'a>,
-    tensor_data_builder: Option<&'mb mut TensorDataBuilder>,
+    tensor_data_builder: &'mb mut TensorDataBuilder,
 
     nodes: Vec<WIPOffset<sg::Node<'a>>>,
     input_ids: Vec<NodeId>,
@@ -283,7 +243,7 @@ pub struct GraphBuilder<'mb, 'a> {
 impl<'mb, 'a> GraphBuilder<'mb, 'a> {
     fn new(
         builder: &'mb mut FlatBufferBuilder<'a>,
-        tensor_data_builder: Option<&'mb mut TensorDataBuilder>,
+        tensor_data_builder: &'mb mut TensorDataBuilder,
     ) -> GraphBuilder<'mb, 'a> {
         GraphBuilder {
             builder,
@@ -312,16 +272,8 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
     }
 
     /// Return a graph builder for a subgraph.
-    #[allow(dead_code)] // Only used to build subgraphs, which no test does.
     pub fn subgraph_builder(&mut self) -> GraphBuilder<'_, 'a> {
-        GraphBuilder::new(
-            self.builder,
-            if let Some(tdb) = self.tensor_data_builder.as_mut() {
-                Some(*tdb)
-            } else {
-                None
-            },
-        )
+        GraphBuilder::new(self.builder, self.tensor_data_builder)
     }
 
     /// Add a constant node (eg. weights, biases) to the model
@@ -334,27 +286,13 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
         let dtype = <T as ToConstantData>::dtype();
 
         let elts: Vec<T> = input.to_vec();
-        let args: sg::ConstantNodeArgs = if let Some(tdb) = self.tensor_data_builder.as_mut() {
-            let offset = tdb.add_tensor(&elts) as u64;
-
-            sg::ConstantNodeArgs {
-                shape: Some(shape_vec),
-                data_type: sg::ConstantData::NONE,
-                data: None,
-                data_offset: Some(offset),
-                dtype: Some(dtype),
-            }
-        } else {
-            let (inline_dtype, data) =
-                <T as ToConstantData>::create_inline_data(self.builder, &elts);
-
-            sg::ConstantNodeArgs {
-                shape: Some(shape_vec),
-                data_type: inline_dtype,
-                data: Some(data),
-                data_offset: None,
-                dtype: Some(dtype),
-            }
+        let offset = self.tensor_data_builder.add_tensor(&elts) as u64;
+        let args = sg::ConstantNodeArgs {
+            shape: Some(shape_vec),
+            data_type: sg::ConstantData::NONE,
+            data: None,
+            data_offset: Some(offset),
+            dtype: Some(dtype),
         };
 
         let const_node = sg::ConstantNode::create(self.builder, &args);
@@ -800,7 +738,11 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
                     }
                 )
             }
-            OpType::Pad => op!(Pad),
+            OpType::Pad => op_with_attrs!(Pad, PadAttrs, {
+                sg::PadAttrsArgs {
+                    mode: sg::PadMode::Constant,
+                }
+            }),
             OpType::Pow => op!(Pow),
 
             OpType::QuantizeLinear(args) => op_with_attrs!(
@@ -1087,29 +1029,23 @@ impl<'mb, 'a> GraphBuilder<'mb, 'a> {
 
 /// Serializes models to the RTen model format.
 ///
-/// This exists for use in model-loading tests. Models for deployment are
-/// normally built by converting ONNX models using the Python scripts.
+/// This exists for use in model-loading tests.
 pub struct ModelBuilder<'a> {
     builder: FlatBufferBuilder<'a>,
     graph: Option<WIPOffset<sg::Graph<'a>>>,
     metadata: Option<WIPOffset<sg::Metadata<'a>>>,
 
-    // Builder for the buffer containing tensor data stored outside the model.
-    // `None` if building the V1 format which stores all data inline.
-    tensor_data_builder: Option<TensorDataBuilder>,
+    tensor_data_builder: TensorDataBuilder,
 }
 
 impl<'a> ModelBuilder<'a> {
-    pub fn new(format: ModelFormat) -> ModelBuilder<'a> {
+    pub fn new() -> ModelBuilder<'a> {
         let builder = FlatBufferBuilder::with_capacity(1024);
         ModelBuilder {
             builder,
             graph: None,
             metadata: None,
-            tensor_data_builder: match format {
-                ModelFormat::V1 => None,
-                ModelFormat::V2 => Some(TensorDataBuilder::new()),
-            },
+            tensor_data_builder: TensorDataBuilder::new(),
         }
     }
 
@@ -1119,7 +1055,7 @@ impl<'a> ModelBuilder<'a> {
     /// Call [`GraphBuilder::finish`] to finish serialization and pass the
     /// result to [`set_graph`](ModelBuilder::set_graph).
     pub fn graph_builder<'mb>(&'mb mut self) -> GraphBuilder<'mb, 'a> {
-        GraphBuilder::new(&mut self.builder, self.tensor_data_builder.as_mut())
+        GraphBuilder::new(&mut self.builder, &mut self.tensor_data_builder)
     }
 
     /// Set the main graph for this model.
@@ -1144,43 +1080,32 @@ impl<'a> ModelBuilder<'a> {
 
     /// Finish writing the model data to the buffer and return the buffer's contents.
     pub fn finish(mut self) -> Vec<u8> {
-        let model = sg::Model::create(
+        let model = create_model(
             &mut self.builder,
-            &sg::ModelArgs {
-                schema_version: 1,
-                graph: self.graph,
-                metadata: self.metadata,
-            },
+            self.graph.expect("model requires a graph"),
+            self.metadata,
         );
 
         self.builder.finish(model, None);
         let model_data = self.builder.finished_data().to_vec();
 
-        // If we are storing tensor data externally, then generate a file in the
-        // V2 format. Otherwise use the V1 format which contains just the
-        // FlatBuffers data.
-        if let Some(tensor_data) = self.tensor_data_builder.take() {
-            let mut file_buf = Vec::new();
-            let tensor_data = tensor_data.into_vec();
-            let header = Header {
-                version: 2,
-                model_len: model_data.len() as u64,
-                model_offset: Header::LEN as u64,
-                tensor_data_offset: Header::LEN as u64 + model_data.len() as u64,
-            };
-            file_buf.extend(header.to_buf());
-            file_buf.extend(model_data);
-            file_buf.extend(tensor_data);
-            file_buf
-        } else {
-            model_data
-        }
+        let mut file_buf = Vec::new();
+        let tensor_data = self.tensor_data_builder.into_vec();
+        let header = Header {
+            model_len: model_data.len() as u64,
+            model_offset: Header::LEN as u64,
+            tensor_data_offset: Header::LEN as u64 + model_data.len() as u64,
+        };
+        file_buf.extend(header.to_buf());
+        file_buf.extend(model_data);
+        file_buf.extend(tensor_data);
+        file_buf
     }
 }
 
 impl Default for ModelBuilder<'_> {
     fn default() -> Self {
-        Self::new(ModelFormat::V2)
+        Self::new()
     }
 }
 
