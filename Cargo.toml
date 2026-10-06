@@ -100,6 +100,10 @@ name = "current_format"
 path = "tests/current_format.rs"
 required-features = ["rten_format"]
 
+[[test]]
+name = "matmul_integer"
+path = "tests/matmul_integer.rs"
+
 [features]
 default = ["contrib", "onnx_format"]
 

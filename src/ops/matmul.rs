@@ -630,6 +630,45 @@ where
     let a_quant = QuantParams {
         zero_point: a_zero_cast.as_slice(),
     };
+
+    // A prepacked B carries the zero points it was packed with, and
+    // `MatMulInteger::prepack` only sees B, so they are zero. The GEMM uses
+    // the packed zero points, not `b_quant`. Packed B is used only for
+    // multi-row A (`matmul_impl` falls back to unpacked B for vectors), so
+    // for that case run with a zero B zero point and apply the remainder:
+    // sum((a - za) * (b - zb)) = sum((a - za) * b) - zb * sum(a - za).
+    let correct_b_zero = packed_b.is_some() && a_rows > 1 && b_zero_cast.iter().any(|&z| z != 0);
+    if correct_b_zero {
+        let no_b_zero = vec![0_i8; b_zero_cast.len()];
+        let mut output = matmul_impl(
+            pool,
+            a_cast.view(),
+            b_cast.view(),
+            packed_b,
+            MatmulStrategy::Auto,
+            None,
+            None,
+            Some(a_quant),
+            Some(QuantParams {
+                zero_point: no_b_zero.as_slice(),
+            }),
+        )?;
+        let depth = a_cast.size(a_cast.ndim() - 1);
+        let a_contiguous = a_cast.to_contiguous_in(pool).auto_return(pool);
+        let output_data = output.data_mut().ok_or(OpError::invalid_value(
+            "MatMulInteger output must be contiguous",
+        ))?;
+        for (row, a_row) in a_contiguous.data().chunks(depth).enumerate() {
+            let a_sum = a_row.iter().map(|&x| i32::from(x)).sum::<i32>()
+                - depth as i32 * i32::from(a_zero_cast[row % a_rows]);
+            let out_row = &mut output_data[row * b_cols..(row + 1) * b_cols];
+            for (out, &zero) in out_row.iter_mut().zip(&b_zero_cast) {
+                *out -= i32::from(zero) * a_sum;
+            }
+        }
+        return Ok(output);
+    }
+
     let b_quant = QuantParams {
         zero_point: b_zero_cast.as_slice(),
     };
