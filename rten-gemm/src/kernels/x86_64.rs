@@ -697,21 +697,7 @@ unsafe impl Int8DotProduct for Avx2Isa {
     /// add the `i32` results to `c`.
     #[inline]
     fn dot_product(self, a: Self::X8, b: Self::X8, c: Self::I32) -> Self::I32 {
-        use core::arch::x86_64::{
-            _mm256_add_epi32, _mm256_and_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
-            _mm256_set1_epi8, _mm256_set1_epi16,
-        };
-
-        unsafe {
-            // Split unsigned inputs so each pairwise product sum fits in i16.
-            // Widen both sums before adding to preserve the full u8/i8 range.
-            let low = _mm256_and_si256(a.0, _mm256_set1_epi8(0x7f));
-            let high = _mm256_and_si256(a.0, _mm256_set1_epi8(i8::MIN));
-            let ones = _mm256_set1_epi16(1);
-            let low = _mm256_madd_epi16(_mm256_maddubs_epi16(low, b.0), ones);
-            let high = _mm256_madd_epi16(_mm256_maddubs_epi16(high, b.0), ones);
-            _mm256_add_epi32(c.0, _mm256_add_epi32(low, high)).into()
-        }
+        unsafe { crate::i8dot::avx2_u8i8i32_dot_product(a, b, c) }
     }
 }
 

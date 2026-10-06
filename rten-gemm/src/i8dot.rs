@@ -213,6 +213,33 @@ mod aarch64 {
     }
 }
 
+/// Compute exact unsigned-by-signed eight-bit dot products on AVX2.
+///
+/// # Safety
+/// The caller must ensure AVX2 is supported.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(crate) unsafe fn avx2_u8i8i32_dot_product(
+    a: <rten_simd::isa::Avx2Isa as Isa>::I8,
+    b: <rten_simd::isa::Avx2Isa as Isa>::I8,
+    c: <rten_simd::isa::Avx2Isa as Isa>::I32,
+) -> <rten_simd::isa::Avx2Isa as Isa>::I32 {
+    use core::arch::x86_64::{
+        _mm256_add_epi32, _mm256_and_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_set1_epi8, _mm256_set1_epi16,
+    };
+
+    // Split unsigned inputs so each pairwise product sum fits in i16.
+    // Widen both sums before adding to preserve the full u8/i8 range.
+    let low = _mm256_and_si256(a.0, _mm256_set1_epi8(0x7f));
+    let high = _mm256_and_si256(a.0, _mm256_set1_epi8(i8::MIN));
+    let ones = _mm256_set1_epi16(1);
+    let low = _mm256_madd_epi16(_mm256_maddubs_epi16(low, b.0), ones);
+    let high = _mm256_madd_epi16(_mm256_maddubs_epi16(high, b.0), ones);
+    _mm256_add_epi32(c.0, _mm256_add_epi32(low, high)).into()
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
     use rten_simd::Isa;
@@ -295,29 +322,8 @@ mod x86_64 {
             b: <Self::Isa as Isa>::I8,
             acc: <Self::Isa as Isa>::I32,
         ) -> <Self::Isa as Isa>::I32 {
-            use std::arch::x86_64::{
-                _mm256_add_epi32, _mm256_and_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
-                _mm256_set1_epi8, _mm256_set1_epi16,
-            };
-
-            #[target_feature(enable = "avx2")]
-            #[target_feature(enable = "avx")]
-            #[target_feature(enable = "fma")]
-            #[inline]
-            unsafe fn dot(
-                a: <Avx2Isa as Isa>::I8,
-                b: <Avx2Isa as Isa>::I8,
-                acc: <Avx2Isa as Isa>::I32,
-            ) -> <Avx2Isa as Isa>::I32 {
-                let low = _mm256_and_si256(a.0, _mm256_set1_epi8(0x7f));
-                let high = _mm256_and_si256(a.0, _mm256_set1_epi8(i8::MIN));
-                let ones = _mm256_set1_epi16(1);
-                let low = _mm256_madd_epi16(_mm256_maddubs_epi16(low, b.0), ones);
-                let high = _mm256_madd_epi16(_mm256_maddubs_epi16(high, b.0), ones);
-                _mm256_add_epi32(acc.0, _mm256_add_epi32(low, high)).into()
-            }
-            // Safety: Constructor checks "avx2" feature is supported.
-            unsafe { dot(a, b, acc) }
+            // Safety: Constructor checks that AVX2 is supported.
+            unsafe { super::avx2_u8i8i32_dot_product(a, b, acc) }
         }
     }
 }
